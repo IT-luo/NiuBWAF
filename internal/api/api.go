@@ -526,6 +526,11 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 	default:
 		s.DynamicMode = "off"
 	}
+	switch s.BotMode {
+	case "block", "captcha", "log":
+	default:
+		s.BotMode = "off"
+	}
 	s.Domain = strings.ToLower(strings.TrimSpace(s.Domain))
 	// Basic-Auth 口令哈希落盘：更新时留空表示保留原口令（控制台不回显哈希）
 	if id != 0 && s.AuthPass == "" {

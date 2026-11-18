@@ -206,7 +206,7 @@ function barOpt(kvs, color) {
   };
 }
 function barChart(el, kvs, color) { return mkChart(el, barOpt(kvs, color)); }
-const actionTag = a => ({waf: '<span class="tag red">WAF拦截</span>', resp: '<span class="tag red">响应拦截</span>', cc: '<span class="tag orange">CC限频</span>', blacklist: '<span class="tag red">黑名单</span>', geo: '<span class="tag blue">地区限制</span>', semantic: '<span class="tag blue">语义检测</span>', reputation: '<span class="tag orange">信誉封禁</span>', custom: '<span class="tag violet">自定义</span>', dynamic: '<span class="tag cyan">动态防护</span>'}[a] || esc(a));
+const actionTag = a => ({waf: '<span class="tag red">WAF拦截</span>', resp: '<span class="tag red">响应拦截</span>', cc: '<span class="tag orange">CC限频</span>', blacklist: '<span class="tag red">黑名单</span>', geo: '<span class="tag blue">地区限制</span>', semantic: '<span class="tag blue">语义检测</span>', reputation: '<span class="tag orange">信誉封禁</span>', custom: '<span class="tag violet">自定义</span>', dynamic: '<span class="tag cyan">动态防护</span>', bot: '<span class="tag violet">Bot防护</span>'}[a] || esc(a));
 function liveRow(d) {
   const ip = d.ip || d.client_ip;
   const geo = [d.city, d.country].filter(Boolean).map(esc).join(' / ');
@@ -234,7 +234,7 @@ async function sites() {
       `<div><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${t.up ? '#34d399' : '#fb7185'};margin-right:6px;box-shadow:0 0 6px ${t.up ? 'rgba(52,211,153,.6)' : 'rgba(251,113,133,.6)'}"></span>${esc(t.url)}</div>`).join('') || esc(s.upstream);
     $('#site-body').innerHTML = list.length ? list.map(s => `<tr>
       <td>${esc(s.name)}</td><td class="mono">${esc(s.domain)}</td><td class="mono">${upCell(s)}</td>
-      <td>${s.waf_mode === 'strict' ? '<span class="tag orange">严格</span>' : '<span class="tag blue">平衡</span>'}${s.dynamic_mode === 'block' ? ' <span class="tag cyan">动态拦截</span>' : s.dynamic_mode === 'observe' ? ' <span class="tag cyan">动态观察</span>' : ''}</td>
+      <td>${s.waf_mode === 'strict' ? '<span class="tag orange">严格</span>' : '<span class="tag blue">平衡</span>'}${s.dynamic_mode === 'block' ? ' <span class="tag cyan">动态拦截</span>' : s.dynamic_mode === 'observe' ? ' <span class="tag cyan">动态观察</span>' : ''}${s.bot_mode && s.bot_mode !== 'off' ? ' <span class="tag violet">反爬' + ({block: '拦截', captcha: '验证', log: '观察'}[s.bot_mode] || '') + '</span>' : ''}</td>
       <td>${s.cc_rate > 0 ? s.cc_rate + ' req/s' + (s.captcha ? ' +人机验证' : '') : '<span class="hint">关闭</span>'}</td>
       <td>${s.auth_user ? '<span class="tag on">开启</span>' : '<span class="hint">关闭</span>'}</td>
       <td>${s.enabled ? '<span class="tag on">防护中</span>' : '<span class="tag off">已停用</span>'}</td>
@@ -245,7 +245,7 @@ async function sites() {
 }
 
 function siteForm(s) {
-  s = s || {name: '', domain: '', upstream: 'http://', enabled: true, waf_mode: 'balanced', cc_rate: 0, cc_burst: 0, captcha: false, auth_user: '', auth_pass: '', resp_detect: false, dynamic_mode: 'off', cert_pem: '', key_pem: '', http_redirect: false};
+  s = s || {name: '', domain: '', upstream: 'http://', enabled: true, waf_mode: 'balanced', cc_rate: 0, cc_burst: 0, captcha: false, auth_user: '', auth_pass: '', resp_detect: false, dynamic_mode: 'off', bot_mode: 'off', bot_strict: false, cert_pem: '', key_pem: '', http_redirect: false};
   $('#modal-root').innerHTML = `<div class="modal-mask" onclick="if(event.target===this)closeModal()"><div class="modal">
   <h3>${s.id ? '编辑站点' : '添加防护站点'}</h3>
   <div class="form-grid">
@@ -271,6 +271,12 @@ function siteForm(s) {
     <option value="off" ${s.dynamic_mode !== 'observe' && s.dynamic_mode !== 'block' ? 'selected' : ''}>关闭</option>
     <option value="observe" ${s.dynamic_mode === 'observe' ? 'selected' : ''}>观察（仅记录，不拦截）</option>
     <option value="block" ${s.dynamic_mode === 'block' ? 'selected' : ''}>拦截（缺失令牌即 403）</option></select></div>
+  <div class="form-row"><label>反爬 Bot 防护（内置爬虫 UA 特征库：脚本库 / 采集框架 / 下载器 / 扫描攻击工具 / SEO 外链爬虫）</label><select id="f-bot">
+    <option value="off" ${s.bot_mode !== 'block' && s.bot_mode !== 'captcha' && s.bot_mode !== 'log' ? 'selected' : ''}>关闭</option>
+    <option value="log" ${s.bot_mode === 'log' ? 'selected' : ''}>观察（仅记录，不拦截）</option>
+    <option value="captcha" ${s.bot_mode === 'captcha' ? 'selected' : ''}>人机验证（命中即弹 JS 挑战）</option>
+    <option value="block" ${s.bot_mode === 'block' ? 'selected' : ''}>拦截（命中即 403）</option></select></div>
+  <label class="check"><input id="f-botstrict" type="checkbox" ${s.bot_strict ? 'checked' : ''}> 严格模式：连同搜索引擎爬虫（Googlebot / Baiduspider 等）一并处置，默认放行以免误伤 SEO 收录</label>
   <details class="https-box" ${s.cert_pem ? 'open' : ''}>
     <summary>HTTPS 证书配置（TLS 监听默认 :8443，按域名 SNI 匹配）</summary>
     <div class="form-row"><label>证书（PEM 格式，含证书链）</label><textarea id="f-cert" rows="4" placeholder="-----BEGIN CERTIFICATE-----">${esc(s.cert_pem || '')}</textarea></div>
@@ -290,6 +296,7 @@ async function saveSite(id) {
     auth_user: $('#f-authu').value.trim(), auth_pass: $('#f-authp').value,
     enabled: $('#f-enabled').checked, captcha: $('#f-captcha').checked, resp_detect: $('#f-resp').checked,
     dynamic_mode: $('#f-dyn').value,
+    bot_mode: $('#f-bot').value, bot_strict: $('#f-botstrict').checked,
     cert_pem: $('#f-cert').value.trim(), key_pem: $('#f-key').value.trim(), http_redirect: $('#f-redirect').checked,
   };
   try {
@@ -312,7 +319,7 @@ async function logs() {
   <div class="toolbar">
     <input id="q-ip" placeholder="客户端 IP">
     <input id="q-domain" placeholder="站点域名">
-    <select id="q-action"><option value="">全部动作</option><option value="waf">WAF拦截</option><option value="semantic">语义检测</option><option value="reputation">信誉封禁</option><option value="cc">CC限频</option><option value="blacklist">黑名单</option><option value="geo">地区限制</option><option value="resp">响应拦截</option><option value="custom">自定义规则</option><option value="dynamic">动态防护</option></select>
+    <select id="q-action"><option value="">全部动作</option><option value="waf">WAF拦截</option><option value="semantic">语义检测</option><option value="reputation">信誉封禁</option><option value="cc">CC限频</option><option value="blacklist">黑名单</option><option value="geo">地区限制</option><option value="resp">响应拦截</option><option value="custom">自定义规则</option><option value="dynamic">动态防护</option><option value="bot">Bot防护</option></select>
     <button class="btn" onclick="logPage=1;loadLogs()">${ico('search')}查询</button>
     <button class="btn ghost" onclick="exportCSV()">${ico('download')}导出 CSV</button>
     <button class="btn ghost" onclick="window.open('/api/report')">${ico('report')}导出防护报告</button>

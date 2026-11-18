@@ -518,6 +518,27 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 反爬 Bot 防护：内置爬虫 UA 特征库，命中恶意/自动化客户端按站点动作处置。
+	// 置于自定义规则之后（放行规则可豁免特定 UA）、CC 与扫体之前（低成本前置过滤）。
+	// 善意爬虫（搜索引擎等）默认放行，仅严格模式处置；已通过人机验证的 cookie 豁免。
+	if site.BotMode != "" && site.BotMode != "off" && !p.Cap.ValidCookie(r, ip, site.ID) {
+		kind, sig := classifyBotUA(r.Header.Get("User-Agent"))
+		if kind == "bad" || (kind == "good" && site.BotStrict) {
+			switch site.BotMode {
+			case "block":
+				block(http.StatusForbidden, "bot", "Bot 防护：识别为自动化爬虫/攻击工具（"+sig+"）", botRuleID)
+				return
+			case "captcha":
+				p.Store.AddTraffic(site.ID, true, 0)
+				p.logAttack(site, ip, r, "bot", "Bot 防护：识别为自动化客户端，触发人机验证（"+sig+"）", botRuleID, http.StatusTooManyRequests, reqID)
+				p.Cap.Issue(w, ip, site.ID, r.URL.RequestURI())
+				return
+			case "log":
+				p.logAttack(site, ip, r, "bot", "Bot 防护（观察）：识别为自动化爬虫（"+sig+"）", botRuleID, http.StatusOK, reqID)
+			}
+		}
+	}
+
 	if site.CCRate > 0 && !p.Cap.ValidCookie(r, ip, site.ID) {
 		if !p.Limiter.Allow(fmt.Sprintf("%s|%d", ip, site.ID), site.CCRate, site.CCBurst) {
 			if site.Captcha {
@@ -858,7 +879,7 @@ func severityOf(action string) string {
 	switch action {
 	case "waf", "resp":
 		return "CRITICAL"
-	case "cc", "semantic", "reputation", "custom", "dynamic":
+	case "cc", "semantic", "reputation", "custom", "dynamic", "bot":
 		return "WARNING"
 	default:
 		return "NOTICE"

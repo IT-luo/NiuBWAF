@@ -23,6 +23,8 @@
 
 - **请求检测**：内嵌 OWASP CRS4 规则集 + 自研语义分析引擎（SQLi / XSS / RCE / 命令注入 / 扫描器特征）
 - **CC 防护**：限流 + JS 人机验证挑战（混淆算法，无明文逻辑）
+- **反爬 Bot 防护**：内置爬虫 UA 特征库（脚本库 / 采集框架 / 下载器 / 扫描攻击工具 / SEO 外链爬虫），一键拦截或人机验证，搜索引擎等善意爬虫默认放行（可选严格模式）
+- **动态防护**：向页面植入混淆令牌，拦截无令牌的自动化写操作 / 重放 / CSRF
 - **IP 治理**：黑白名单、IP 信誉库（攻击自动累积封禁、宽限与赦免）、GeoIP 归属地
 - **响应防护**：响应体信息泄露检测（SQL 报错、敏感路径回显等）
 - **运营能力**：自定义规则引擎、告警通知、攻击日志检索与流式 CSV 导出、实时安全大屏、Prometheus `/metrics`
@@ -54,7 +56,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o niu
 ```
 internal/
   engine/   Coraza v3 封装：CRS4 装载、语义引擎、送检上限与截断豁免
-  proxy/    反向代理：站点路由、SNI、负载均衡、CC/人机验证、响应检测
+  proxy/    反向代理：站点路由、SNI、负载均衡、CC/人机验证、反爬 Bot、动态防护、响应检测
   api/      管理 API：站点/日志/规则/信誉/告警/设置/备份
   store/    纯 Go SQLite 持久层（WAL、连接池、自动备份）
   metrics/  Prometheus 指标

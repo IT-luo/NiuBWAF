@@ -122,7 +122,7 @@ async function refresh() {
 refresh();
 setInterval(refresh, 10000);
 
-const tag = a => ({waf:'<span class="tag red">WAF拦截</span>',resp:'<span class="tag red">响应拦截</span>',cc:'<span class="tag orange">CC限频</span>',blacklist:'<span class="tag red">黑名单</span>',geo:'<span class="tag blue">地区限制</span>',semantic:'<span class="tag blue">语义检测</span>',reputation:'<span class="tag orange">信誉封禁</span>',custom:'<span class="tag violet">自定义</span>',dynamic:'<span class="tag cyan">动态防护</span>'}[a] || esc(a));
+const tag = a => ({waf:'<span class="tag red">WAF拦截</span>',resp:'<span class="tag red">响应拦截</span>',cc:'<span class="tag orange">CC限频</span>',blacklist:'<span class="tag red">黑名单</span>',geo:'<span class="tag blue">地区限制</span>',semantic:'<span class="tag blue">语义检测</span>',reputation:'<span class="tag orange">信誉封禁</span>',custom:'<span class="tag violet">自定义</span>',dynamic:'<span class="tag cyan">动态防护</span>',bot:'<span class="tag violet">Bot防护</span>'}[a] || esc(a));
 const es = new EventSource('/api/events');
 es.onmessage = ev => {
   const d = JSON.parse(ev.data);

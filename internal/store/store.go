@@ -55,6 +55,8 @@ type Site struct {
 	Captcha      bool   `json:"captcha"`
 	RespDetect   bool   `json:"resp_detect"`
 	DynamicMode  string `json:"dynamic_mode"`
+	BotMode      string `json:"bot_mode"`
+	BotStrict    bool   `json:"bot_strict"`
 	CertPEM      string `json:"cert_pem"`
 	KeyPEM       string `json:"key_pem"`
 	HTTPRedirect bool   `json:"http_redirect"`
@@ -289,6 +291,8 @@ func (s *Store) migrate() error {
 			captcha INTEGER DEFAULT 0,
 			resp_detect INTEGER DEFAULT 0,
 			dynamic_mode TEXT DEFAULT 'off',
+			bot_mode TEXT DEFAULT 'off',
+			bot_strict INTEGER DEFAULT 0,
 			cert_pem TEXT DEFAULT '',
 			key_pem TEXT DEFAULT '',
 			http_redirect INTEGER DEFAULT 0,
@@ -363,7 +367,7 @@ func (s *Store) migrate() error {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
-	for _, col := range []string{"cert_pem TEXT DEFAULT ''", "key_pem TEXT DEFAULT ''", "http_redirect INTEGER DEFAULT 0", "dynamic_mode TEXT DEFAULT 'off'"} {
+	for _, col := range []string{"cert_pem TEXT DEFAULT ''", "key_pem TEXT DEFAULT ''", "http_redirect INTEGER DEFAULT 0", "dynamic_mode TEXT DEFAULT 'off'", "bot_mode TEXT DEFAULT 'off'", "bot_strict INTEGER DEFAULT 0"} {
 		s.DB.Exec("ALTER TABLE sites ADD COLUMN " + col)
 	}
 	if s.GetSetting("admin_pass") == "" {
@@ -511,7 +515,7 @@ func (s *Store) SetSetting(key, val string) error {
 }
 
 func (s *Store) ListSites() ([]Site, error) {
-	rows, err := s.DB.Query(`SELECT id,name,domain,upstream,enabled,waf_mode,auth_user,auth_pass,cc_rate,cc_burst,captcha,resp_detect,dynamic_mode,cert_pem,key_pem,http_redirect,created_at FROM sites ORDER BY id`)
+	rows, err := s.DB.Query(`SELECT id,name,domain,upstream,enabled,waf_mode,auth_user,auth_pass,cc_rate,cc_burst,captcha,resp_detect,dynamic_mode,bot_mode,bot_strict,cert_pem,key_pem,http_redirect,created_at FROM sites ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -519,7 +523,7 @@ func (s *Store) ListSites() ([]Site, error) {
 	out := []Site{}
 	for rows.Next() {
 		var t Site
-		if err := rows.Scan(&t.ID, &t.Name, &t.Domain, &t.Upstream, &t.Enabled, &t.WAFMode, &t.AuthUser, &t.AuthPass, &t.CCRate, &t.CCBurst, &t.Captcha, &t.RespDetect, &t.DynamicMode, &t.CertPEM, &t.KeyPEM, &t.HTTPRedirect, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Name, &t.Domain, &t.Upstream, &t.Enabled, &t.WAFMode, &t.AuthUser, &t.AuthPass, &t.CCRate, &t.CCBurst, &t.Captcha, &t.RespDetect, &t.DynamicMode, &t.BotMode, &t.BotStrict, &t.CertPEM, &t.KeyPEM, &t.HTTPRedirect, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, t)
@@ -529,8 +533,8 @@ func (s *Store) ListSites() ([]Site, error) {
 
 func (s *Store) GetSite(id int64) (*Site, error) {
 	var t Site
-	err := s.DB.QueryRow(`SELECT id,name,domain,upstream,enabled,waf_mode,auth_user,auth_pass,cc_rate,cc_burst,captcha,resp_detect,dynamic_mode,cert_pem,key_pem,http_redirect,created_at FROM sites WHERE id=?`, id).
-		Scan(&t.ID, &t.Name, &t.Domain, &t.Upstream, &t.Enabled, &t.WAFMode, &t.AuthUser, &t.AuthPass, &t.CCRate, &t.CCBurst, &t.Captcha, &t.RespDetect, &t.DynamicMode, &t.CertPEM, &t.KeyPEM, &t.HTTPRedirect, &t.CreatedAt)
+	err := s.DB.QueryRow(`SELECT id,name,domain,upstream,enabled,waf_mode,auth_user,auth_pass,cc_rate,cc_burst,captcha,resp_detect,dynamic_mode,bot_mode,bot_strict,cert_pem,key_pem,http_redirect,created_at FROM sites WHERE id=?`, id).
+		Scan(&t.ID, &t.Name, &t.Domain, &t.Upstream, &t.Enabled, &t.WAFMode, &t.AuthUser, &t.AuthPass, &t.CCRate, &t.CCBurst, &t.Captcha, &t.RespDetect, &t.DynamicMode, &t.BotMode, &t.BotStrict, &t.CertPEM, &t.KeyPEM, &t.HTTPRedirect, &t.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -538,9 +542,9 @@ func (s *Store) GetSite(id int64) (*Site, error) {
 }
 
 func (s *Store) CreateSite(t *Site) error {
-	r, err := s.DB.Exec(`INSERT INTO sites(name,domain,upstream,enabled,waf_mode,auth_user,auth_pass,cc_rate,cc_burst,captcha,resp_detect,dynamic_mode,cert_pem,key_pem,http_redirect)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		t.Name, t.Domain, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst, t.Captcha, t.RespDetect, t.DynamicMode, t.CertPEM, t.KeyPEM, t.HTTPRedirect)
+	r, err := s.DB.Exec(`INSERT INTO sites(name,domain,upstream,enabled,waf_mode,auth_user,auth_pass,cc_rate,cc_burst,captcha,resp_detect,dynamic_mode,bot_mode,bot_strict,cert_pem,key_pem,http_redirect)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		t.Name, t.Domain, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst, t.Captcha, t.RespDetect, t.DynamicMode, t.BotMode, t.BotStrict, t.CertPEM, t.KeyPEM, t.HTTPRedirect)
 	if err != nil {
 		return err
 	}
@@ -549,8 +553,8 @@ func (s *Store) CreateSite(t *Site) error {
 }
 
 func (s *Store) UpdateSite(t *Site) error {
-	_, err := s.DB.Exec(`UPDATE sites SET name=?,domain=?,upstream=?,enabled=?,waf_mode=?,auth_user=?,auth_pass=?,cc_rate=?,cc_burst=?,captcha=?,resp_detect=?,dynamic_mode=?,cert_pem=?,key_pem=?,http_redirect=? WHERE id=?`,
-		t.Name, t.Domain, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst, t.Captcha, t.RespDetect, t.DynamicMode, t.CertPEM, t.KeyPEM, t.HTTPRedirect, t.ID)
+	_, err := s.DB.Exec(`UPDATE sites SET name=?,domain=?,upstream=?,enabled=?,waf_mode=?,auth_user=?,auth_pass=?,cc_rate=?,cc_burst=?,captcha=?,resp_detect=?,dynamic_mode=?,bot_mode=?,bot_strict=?,cert_pem=?,key_pem=?,http_redirect=? WHERE id=?`,
+		t.Name, t.Domain, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst, t.Captcha, t.RespDetect, t.DynamicMode, t.BotMode, t.BotStrict, t.CertPEM, t.KeyPEM, t.HTTPRedirect, t.ID)
 	return err
 }
 
