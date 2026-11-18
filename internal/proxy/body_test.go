@@ -38,3 +38,26 @@ func TestBodyInspectLimit(t *testing.T) {
 		t.Fatalf("负数应回退默认, got %d", got)
 	}
 }
+
+func TestIsBinaryContentType(t *testing.T) {
+	bin := []string{
+		"application/octet-stream", "application/octet-stream; charset=binary",
+		"image/png", "video/mp4", "audio/mpeg", "font/woff2",
+		"application/zip", "application/gzip", "application/x-tar", "application/zstd",
+		"application/java-archive", "application/pdf", "APPLICATION/ZIP",
+	}
+	for _, ct := range bin {
+		if !isBinaryContentType(ct) {
+			t.Fatalf("应判定为二进制: %q", ct)
+		}
+	}
+	text := []string{
+		"", "text/plain", "application/json", "application/x-www-form-urlencoded",
+		"multipart/form-data; boundary=x", "application/xml", "text/html; charset=utf-8",
+	}
+	for _, ct := range text {
+		if isBinaryContentType(ct) {
+			t.Fatalf("不应判定为二进制: %q", ct)
+		}
+	}
+}

@@ -169,11 +169,11 @@ func TestBodyScanLimitSetting(t *testing.T) {
 	a.getSettings(rec)
 	var got map[string]string
 	json.Unmarshal(rec.Body.Bytes(), &got)
-	if got["body_scan_kb"] != "128" {
-		t.Fatalf("默认送检上限应为 128KB, got %q", got["body_scan_kb"])
+	if got["body_scan_kb"] != "16" {
+		t.Fatalf("默认送检上限应为 16KB, got %q", got["body_scan_kb"])
 	}
-	if a.Proxy.Engine.ScanLimit() != 128<<10 {
-		t.Fatalf("引擎送检上限应为 128KB, got %d", a.Proxy.Engine.ScanLimit())
+	if a.Proxy.Engine.ScanLimit() != 16<<10 {
+		t.Fatalf("引擎送检上限应为 16KB, got %d", a.Proxy.Engine.ScanLimit())
 	}
 
 	put := func(body string) *httptest.ResponseRecorder {
@@ -186,7 +186,7 @@ func TestBodyScanLimitSetting(t *testing.T) {
 			t.Fatalf("非法送检上限应返回 400: %s → %d %s", bad, r.Code, r.Body.String())
 		}
 	}
-	if a.Proxy.Engine.ScanLimit() != 128<<10 {
+	if a.Proxy.Engine.ScanLimit() != 16<<10 {
 		t.Fatal("非法配置不应改动引擎送检上限")
 	}
 	if r := put(`{"body_scan_kb":"64"}`); r.Code != 200 {

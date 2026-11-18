@@ -569,17 +569,28 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 二进制体（镜像层/文件上传等）无文本攻击面：跳过 CRS 扫体与语义 body 扫描，
+	// 仅做头/URI 检测，避免大二进制流承担 ~4.5µs/字节的正则成本
+	binaryCT := isBinaryContentType(r.Header.Get("Content-Type"))
+	detectBody := body
+	if binaryCT {
+		detectBody = nil
+	}
+
 	// Go 将 Host 提升至 r.Host，需补回供 CRS 协议检查（920280 等）使用
 	hdr := r.Header.Clone()
 	hdr.Set("Host", r.Host)
 	res := p.Engine.Detect(site.WAFMode, site.excl, &engine.RequestInfo{
 		ClientIP: ip, ServerIP: "127.0.0.1",
 		Method: r.Method, URL: r.URL.RequestURI(), Proto: r.Proto,
-		Headers: hdr, Body: body,
+		Headers: hdr, Body: detectBody,
 	})
 	if res.Blocked {
 		block(res.Status, "waf", res.Msg, res.RuleID)
 		return
+	}
+	if res.LogOnly {
+		p.logAttack(site, ip, r, "waf", res.Msg+"（语义复核未确认，放行）", res.RuleID, http.StatusOK, reqID)
 	}
 
 	semMode := p.Store.GetSetting("semantic_mode")
@@ -587,7 +598,11 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		semMode = "observe"
 	}
 	if semMode != "off" {
-		if hit := p.Engine.Semantic(site.excl, r.URL.RequestURI(), body); hit != nil {
+		semBody := body
+		if binaryCT {
+			semBody = nil
+		}
+		if hit := p.Engine.Semantic(site.excl, r.URL.RequestURI(), semBody); hit != nil {
 			if semMode == "block" {
 				block(http.StatusForbidden, "semantic", hit.Msg, hit.RuleID)
 				return
@@ -635,17 +650,34 @@ func (p *Proxy) bodyInspectLimit() int64 {
 	return int64(kb) << 10
 }
 
-// bodyScanLimit 返回送检上限（字节）。默认 128KB，可由设置 body_scan_kb 调整（16KB–1MB）。
+// bodyScanLimit 返回送检上限（字节）。默认 16KB，可由设置 body_scan_kb 调整（16KB–1MB）。
 // CRS 正则扫描成本约 4.5µs/字节，因此该上限决定单请求检测的 CPU 上界；
 // 超出部分仍原样转发给上游，只是不做内容检测。
 func (p *Proxy) bodyScanLimit() int {
-	kb := 128
+	kb := 16
 	if v := p.Store.GetSetting("body_scan_kb"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			kb = n
 		}
 	}
 	return kb << 10
+}
+
+// isBinaryContentType 判定二进制类 Content-Type（无文本攻击面），用于跳过请求体扫描
+func isBinaryContentType(ct string) bool {
+	base := strings.ToLower(ct)
+	if i := strings.IndexByte(base, ';'); i >= 0 {
+		base = strings.TrimSpace(base[:i])
+	}
+	switch base {
+	case "application/octet-stream", "application/zip", "application/gzip", "application/x-gzip",
+		"application/x-tar", "application/x-bzip2", "application/x-xz", "application/zstd",
+		"application/wasm", "application/x-7z-compressed", "application/x-rar-compressed",
+		"application/java-archive", "application/x-iso9660-image", "application/pdf":
+		return true
+	}
+	return strings.HasPrefix(base, "image/") || strings.HasPrefix(base, "video/") ||
+		strings.HasPrefix(base, "audio/") || strings.HasPrefix(base, "font/")
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, site *cachedSite, ip, reqID string, countTraffic bool) {

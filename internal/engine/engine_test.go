@@ -111,3 +111,33 @@ func TestExclusions(t *testing.T) {
 		}
 	}
 }
+func TestConfirmCodeInj(t *testing.T) {
+	e, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	yes := []struct{ uri, body string }{
+		{"/x", "<?php eval($_POST[cmd]);?>"},
+		{"/x", "(#_memberAccess=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)"},
+	}
+	for _, c := range yes {
+		if !e.confirmCodeInj(c.uri, []byte(c.body)) {
+			t.Fatalf("应确认代码注入: %q %q", c.uri, c.body)
+		}
+	}
+	no := []struct{ uri, body string }{
+		{"/list?page=2&sort=name", "quarterly revenue summary and meeting notes"},
+		{"/", ""},
+	}
+	for _, c := range no {
+		if e.confirmCodeInj(c.uri, []byte(c.body)) {
+			t.Fatalf("不应确认代码注入: %q %q", c.uri, c.body)
+		}
+	}
+}
+
+func TestSoleDetectionRule(t *testing.T) {
+	if got := soleDetectionRule(nil); got != 0 {
+		t.Fatalf("空匹配应返回 0, got %d", got)
+	}
+}

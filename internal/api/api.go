@@ -789,7 +789,7 @@ func (a *API) getSettings(w http.ResponseWriter) {
 	}
 	for k, def := range map[string]string{"reputation_enabled": "on", "rep_window": "24", "rep_threshold": "30", "rep_ban_ttl": "60", "rep_max_ttl": "1440",
 		"alert_enabled": "off", "alert_threshold": "50", "alert_window": "60", "alert_cooldown": "300",
-		"acme_enabled": "off", "acme_staging": "on", "intel_provider": "off", "body_inspect_kb": "2048", "body_scan_kb": "128"} {
+		"acme_enabled": "off", "acme_staging": "on", "intel_provider": "off", "body_inspect_kb": "2048", "body_scan_kb": "16"} {
 		if out[k] == "" {
 			out[k] = def
 		}

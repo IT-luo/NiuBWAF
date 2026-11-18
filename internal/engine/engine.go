@@ -18,6 +18,7 @@ import (
 
 type Result struct {
 	Blocked  bool
+	LogOnly  bool // 命中但按策略仅记录不拦截（如 932235 语义复核未确认）
 	Status   int
 	RuleID   int
 	Msg      string
@@ -33,9 +34,10 @@ type Engine struct {
 	matched   sync.Map
 }
 
-// defaultScanLimit 请求体送检上限默认值。CRS 正则扫描成本约 4.5µs/字节（2MB 请求体
-// 需 ~9 秒 CPU），必须设上限，否则大体积请求可被用作低成本 CPU 拒绝服务。
-const defaultScanLimit = 128 << 10
+// defaultScanLimit 请求体送检上限默认值。CRS 正则扫描成本约 4.5µs/字节（实测 64KB
+// 二进制体单请求 ~380ms），必须设上限，否则大体积请求可被用作低成本 CPU 拒绝服务；
+// 16KB 已覆盖绝大多数攻击载荷位置，二进制 Content-Type 由代理层直接跳过扫体。
+const defaultScanLimit = 16 << 10
 
 // maxScanLimit 送检上限的硬上限，与 SecRequestBodyInMemoryLimit 一致，
 // 确保请求体始终留在内存、不落临时文件。
@@ -217,8 +219,15 @@ Include @owasp_crs/*.conf
 //   - 920420 Content-Type 白名单：仅在用户显式配置 allowed_content_types 时启用严格模式；
 //     默认放行任意 CT——反向代理 WAF 不应因 CT 不在白名单而拒绝请求（真实流量 CT 无穷尽），
 //     请求体仍由 REQUEST_BODY 规则与语义引擎检测。
+//   - 920270 请求空字符：二进制/压缩类正常请求体含 \x00 即误报（FP 358 / TP 5）
+//   - 933150/933120 PHP 函数名/配置指令：正文提及函数名即误报，调用形态由 933160/100203 覆盖（FP 135 / TP 6）
+//   - 932130 Unix shell 表达式：正常参数含 shell 元字符组合即误报，命令注入由 932235/100001 覆盖（FP 65 / TP 3）
+//   - 942190/942540/942140/942290 MSSQL/拆分查询/库名/MongoDB：宽匹配误报，SQLi 由 942100/语义引擎 100200 覆盖（FP 89 / TP 5）
+//   - 920470 非法 Content-Type：非标准但合法的 CT 误报，体检测不依赖该头校验（FP 18 / TP 1）
+//   - 932235 不整体豁免：单独命中时须语义引擎 100203 复核确认才拦截（FP 434 / TP 37，见 Detect 熔断）
 func defaultExclusions(extraCT []string) []Exclusion {
-	ids := []int{942550, 930120, 932260, 932370, 932380, 943110, 921150, 920450, 941180, 932230, 933180}
+	ids := []int{942550, 930120, 932260, 932370, 932380, 943110, 921150, 920450, 941180, 932230, 933180,
+		920270, 933150, 933120, 932130, 942190, 942540, 942140, 942290, 920470}
 	if len(extraCT) == 0 {
 		ids = append(ids, 920420)
 	}
@@ -333,6 +342,16 @@ func (e *Engine) Detect(mode string, excl []Exclusion, r *RequestInfo) Result {
 	defer tx.Close()
 	txID := tx.ID()
 
+	// 932235 熔断：该规则宽匹配误报大（FP 434 / TP 37），单独命中时须语义引擎
+	// 代码注入复核确认才拦截，否则降级为仅记录，兼顾误报与检出。
+	finish := func(it *types.Interruption, matched []types.MatchedRule) Result {
+		res := resultFrom(it, matched)
+		if res.Blocked && res.RuleID == 932235 && soleDetectionRule(matched) == 932235 && !e.confirmCodeInj(r.URL, body) {
+			res.Blocked, res.LogOnly = false, true
+		}
+		return res
+	}
+
 	tx.ProcessConnection(r.ClientIP, 0, r.ServerIP, 0)
 	tx.ProcessURI(r.URL, r.Method, r.Proto)
 	for k, vv := range r.Headers {
@@ -341,18 +360,50 @@ func (e *Engine) Detect(mode string, excl []Exclusion, r *RequestInfo) Result {
 		}
 	}
 	if it := tx.ProcessRequestHeaders(); it != nil {
-		return resultFrom(it, e.takeMatched(txID))
+		return finish(it, e.takeMatched(txID))
 	}
 	if len(body) > 0 {
 		if it, _, err := tx.WriteRequestBody(body); err == nil && it != nil {
-			return resultFrom(it, e.takeMatched(txID))
+			return finish(it, e.takeMatched(txID))
 		}
 	}
 	if it, err := tx.ProcessRequestBody(); err == nil && it != nil {
-		return resultFrom(it, e.takeMatched(txID))
+		return finish(it, e.takeMatched(txID))
 	}
 	e.takeMatched(txID)
 	return Result{}
+}
+
+// confirmCodeInj 语义引擎代码注入复核（100203 探针），用于 932235 熔断确认
+func (e *Engine) confirmCodeInj(uri string, body []byte) bool {
+	check := func(v string) bool {
+		for _, n := range Normalize(v) {
+			if sc, _ := codeInjScore(strings.ToLower(n)); sc >= codeThreshold {
+				return true
+			}
+		}
+		return false
+	}
+	if check(uri) {
+		return true
+	}
+	return len(body) > 0 && check(truncUTF8(string(body), 8<<10))
+}
+
+// soleDetectionRule 返回唯一命中的检测规则 ID（排除汇总与内置控制规则），非唯一返回 0
+func soleDetectionRule(matched []types.MatchedRule) int {
+	sole := 0
+	for _, mr := range matched {
+		id := mr.Rule().ID()
+		if id == 949110 || id == 949120 || id == 959100 || id == 900002 || id == 900003 || (id >= 100100 && id < 100200) {
+			continue
+		}
+		if sole != 0 && sole != id {
+			return 0
+		}
+		sole = id
+	}
+	return sole
 }
 
 // withTruncationExclusions 复制豁免列表（调用方切片跨请求共享，不可原地追加）

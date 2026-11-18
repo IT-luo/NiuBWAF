@@ -852,7 +852,7 @@ async function settings() {
       <label class="hint">送检</label><input id="body-scan-kb" type="number" min="16" max="1024" style="width:120px"> KB
       <button class="btn" onclick="saveBodyScan()">保存</button>
     </div>
-    <p class="hint">实际交给检测引擎的请求体前缀长度（默认 128 KB，范围 16–1024 KB）。规则集对请求体做正则扫描，成本约每 128 KB 耗 0.55 秒 CPU，因此该值决定单请求检测的 CPU 上界，可防止大请求体被用作低成本拒绝服务。超出送检上限的部分原样转发给上游、不做内容检测；实际送检量 = min(检查上限, 送检上限)。发生截断时自动豁免 200002/200003 两条“请求体解析完整性”规则，避免正常大文件上传被误判为 400。修改即时生效。</p>
+    <p class="hint">实际交给检测引擎的请求体前缀长度（默认 16 KB，范围 16–1024 KB）。规则集对请求体做正则扫描，成本约每 16 KB 耗 70 毫秒 CPU，因此该值决定单请求检测的 CPU 上界，可防止大请求体被用作低成本拒绝服务。二进制 Content-Type（镜像层/压缩包/音视频等）自动跳过扫体。超出送检上限的部分原样转发给上游、不做内容检测；实际送检量 = min(检查上限, 送检上限)。发生截断时自动豁免 200002/200003 两条“请求体解析完整性”规则，避免正常大文件上传被误判为 400。修改即时生效。</p>
   </div>
   <div class="panel"><h3>允许的请求体 Content-Type</h3>
     <div class="toolbar">
@@ -892,7 +892,7 @@ async function settings() {
     $('#acme-email').value = s.acme_email || '';
     $('#metrics-token').value = s.metrics_token || '';
     $('#body-inspect-kb').value = s.body_inspect_kb || 2048;
-    $('#body-scan-kb').value = s.body_scan_kb || 128;
+    $('#body-scan-kb').value = s.body_scan_kb || 16;
     $('#allowed-ct').value = s.allowed_content_types || '';
     loadBackups();
   } catch (e) { if (e.message !== '未登录') toast(e.message, true); }
