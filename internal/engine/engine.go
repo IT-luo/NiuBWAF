@@ -186,9 +186,10 @@ SecAuditEngine Off
 Include @crs-setup.conf.example
 SecAction "id:900000,phase:1,nolog,pass,t:none,setvar:tx.blocking_paranoia_level=%d,setvar:tx.detection_paranoia_level=%d"
 SecAction "id:900001,phase:1,nolog,pass,t:none,setvar:tx.inbound_anomaly_score_threshold=5,setvar:tx.outbound_anomaly_score_threshold=4"
-%s%sSecRule ARGS|ARGS_NAMES|REQUEST_URI|REQUEST_BODY "(?:;|\||\x60|&&|\$\()\s*(?:cat|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php|chmod|chown|rm|dd|mkfifo|telnet)\b" "id:100001,phase:2,block,t:none,t:urlDecodeUni,t:lowercase,setvar:tx.anomaly_score=+5,setvar:tx.inbound_anomaly_score_pl1=+5,setvar:tx.inbound_anomaly_score_pl2=+5,msg:'牛B WAF: Unix 命令注入尝试',logdata:'Matched Data: %%{MATCHED_VAR} found within %%{MATCHED_VAR_NAME}',severity:'CRITICAL'"
+SecAction "id:900003,phase:1,nolog,pass,t:none,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'"
+%s%sSecRule ARGS|ARGS_NAMES|REQUEST_URI|REQUEST_BODY "(?:;|\||\x60|&&|\$\()\s*(?:cat|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php|chmod|chown|rm|dd|mkfifo|telnet)(?:[\s/\\;|&]|$)" "id:100001,phase:2,block,t:none,t:urlDecodeUni,t:lowercase,setvar:tx.anomaly_score=+5,setvar:tx.inbound_anomaly_score_pl1=+5,setvar:tx.inbound_anomaly_score_pl2=+5,msg:'牛B WAF: Unix 命令注入尝试',logdata:'Matched Data: %%{MATCHED_VAR} found within %%{MATCHED_VAR_NAME}',severity:'CRITICAL'"
 Include @owasp_crs/*.conf
-`, pl, pl, contentTypeDirectives(extraCT), exclusionDirectives(excl))
+`, pl, pl, contentTypeDirectives(extraCT), exclusionDirectives(append(defaultExclusions(extraCT), excl...)))
 	return coraza.NewWAF(coraza.NewWAFConfig().
 		WithRootFS(crs.FS).
 		WithErrorCallback(func(mr types.MatchedRule) {
@@ -198,6 +199,34 @@ Include @owasp_crs/*.conf
 			*lst = append(*lst, mr)
 		}).
 		WithDirectives(directives))
+}
+
+// defaultExclusions 内置默认豁免规则（基于 BLAZEHTTP 3.4 万真实流量样本回归：
+// 这些规则对遥测/日志/REST 类正常流量误报量大且检出贡献≈0，等价攻击已由
+// 932235/930100/942100/语义引擎等覆盖）：
+//   - 942550 JSON SQLi：JSON API 常规字段误报（FP 195 / TP 0）
+//   - 930120 敏感文件名列表：遥测正文误报，LFI 检测由语义引擎 100202 精准接管（FP 140 / TP 0）
+//   - 932260 直接 Unix 命令执行：正常 URL 参数含分隔符+命令词即误报（FP 114 / TP 0）
+//   - 932370/932380 Windows 命令注入：宽匹配误报（FP 121 / TP 0）
+//   - 943110 会话固定：参数名含 sessionid 即误报（FP 16 / TP 0）
+//   - 921150 头部 CR/LF 注入：Go net/http 已拒绝裸 CRLF 头，白样本多行/编码头误报（FP 1353 / TP 0）
+//   - 920450 受限请求头策略：正常 Content-Encoding/Lock-Token 等头误报（FP 231 / TP 0）
+//   - 941180 Node-Validator 黑名单词：参数含 user/system 等常用词即误报（FP 174 / TP 0）
+//   - 932230 2-3 字符 Unix 命令：宽匹配误报，命令注入由 932235/100001 覆盖（FP 39 / TP 0）
+//   - 933180 PHP 变量函数调用：误报，PHP 注入由 933160/语义引擎 100203 覆盖（FP 16 / TP 0）
+//   - 920420 Content-Type 白名单：仅在用户显式配置 allowed_content_types 时启用严格模式；
+//     默认放行任意 CT——反向代理 WAF 不应因 CT 不在白名单而拒绝请求（真实流量 CT 无穷尽），
+//     请求体仍由 REQUEST_BODY 规则与语义引擎检测。
+func defaultExclusions(extraCT []string) []Exclusion {
+	ids := []int{942550, 930120, 932260, 932370, 932380, 943110, 921150, 920450, 941180, 932230, 933180}
+	if len(extraCT) == 0 {
+		ids = append(ids, 920420)
+	}
+	out := make([]Exclusion, len(ids))
+	for i, id := range ids {
+		out[i] = Exclusion{RuleID: id}
+	}
+	return out
 }
 
 // 豁免指令置于 CRS 之前，确保 phase:1 的规则也能被移除

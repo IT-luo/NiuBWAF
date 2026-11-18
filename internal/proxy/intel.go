@@ -10,6 +10,7 @@ type IntelResult struct {
 	Longitude     float64  `json:"longitude"`
 	ASN           uint     `json:"asn"`
 	ASNOrg        string   `json:"asn_org"`
+	ISP           string   `json:"isp"`
 	IDC           string   `json:"idc"`
 	Tor           bool     `json:"tor"`
 	ThreatTags    []string `json:"threat_tags"`
@@ -30,6 +31,7 @@ func (p *Proxy) IntelLookup(ip string) IntelResult {
 		Longitude: city.Longitude,
 		ASN:       asn.Number,
 		ASNOrg:    asn.Org,
+		ISP:       city.ISP,
 		IDC:       p.IDC.Match(ip),
 		Tor:       p.Tor.Has(ip),
 	}
@@ -47,6 +49,7 @@ func (p *Proxy) IntelStatus() map[string]any {
 		"geo_country": p.Geo.Available(),
 		"geo_city":    p.Geo.CityAvailable(),
 		"geo_asn":     p.Geo.ASNAvailable(),
+		"geo_xdb":     p.Geo.XDBAvailable(),
 		"idc":         p.IDC.Status(),
 		"tor":         p.Tor.Status(),
 	}

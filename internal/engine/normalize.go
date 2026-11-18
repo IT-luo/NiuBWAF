@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"html"
 	"regexp"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -15,7 +16,8 @@ const maxFieldScan = 16 << 10
 var (
 	reMySQLExecComment = regexp.MustCompile(`(?s)/\*!\d*(.*?)\*/`)
 	reBlockComment     = regexp.MustCompile(`(?s)/\*.*?\*/`)
-	reBase64           = regexp.MustCompile(`^[A-Za-z0-9+/]{24,}={0,2}$`)
+	reBase64           = regexp.MustCompile(`^[A-Za-z0-9+/_-]{16,}={0,2}$`)
+	reJSEscape         = regexp.MustCompile(`\\(?:x[0-9a-fA-F]{2}|u\{[0-9a-fA-F]{1,6}\}|u[0-9a-fA-F]{4}|[0-7]{1,3})`)
 )
 
 // Normalize 生成检测变体：递归 URL/%u/HTML 实体解码、NFKC 全角折叠、
@@ -43,10 +45,50 @@ func Normalize(s string) []string {
 		push(cur)
 	}
 	push(foldComments(norm.NFKC.String(cur)))
+	// JS 字符串转义还原（\xNN / \uNNNN / \u{NNNN} / 八进制 \NNN），
+	// 暴露 parent['\x65\x76\x61\x6c'] → parent['eval'] 一类混淆 XSS
+	if j := jsUnescape(cur); j != cur {
+		push(j)
+		push(foldComments(norm.NFKC.String(j)))
+	}
 	if b, ok := tryBase64(strings.TrimSpace(cur)); ok {
 		push(b)
+		// 双层 base64（webshell 载荷常见包装）再还原一层
+		if b2, ok2 := tryBase64(strings.TrimSpace(b)); ok2 {
+			push(b2)
+		}
 	}
 	return variants
+}
+
+// jsUnescape 解码 JavaScript 字符串转义序列；非法序列原样保留。
+// 仅用于生成检测变体，不修改转发请求。
+func jsUnescape(s string) string {
+	if !strings.Contains(s, "\\") || !reJSEscape.MatchString(s) {
+		return s
+	}
+	return reJSEscape.ReplaceAllStringFunc(s, func(m string) string {
+		body := m[1:]
+		switch body[0] {
+		case 'x', 'X':
+			if v, ok := hexVal(body[1:3]); ok {
+				return string(rune(v))
+			}
+		case 'u', 'U':
+			h := body[1:]
+			if strings.HasPrefix(h, "{") {
+				h = h[1 : len(h)-1]
+			}
+			if v, err := strconv.ParseUint(h, 16, 32); err == nil && v <= 0x10FFFF && utf8.ValidRune(rune(v)) && v != 0 {
+				return string(rune(v))
+			}
+		default: // 八进制
+			if v, err := strconv.ParseUint(body, 8, 32); err == nil && v <= 0x7F && v != 0 {
+				return string(rune(v))
+			}
+		}
+		return m
+	})
 }
 
 // percentDecode 宽松百分号解码，兼容 %XX 与 IIS 风格 %uXXXX，非法序列原样保留
@@ -110,6 +152,12 @@ func foldComments(s string) string {
 
 func tryBase64(s string) (string, bool) {
 	if !reBase64.MatchString(s) {
+		return "", false
+	}
+	// 兼容 base64url 字母表与被截断的载荷（裁到 4 字节对齐）
+	s = strings.NewReplacer("-", "+", "_", "/").Replace(s)
+	s = s[:len(s)-len(s)%4]
+	if len(s) < 16 {
 		return "", false
 	}
 	b, err := base64.StdEncoding.DecodeString(s)

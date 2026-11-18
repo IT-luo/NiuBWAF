@@ -30,19 +30,20 @@ func TestAllowedContentTypesSetting(t *testing.T) {
 		t.Fatalf("设置项应包含 allowed_content_types: %v", got)
 	}
 
-	plain := func() engine.Result {
+	plain := func(ct string) engine.Result {
 		h := http.Header{}
 		h.Set("Host", "t.local")
 		h.Set("User-Agent", "Mozilla/5.0")
-		h.Set("Content-Type", "text/plain")
+		h.Set("Content-Type", ct)
 		h.Set("Content-Length", "11")
 		return a.Proxy.Engine.Detect("balanced", nil, &engine.RequestInfo{
 			ClientIP: "1.2.3.4", ServerIP: "127.0.0.1", Method: "POST", URL: "/ingest",
 			Proto: "HTTP/1.1", Headers: h, Body: []byte("hello world"),
 		})
 	}
-	if res := plain(); !res.Blocked || res.RuleID != 920420 {
-		t.Fatalf("默认应被 920420 拦截, got blocked=%v rule=%d", res.Blocked, res.RuleID)
+	// 默认（未配置追加类型）排除 920420：任意 CT 放行
+	if res := plain("text/plain"); res.Blocked {
+		t.Fatalf("默认应放行任意 CT, got rule=%d msg=%s", res.RuleID, res.Msg)
 	}
 
 	put := func(body string) *httptest.ResponseRecorder {
@@ -57,8 +58,12 @@ func TestAllowedContentTypesSetting(t *testing.T) {
 	if v := a.Store.GetSetting("allowed_content_types"); v != "text/plain" {
 		t.Fatalf("设置应落盘, got %q", v)
 	}
-	if res := plain(); res.Blocked {
+	if res := plain("text/plain"); res.Blocked {
 		t.Fatalf("追加后应放行 text/plain, got rule=%d msg=%s", res.RuleID, res.Msg)
+	}
+	// 配置后进入严格模式：白名单外 CT 被 920420 拦截
+	if res := plain("application/x-custom"); !res.Blocked || res.RuleID != 920420 {
+		t.Fatalf("严格模式下白名单外 CT 应被 920420 拦截, got blocked=%v rule=%d", res.Blocked, res.RuleID)
 	}
 	for _, bad := range []string{
 		`{"allowed_content_types":"text/plain| |x"}`,
@@ -76,8 +81,8 @@ func TestAllowedContentTypesSetting(t *testing.T) {
 	if r := put(`{"allowed_content_types":""}`); r.Code != 200 {
 		t.Fatalf("清空应成功, got %d", r.Code)
 	}
-	if res := plain(); !res.Blocked || res.RuleID != 920420 {
-		t.Fatalf("清空后应恢复拦截, got blocked=%v rule=%d", res.Blocked, res.RuleID)
+	if res := plain("application/x-custom"); res.Blocked {
+		t.Fatalf("清空后应恢复默认放行语义, got rule=%d msg=%s", res.RuleID, res.Msg)
 	}
 }
 

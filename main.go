@@ -62,10 +62,10 @@ func main() {
 	log.Printf("引擎就绪（平衡/严格双模式），耗时 %s", time.Since(start).Round(time.Millisecond))
 
 	geo := proxy.NewGeoIP(*dataDir)
-	if geo.Available() {
-		log.Printf("GeoIP 已加载（城市库=%v ASN库=%v）", geo.CityAvailable(), geo.ASNAvailable())
+	if geo.Available() || geo.CityAvailable() {
+		log.Printf("GeoIP 已加载（ip2region=%v 城市库=%v ASN库=%v）", geo.XDBAvailable(), geo.CityAvailable(), geo.ASNAvailable())
 	} else {
-		log.Println("GeoIP 数据库未找到（data/geoip.mmdb），地理位置功能暂不可用")
+		log.Println("GeoIP 数据库未找到（data/ip2region_v4.xdb 或 data/geoip.mmdb），地理位置功能暂不可用")
 	}
 
 	secret := st.GetSetting("cookie_secret")

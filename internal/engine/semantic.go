@@ -9,10 +9,14 @@ import (
 
 // 语义引擎自定义规则 ID（可被规则调优豁免）
 const (
-	SemSQLiRuleID = 100200
-	SemXSSRuleID  = 100201
-	sqlThreshold  = 6
-	xssThreshold  = 6
+	SemSQLiRuleID    = 100200
+	SemXSSRuleID     = 100201
+	SemLFIRuleID     = 100202
+	SemCodeInjRuleID = 100203
+	sqlThreshold     = 6
+	xssThreshold     = 6
+	lfiThreshold     = 6
+	codeThreshold    = 6
 )
 
 type SemanticHit struct {
@@ -225,6 +229,10 @@ func sqlScore(toks []token) (int, string) {
 		switch {
 		case w == "union" && (word(i+1) == "select" || (word(i+1) == "all" || word(i+1) == "distinct") && word(i+2) == "select"):
 			add(6, "UNION SELECT 结构")
+		case w == "select" && selectFromStructure(toks, i):
+			add(6, "SELECT…FROM 查询结构")
+		case w == "insert" && word(i+1) == "into" && keywordWithin(toks, i+2, 6, "values", "set", "select"):
+			add(6, "INSERT INTO 写入结构")
 		case t.kind == 'p' && t.val == ";" && stackKeywords[word(i+1)]:
 			add(6, "堆叠查询")
 		case sqlFuncs[w] > 0 && is(i+1, 'p', "("):
@@ -281,6 +289,46 @@ func sqlScore(toks []token) (int, string) {
 	return score, reason
 }
 
+// selectFromStructure 识别 SELECT * FROM / SELECT col,col FROM / SELECT DISTINCT… 查询结构。
+// 要求 select 与 from 之间出现 SQL 特征（* 、逗号、括号、distinct/top），
+// 避免把正常英文文本 "select their representatives from…" 误判为注入。
+func selectFromStructure(toks []token, i int) bool {
+	feature := false
+	for j := i + 1; j < len(toks) && j <= i+8; j++ {
+		t := toks[j]
+		if t.kind == 'w' && t.val == "from" {
+			return feature
+		}
+		switch {
+		case t.kind == 'o' && t.val == "*":
+			feature = true
+		case t.kind == 'p' && (t.val == "," || t.val == "("):
+			feature = true
+		case t.kind == 'w' && (t.val == "distinct" || t.val == "top" || t.val == "count"):
+			feature = true
+		}
+	}
+	return false
+}
+
+// keywordWithin 判断 toks[i, i+span) 内是否出现指定关键字之一
+func keywordWithin(toks []token, i, span int, kws ...string) bool {
+	for j := i; j < len(toks) && j < i+span; j++ {
+		if toks[j].kind != 'w' {
+			continue
+		}
+		for _, k := range kws {
+			if toks[j].val == k {
+				return true
+			}
+		}
+		if toks[j].val == "from" || toks[j].val == "values" {
+			return true
+		}
+	}
+	return false
+}
+
 var xssProbes = []struct {
 	re   *regexp.Regexp
 	pts  int
@@ -298,12 +346,72 @@ var xssProbes = []struct {
 	{regexp.MustCompile(`\b(atob|unescape|decodeuri|decodeuricomponent)\s*\(`), 3, "解码函数"},
 	{regexp.MustCompile(`\b(alert|prompt|confirm)\s*\(`), 3, "弹窗探测"},
 	{regexp.MustCompile(`innerhtml\s*=`), 3, "innerHTML 注入"},
+	{regexp.MustCompile(`\b(?:window|top|self|parent|frames|globalthis|document)\s*\[`), 4, "全局对象括号属性访问"},
+	{regexp.MustCompile(`\[\s*['"]?(?:eval|alert|prompt|confirm|fromcharcode|function)['"]?\s*\]\s*\(`), 5, "括号引用危险方法并调用"},
 }
 
 func xssScore(low string) (int, string) {
 	score, best := 0, 0
 	reason := ""
 	for _, p := range xssProbes {
+		if p.re.MatchString(low) {
+			score += p.pts
+			if p.pts > best {
+				best, reason = p.pts, p.name
+			}
+		}
+	}
+	return score, reason
+}
+
+// lfiProbes 服务端文件包含/读取与 SSRF 探测（弥补 CRS 930120 对真实遥测流量的高误报，
+// 只匹配高置信度敏感目标，误报远低于 CRS 的文件名列表）
+var lfiProbes = []struct {
+	re   *regexp.Regexp
+	pts  int
+	name string
+}{
+	{regexp.MustCompile(`\b(?:file|php|phar|zip|glob|expect|dict|gopher|ldap|sftp)://`), 6, "危险协议伪 URL"},
+	{regexp.MustCompile(`\bdata://[^,]*;?\s*base64`), 6, "data:// base64 载荷"},
+	{regexp.MustCompile(`(?:^|[/\\])etc[/\\](?:passwd|shadow|group|hosts|issue|motd|profile|crontab|sudoers)\b`), 6, "敏感 *nix 系统文件"},
+	{regexp.MustCompile(`(?:boot\.ini|win\.ini|system32[/\\]|[/\\]proc/self/|web\.config|wp-config\.php|[/\\]\.ssh/|\.aws/credentials)`), 6, "敏感配置/凭据文件"},
+	{regexp.MustCompile(`(?:169\.254\.169\.254|100\.100\.100\.200|metadata\.google\.internal|/latest/meta-data)`), 6, "云元数据 SSRF"},
+}
+
+func lfiScore(low string) (int, string) {
+	score, best := 0, 0
+	reason := ""
+	for _, p := range lfiProbes {
+		if p.re.MatchString(low) {
+			score += p.pts
+			if p.pts > best {
+				best, reason = p.pts, p.name
+			}
+		}
+	}
+	return score, reason
+}
+
+// codeInjProbes Webshell/代码注入特征（PHP/JSP 源码、危险执行函数），
+// 覆盖 base64 还原后暴露的 <?php 载荷等 CRS 结构化规则易漏报的场景
+var codeInjProbes = []struct {
+	re   *regexp.Regexp
+	pts  int
+	name string
+}{
+	{regexp.MustCompile(`<\?php\b`), 6, "PHP 源码标签"},
+	{regexp.MustCompile(`\bphpinfo\s*\(`), 6, "phpinfo 探测"},
+	{regexp.MustCompile(`\b(?:shell_exec|passthru|proc_open|popen)\s*\(`), 6, "命令执行函数"},
+	{regexp.MustCompile(`\b(?:system|exec|assert|preg_replace|file_put_contents|include|require)(_once)?\s*\(\s*\$_`), 6, "外部输入直达危险函数"},
+	{regexp.MustCompile(`\beval\s*\(\s*(?:base64_decode|gzinflate|str_rot13|\$_)`), 6, "eval 解码执行"},
+	{regexp.MustCompile(`<%[=@]`), 6, "JSP/ASP 模板标签"},
+	{regexp.MustCompile(`@java\.lang|#_memberaccess|com\.opensymphony`), 6, "Java OGNL/Struts 注入"},
+}
+
+func codeInjScore(low string) (int, string) {
+	score, best := 0, 0
+	reason := ""
+	for _, p := range codeInjProbes {
 		if p.re.MatchString(low) {
 			score += p.pts
 			if p.pts > best {
@@ -373,6 +481,12 @@ func (e *Engine) Semantic(excl []Exclusion, uri string, body []byte) *SemanticHi
 			}
 			if sc, r := xssScore(low); sc >= xssThreshold {
 				consider(SemXSSRuleID, sc, "XSS 上下文级命中", r, f.name)
+			}
+			if sc, r := lfiScore(low); sc >= lfiThreshold {
+				consider(SemLFIRuleID, sc, "文件包含/SSRF 命中", r, f.name)
+			}
+			if sc, r := codeInjScore(low); sc >= codeThreshold {
+				consider(SemCodeInjRuleID, sc, "代码注入/Webshell 命中", r, f.name)
 			}
 		}
 	}

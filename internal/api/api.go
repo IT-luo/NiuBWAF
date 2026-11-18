@@ -469,6 +469,14 @@ func (a *API) top(w http.ResponseWriter, r *http.Request, kind string) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	if kind == "ips" && a.Proxy.Geo.CityAvailable() {
+		out := make([]map[string]any, 0, len(list))
+		for _, kv := range list {
+			out = append(out, map[string]any{"key": kv.Key, "count": kv.Count, "city": a.Proxy.Geo.CityInfo(kv.Key).City})
+		}
+		writeJSON(w, out)
+		return
+	}
 	writeJSON(w, list)
 }
 
@@ -655,6 +663,13 @@ func (a *API) logs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
+	if a.Proxy.Geo.CityAvailable() {
+		for i := range list {
+			if list[i].City == "" {
+				list[i].City = a.Proxy.Geo.CityInfo(list[i].ClientIP).City
+			}
+		}
+	}
 	writeJSON(w, map[string]any{"list": list, "total": total, "page": page, "size": size})
 }
 
@@ -677,18 +692,22 @@ func (a *API) exportCSV(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", "attachment; filename=niubwaf-attack-logs.csv")
 	bw := bufio.NewWriterSize(w, 32*1024)
 	bw.Write([]byte{0xEF, 0xBB, 0xBF})
-	bw.WriteString("时间,站点域名,客户端IP,国家,方法,URL,动作,规则ID,描述,严重级别,状态码,请求ID\n")
+	bw.WriteString("时间,站点域名,客户端IP,国家,城市,方法,URL,动作,规则ID,描述,严重级别,状态码,请求ID\n")
 	csvEsc := func(s string) string {
 		if strings.ContainsAny(s, ",\"\n") {
 			return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
 		}
 		return s
 	}
+	cityOn := a.Proxy.Geo.CityAvailable()
 	rows := 0
 	err := a.Store.EachLog(ip, domain, action, func(l *store.AttackLog) error {
 		rows++
-		_, err := fmt.Fprintf(bw, "%s,%s,%s,%s,%s,%s,%s,%d,%s,%s,%d,%s\n",
-			l.Ts, csvEsc(l.Domain), l.ClientIP, l.Country, l.Method, csvEsc(l.URL),
+		if cityOn && l.City == "" {
+			l.City = a.Proxy.Geo.CityInfo(l.ClientIP).City
+		}
+		_, err := fmt.Fprintf(bw, "%s,%s,%s,%s,%s,%s,%s,%s,%d,%s,%s,%d,%s\n",
+			l.Ts, csvEsc(l.Domain), l.ClientIP, l.Country, csvEsc(l.City), l.Method, csvEsc(l.URL),
 			l.Action, l.RuleID, csvEsc(l.Msg), l.Severity, l.Status, l.ReqID)
 		return err
 	})

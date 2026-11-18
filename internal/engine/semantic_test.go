@@ -2,6 +2,7 @@ package engine
 
 import (
 	"encoding/base64"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -42,6 +43,36 @@ func TestNormalize(t *testing.T) {
 	}
 }
 
+func TestNormalizeJSEscape(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{`\x65\x76\x61\x6c`, "eval"},            // \xNN
+		{`\u0061lert(1)`, "alert(1)"},           // \uNNNN
+		{`\u{61}lert(1)`, "alert(1)"},           // ES6 \u{N}
+		{`parent['\145val']`, "parent['eval']"}, // 八进制
+	}
+	for _, c := range cases {
+		if !hasVariant(Normalize(c.in), c.want) {
+			t.Errorf("Normalize(%q) 变体未还原出 %q", c.in, c.want)
+		}
+	}
+	// 非法序列原样保留，不应产生新变体
+	if vs := Normalize(`\xZZ\u12`); len(vs) != 1 {
+		t.Errorf("非法转义序列不应产生变体: %v", vs)
+	}
+	// 双层 base64 还原（webshell 包装）
+	inner := base64.StdEncoding.EncodeToString([]byte("<?php eval($_POST['x']); ?>"))
+	if !hasVariant(Normalize(base64.StdEncoding.EncodeToString([]byte(inner))), "<?php") {
+		t.Error("双层 base64 未还原")
+	}
+	// 截断的 base64 载荷（基准样本常见形态）
+	full := base64.StdEncoding.EncodeToString([]byte("union select password from users"))
+	if !hasVariant(Normalize(full[:len(full)-2]), "union select") {
+		t.Error("截断 base64 未还原")
+	}
+}
+
 func sqlHit(t *testing.T, payload string) bool {
 	t.Helper()
 	for _, v := range Normalize(payload) {
@@ -71,6 +102,8 @@ func TestSemanticSQL(t *testing.T) {
 		"%2555nion%2520select%25201,2", // 双重编码绕过 CRS
 		"ＵＮＩＯＮ ＳＥＬＥＣＴ 1,2",   // 全角绕过
 		"UNION/**/SELECT 1,2",        // 注释分隔绕过
+		"SELECT * FROM all_tables",   // libinjection 漏报的裸查询结构
+		"1; INSERT INTO logs VALUES(1)",
 	}
 	for _, p := range positives {
 		if !sqlHit(t, p) {
@@ -88,6 +121,7 @@ func TestSemanticSQL(t *testing.T) {
 		"callback=javascript is fun",
 		"name=张三",
 		"page=2&sort=desc",
+		"select their representatives from among the members", // 英文叙述不应命中 SELECT…FROM 结构
 	}
 	for _, p := range negatives {
 		if sqlHit(t, p) {
@@ -117,6 +151,7 @@ func TestSemanticXSS(t *testing.T) {
 		"%3Cscript%3Ealert(1)%3C/script%3E",
 		"＜ｓｃｒｉｐｔ＞alert(1)＜/ｓｃｒｉｐｔ＞", // 全角标签
 		"&#60;script&#62;alert(1)&#60;/script&#62;",
+		`parent['\x65\x76\x61\x6c']('boom')`, // JS 转义混淆的括号属性访问
 	}
 	for _, p := range positives {
 		if !xssHit(t, p) {
@@ -163,5 +198,48 @@ func TestSemanticExclusions(t *testing.T) {
 	hit = e.Semantic(nil, "/", []byte("q=%3Cscript%3Ealert(1)%3C/script%3E"))
 	if hit == nil || hit.RuleID != SemXSSRuleID || hit.Param != "q" {
 		t.Fatalf("期望表单 q 参数 XSS 命中, got %+v", hit)
+	}
+}
+
+func TestSemanticLFICodeInj(t *testing.T) {
+	e := &Engine{}
+	lfiCases := []string{
+		"/f.php?file=php://filter/read=convert.base64-encode/resource=index.php",
+		"/x?page=../../../../etc/passwd",
+		"/x?f=http://169.254.169.254/latest/meta-data/",
+		"/x?f=file:////etc/shadow",
+	}
+	for _, uri := range lfiCases {
+		hit := e.Semantic(nil, uri, nil)
+		if hit == nil || hit.RuleID != SemLFIRuleID {
+			t.Errorf("LFI/SSRF 漏报 %q, got %+v", uri, hit)
+		}
+	}
+	// 普通下载路径不应命中
+	if hit := e.Semantic(nil, "/download?file=report-2026.pdf", nil); hit != nil {
+		t.Errorf("普通文件参数误报: %+v", hit)
+	}
+	// 豁免生效
+	if hit := e.Semantic([]Exclusion{{RuleID: SemLFIRuleID}}, "/x?page=../../../../etc/passwd", nil); hit != nil {
+		t.Errorf("豁免 %d 未生效: %+v", SemLFIRuleID, hit)
+	}
+
+	// base64 还原后暴露的 PHP 载荷 → 代码注入
+	enc := base64.StdEncoding.EncodeToString([]byte("<?php system($_GET['c']); ?>"))
+	hit := e.Semantic(nil, "/upload", []byte("payload="+url.QueryEscape(enc)))
+	if hit == nil || hit.RuleID != SemCodeInjRuleID {
+		t.Errorf("base64 PHP 载荷漏报, got %+v", hit)
+	}
+	// 明文 webshell 特征
+	if hit := e.Semantic(nil, "/shell.jsp", []byte("x="+url.QueryEscape(`<%@ page import="java.io.*"%>`))); hit == nil || hit.RuleID != SemCodeInjRuleID {
+		t.Errorf("JSP webshell 漏报, got %+v", hit)
+	}
+	// Struts OGNL 注入
+	if hit := e.Semantic(nil, "/x", []byte("p="+url.QueryEscape("(#_memberAccess=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)"))); hit == nil || hit.RuleID != SemCodeInjRuleID {
+		t.Errorf("OGNL 注入漏报, got %+v", hit)
+	}
+	// 普通内容不应命中代码注入
+	if hit := e.Semantic(nil, "/api/doc", []byte("topic=php tutorial for beginners")); hit != nil {
+		t.Errorf("普通文本误报代码注入: %+v", hit)
 	}
 }

@@ -14,6 +14,7 @@ type GeoCity struct {
 	Country   string  `json:"country"`
 	Region    string  `json:"region"`
 	City      string  `json:"city"`
+	ISP       string  `json:"isp"`
 	Latitude  float64 `json:"latitude"`
 	Longitude float64 `json:"longitude"`
 }
@@ -23,9 +24,10 @@ type GeoASN struct {
 	Org    string `json:"org"`
 }
 
-// GeoIP 同时加载国家库（geoip.mmdb，回退）、城市库（geoip_city.mmdb）与 ASN 库（geoip_asn.mmdb），缺失时优雅降级
+// GeoIP 加载 ip2region.xdb（中国省市+运营商，优先）与国家/城市/ASN 三个 mmdb 库，缺失时优雅降级
 type GeoIP struct {
 	mu      sync.RWMutex
+	xdb     *xdbSearcher
 	country *maxminddb.Reader
 	city    *maxminddb.Reader
 	asn     *maxminddb.Reader
@@ -33,6 +35,12 @@ type GeoIP struct {
 
 func NewGeoIP(dataDir string) *GeoIP {
 	g := &GeoIP{}
+	// 官方 v3 起文件更名为 ip2region_v4.xdb，旧名 ip2region.xdb（v2）同样接受
+	if x, err := loadXDB(filepath.Join(dataDir, "ip2region.xdb")); err == nil {
+		g.xdb = x
+	} else if x, err := loadXDB(filepath.Join(dataDir, "ip2region_v4.xdb")); err == nil {
+		g.xdb = x
+	}
 	g.country, _ = openMMDB(filepath.Join(dataDir, "geoip.mmdb"))
 	g.city, _ = openMMDB(filepath.Join(dataDir, "geoip_city.mmdb"))
 	g.asn, _ = openMMDB(filepath.Join(dataDir, "geoip_asn.mmdb"))
@@ -55,7 +63,13 @@ func (g *GeoIP) Available() bool {
 func (g *GeoIP) CityAvailable() bool {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
-	return g.city != nil
+	return g.city != nil || g.xdb != nil
+}
+
+func (g *GeoIP) XDBAvailable() bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.xdb != nil
 }
 
 func (g *GeoIP) ASNAvailable() bool {
@@ -95,6 +109,22 @@ func (g *GeoIP) CityInfo(ip string) GeoCity {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	var out GeoCity
+	if g.xdb != nil {
+		// 中国 IP 优先 ip2region（国内城市精度高于 GeoLite2），海外仍走 mmdb 城市库
+		if reg, ok := g.xdb.lookup(ip); ok && (reg.Country == "中国" || reg.ISO == "CN") {
+			out.Country = reg.ISO
+			if out.Country == "" {
+				out.Country = "CN"
+			}
+			out.Region = reg.Province
+			out.City = reg.City
+			if out.City == "" {
+				out.City = reg.Province
+			}
+			out.ISP = reg.ISP
+			return out
+		}
+	}
 	if g.city == nil {
 		out.Country = g.countryOf(ip)
 		return out

@@ -806,9 +806,9 @@ type multiReadCloser struct {
 
 func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, msg string, ruleID, status int, reqID string) {
 	metrics.Default.IncAttack(action)
-	country := p.Geo.Country(ip)
+	geo := p.Geo.CityInfo(ip)
 	l := &store.AttackLog{
-		SiteID: site.ID, Domain: site.Domain, ClientIP: ip, Country: country,
+		SiteID: site.ID, Domain: site.Domain, ClientIP: ip, Country: geo.Country,
 		Method: r.Method, URL: r.URL.RequestURI(), Action: action,
 		RuleID: ruleID, Msg: msg, Severity: severityOf(action), Status: status, ReqID: reqID,
 	}
@@ -817,7 +817,7 @@ func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, 
 	}
 	p.Hub.Broadcast(map[string]any{
 		"type": "attack", "ts": nowStr(), "domain": site.Domain, "ip": ip,
-		"country": country, "method": r.Method, "url": l.URL,
+		"country": geo.Country, "city": geo.City, "method": r.Method, "url": l.URL,
 		"action": action, "msg": msg, "status": status,
 	})
 }

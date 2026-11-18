@@ -142,12 +142,13 @@ async function dashboard() {
         {name: '拦截', type: 'line', smooth: true, showSymbol: false, data: trend.map(p => p.blocks), lineStyle: {width: 2, color: '#fb7185'}, itemStyle: {color: '#fb7185'}, areaStyle: {color: areaGrad('251,113,133')}}]
     };
     if (first) trendChart = mkChart($('#trend'), trendOpt); else trendChart.setOption(trendOpt);
+    const ipKvs = ips.map(r => ({key: r.city ? r.key + ' · ' + r.city : r.key, count: r.count}));
     const ruleKvs = rules.map(r => ({key: r.key.length > 26 ? r.key.slice(0, 26) + '…' : r.key, count: r.count}));
     if (first) {
-      ipsChart = barChart($('#top-ips'), ips, '#fbbf24');
+      ipsChart = barChart($('#top-ips'), ipKvs, '#fbbf24');
       rulesChart = barChart($('#top-rules'), ruleKvs, '#fb7185');
     } else {
-      ipsChart.setOption(barOpt(ips, '#fbbf24'));
+      ipsChart.setOption(barOpt(ipKvs, '#fbbf24'));
       rulesChart.setOption(barOpt(ruleKvs, '#fb7185'));
     }
   };
@@ -207,7 +208,9 @@ function barOpt(kvs, color) {
 function barChart(el, kvs, color) { return mkChart(el, barOpt(kvs, color)); }
 const actionTag = a => ({waf: '<span class="tag red">WAF拦截</span>', resp: '<span class="tag red">响应拦截</span>', cc: '<span class="tag orange">CC限频</span>', blacklist: '<span class="tag red">黑名单</span>', geo: '<span class="tag blue">地区限制</span>', semantic: '<span class="tag blue">语义检测</span>', reputation: '<span class="tag orange">信誉封禁</span>', custom: '<span class="tag violet">自定义</span>', dynamic: '<span class="tag cyan">动态防护</span>'}[a] || esc(a));
 function liveRow(d) {
-  return `<tr><td class="mono">${esc(d.ts)}</td><td>${esc(d.domain)}</td><td class="mono">${esc(d.ip)}</td><td>${actionTag(d.action)}</td><td class="url-cell" title="${esc(d.msg)}">${esc(d.msg)}</td></tr>`;
+  const ip = d.ip || d.client_ip;
+  const geo = [d.city, d.country].filter(Boolean).map(esc).join(' / ');
+  return `<tr><td class="mono">${esc(d.ts)}</td><td>${esc(d.domain)}</td><td class="mono">${esc(ip)}${geo ? `<div class="hint">${geo}</div>` : ''}</td><td>${actionTag(d.action)}</td><td class="url-cell" title="${esc(d.msg)}">${esc(d.msg)}</td></tr>`;
 }
 function renderLiveRows(list) {
   const tb = $('#live-body');
@@ -316,13 +319,13 @@ async function logs() {
     <button class="btn danger" onclick="clearAttackLogs()">清空日志</button>
   </div>
   <div class="panel" style="padding:0;overflow:hidden"><table>
-  <thead><tr><th>时间</th><th>站点</th><th>IP</th><th>国家</th><th>方法</th><th>URL</th><th>动作</th><th>描述</th><th>状态</th><th>操作</th></tr></thead>
+  <thead><tr><th>时间</th><th>站点</th><th>IP</th><th>国家</th><th>城市</th><th>方法</th><th>URL</th><th>动作</th><th>描述</th><th>状态</th><th>操作</th></tr></thead>
   <tbody id="log-body"></tbody></table></div>
   <div class="pager" id="log-pager"></div>`;
   loadLogs();
 }
 function logQuery() {
-  return `ip=${encodeURIComponent($('#q-ip').value)}&domain=${encodeURIComponent($('#q-domain').value)}&action=${$('#q-action').value}`;
+  return `ip=${encodeURIComponent($('#q-ip').value)}&domain=${encodeURIComponent($('#q-domain').value)}&action=${encodeURIComponent($('#q-action').value)}`;
 }
 async function loadLogs() {
   try {
@@ -330,12 +333,12 @@ async function loadLogs() {
     logRows = d.list;
     $('#log-body').innerHTML = d.list.length ? d.list.map((l, i) => `<tr>
       <td class="mono">${esc(l.ts)}</td><td>${esc(l.domain)}</td><td class="mono">${esc(l.client_ip)}</td>
-      <td>${esc(l.country || '-')}</td><td>${esc(l.method)}</td>
+      <td>${esc(l.country || '-')}</td><td>${esc(l.city || '-')}</td><td>${esc(l.method)}</td>
       <td class="mono url-cell" title="${esc(l.url)}">${esc(l.url)}</td>
       <td>${actionTag(l.action)}</td><td class="url-cell" title="${esc(l.msg)}">${esc(l.msg)}</td>
       <td class="mono">${l.status}</td>
       <td>${l.rule_id > 0 && (l.action === 'waf' || l.action === 'resp' || l.action === 'semantic') ? `<button class="btn ghost sm" onclick="exclFromLog(${i})">豁免</button>` : ''}</td></tr>`).join('')
-      : emptyHTML(10, '暂无记录');
+      : emptyHTML(11, '暂无记录');
     const pages = Math.max(1, Math.ceil(d.total / d.size));
     $('#log-pager').innerHTML = `共 ${d.total} 条 · ${logPage}/${pages} 页
       <button class="btn ghost sm" ${logPage <= 1 ? 'disabled' : ''} onclick="logPage--;loadLogs()">上一页</button>
@@ -606,7 +609,7 @@ async function reputation() {
       <span id="intel-tor" class="hint"></span>
       <button class="btn ghost" onclick="intelRefresh()">${ico('refresh')}刷新情报</button>
     </div>
-    <p class="hint">城市/ASN 来自 GeoLite2 mmdb（data/geoip_city.mmdb、geoip_asn.mmdb）；IDC 机房归属聚合 AWS/GCP/Cloudflare 公开 CIDR（每日刷新）；Tor 出口来自官方列表（每小时刷新）。情报仅作裁决参考标签，不参与自动封禁评分。</p>
+    <p class="hint">中国城市/运营商优先来自 ip2region（data/ip2region.xdb，离线免费、精确到市），海外城市与 ASN 来自 GeoLite2 mmdb（data/geoip_city.mmdb、geoip_asn.mmdb）；IDC 机房归属聚合 AWS/GCP/Cloudflare 公开 CIDR（每日刷新）；Tor 出口来自官方列表（每小时刷新）。情报仅作裁决参考标签，不参与自动封禁评分。</p>
     <div class="toolbar" style="margin-top:10px">
       <label class="hint">付费情报</label>
       <select id="intel-provider"><option value="off">关闭</option><option value="generic">通用 JSON 接口</option></select>
@@ -650,7 +653,7 @@ async function loadIntel() {
   try {
     const s = await api('/api/intel/status');
     const dot = ok => ok ? '<span class="tag green">已加载</span>' : '<span class="tag">未加载</span>';
-    g.innerHTML = `地理 ${dot(s.geo_country)} 城市 ${dot(s.geo_city)} ASN ${dot(s.geo_asn)}`;
+    g.innerHTML = `地理 ${dot(s.geo_country)} 城市 ${dot(s.geo_city)} ASN ${dot(s.geo_asn)} ip2region ${dot(s.geo_xdb)}`;
     idc.innerHTML = `IDC CIDR <b>${s.idc.count}</b> 条 · ${esc(s.idc.source)} · ${esc(s.idc.updated)}`;
     tor.innerHTML = `Tor 出口 <b>${s.tor.count}</b> 个 · ${esc(s.tor.source)} · ${esc(s.tor.updated)}`;
     const th = $('#intel-threat');
@@ -738,12 +741,13 @@ async function repLookup() {
       d.tor ? '<span class="tag red">Tor 出口</span>' : '',
       ...(d.threat_tags || []).map(t => `<span class="tag orange">${esc(t)}</span>`),
     ].filter(Boolean).join(' ') || '<span class="tag blue">无特殊标记</span>';
-    const geo = [d.geo_country, d.region, d.city].filter(Boolean).map(esc).join(' / ') || '未知';
+    const geo = [d.country, d.region, d.city].filter(Boolean).map(esc).join(' / ') || '未知';
     const asn = d.asn ? `AS${d.asn} ${esc(d.asn_org || '')}` : '未知';
+    const isp = d.isp ? ` · ${esc(d.isp)}` : '';
     const threat = d.threat_provider ? `<div class="hint">付费情报 ${esc(d.threat_provider)} · 威胁评分 ${d.threat_score} · 标签 ${(d.threat_tags || []).map(esc).join(', ') || '无'}</div>` : '';
     box.innerHTML = `<div style="margin-top:12px;display:flex;flex-direction:column;gap:8px">
       <div class="toolbar"><span class="mono"><b>${esc(d.ip)}</b></span>${flags}</div>
-      <div class="hint">地理 ${geo} · ASN ${asn} · 累计攻击 ${d.attack_count} 次</div>
+      <div class="hint">地理 ${geo}${isp} · ASN ${asn} · 累计攻击 ${d.attack_count} 次</div>
       ${threat}
       ${r ? `<div class="hint">评分 ${r.score} · 封禁 ${r.ban_count} 次 · 到期 ${esc(r.banned_until || '-')} · 赦免至 ${esc(r.pardoned_until || '-')}</div>` : '<div class="hint">暂无信誉记录</div>'}
     </div>`;
@@ -767,7 +771,7 @@ async function settings() {
       <select id="sem-mode"><option value="observe">观察模式（仅记录，不拦截）</option><option value="block">拦截模式</option><option value="off">关闭</option></select>
       <button class="btn" onclick="saveSemantic()">保存</button>
     </div>
-    <p class="hint">对请求做递归解码 / 全角还原 / 注释折叠 / Base64 还原后，进行 SQL 语法级与 XSS 上下文级评分，可识别双重编码、全角字符、注释分隔等 CRS 易漏报的混淆载荷。建议先以观察模式运行，在攻击日志中确认无误报后再切换拦截模式；命中规则 100200/100201 支持规则调优豁免。</p>
+    <p class="hint">对请求做递归解码 / 全角还原 / JS 转义还原 / 注释折叠 / Base64 还原后，进行 SQL 语法级、XSS 上下文级、文件包含/SSRF 与代码注入评分，可识别双重编码、全角字符、注释分隔等 CRS 易漏报的混淆载荷。建议先以观察模式运行，在攻击日志中确认无误报后再切换拦截模式；命中规则 100200-100203 支持规则调优豁免。</p>
   </div>
   <div class="panel"><h3>地理位置访问控制（GeoIP）</h3>
     <div class="toolbar">
@@ -776,7 +780,7 @@ async function settings() {
       <button class="btn" onclick="saveGeo()">保存</button>
       <span id="geo-status" class="hint"></span>
     </div>
-    <p class="hint">需要将 GeoLite2/DB-IP 的 mmdb 文件放置于 data/geoip.mmdb 后重启。</p>
+    <p class="hint">需要将 GeoLite2/DB-IP 的 mmdb 文件放置于 data/geoip.mmdb 后重启。ip2region.xdb 仅补充城市展示，地域限制策略仍以 mmdb 国家库（ISO 码）为准。</p>
   </div>
   <div class="panel"><h3>可信代理（真实客户端 IP 解析）</h3>
     <div class="toolbar">

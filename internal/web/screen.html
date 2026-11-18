@@ -108,7 +108,7 @@ async function refresh() {
     ipsC.setOption({
       tooltip:tip, grid:{left:10,right:30,top:10,bottom:10,containLabel:true},
       xAxis:{type:'value',...axis},
-      yAxis:{type:'category',inverse:true,data:ips.map(k=>k.key),...axis},
+      yAxis:{type:'category',inverse:true,data:ips.map(k=>k.city?k.key+' '+k.city:k.key),...axis},
       series:[{type:'bar',data:ips.map(k=>k.count),barMaxWidth:14,itemStyle:{borderRadius:[0,6,6,0],color:new echarts.graphic.LinearGradient(0,0,1,0,[{offset:0,color:'#fbbf2440'},{offset:1,color:'#fbbf24'}])}}]
     });
     geoC.setOption({
@@ -128,11 +128,11 @@ es.onmessage = ev => {
   const d = JSON.parse(ev.data);
   if (d.type !== 'attack') return;
   const feed = $('#feed');
-  feed.insertAdjacentHTML('afterbegin', `<div class="ev"><span class="t">${esc(d.ts)}</span>${tag(d.action)}<span class="ip">${esc(d.ip)}</span>${d.country ? ' · ' + esc(d.country) : ''} → ${esc(d.domain)}<span class="m">${esc(d.method)} ${esc(d.url)} · ${esc(d.msg)}</span></div>`);
+  feed.insertAdjacentHTML('afterbegin', `<div class="ev"><span class="t">${esc(d.ts)}</span>${tag(d.action)}<span class="ip">${esc(d.ip)}</span>${d.city ? ' · ' + esc(d.city) : (d.country ? ' · ' + esc(d.country) : '')} → ${esc(d.domain)}<span class="m">${esc(d.method)} ${esc(d.url)} · ${esc(d.msg)}</span></div>`);
   while (feed.children.length > 60) feed.lastChild.remove();
 };
 j('/api/logs?size=20').then(d => {
-  d.list.reverse().forEach(l => es.onmessage({data: JSON.stringify({type:'attack',ts:l.ts,ip:l.client_ip,country:l.country,domain:l.domain,method:l.method,url:l.url,action:l.action,msg:l.msg})}));
+  d.list.reverse().forEach(l => es.onmessage({data: JSON.stringify({type:'attack',ts:l.ts,ip:l.client_ip,country:l.country,city:l.city,domain:l.domain,method:l.method,url:l.url,action:l.action,msg:l.msg})}));
 }).catch(() => {});
 </script>
 </body>

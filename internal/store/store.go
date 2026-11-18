@@ -68,6 +68,7 @@ type AttackLog struct {
 	Domain   string `json:"domain"`
 	ClientIP string `json:"client_ip"`
 	Country  string `json:"country"`
+	City     string `json:"city"`
 	Method   string `json:"method"`
 	URL      string `json:"url"`
 	Action   string `json:"action"`

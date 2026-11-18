@@ -39,7 +39,8 @@
 3. **自签名（默认）**：未提供证书时自动生成 `data/default_cert.pem`、`data/admin_cert.pem`（SAN 仅含 localhost/niubwaf.local/127.0.0.1/::1）。**浏览器会告警，仅限内网 / 测试**；生产请换 1 或 2。
 
 ### 2.4 可选：GeoIP 库
-- 将 MaxMind/DB-IP 的 mmdb 放到 `data/geoip.mmdb`（国家）、`data/geoip_city.mmdb`（城市）、`data/geoip_asn.mmdb`（ASN）。缺失时地理位置功能自动降级为不可用，不影响其他功能。
+- **ip2region（推荐）**：官方 `ip2region_v4.xdb`（旧名 `ip2region.xdb` 亦兼容）放到 `data/`，离线免费、无需注册；中国 IP 精确到省/市/运营商，仪表盘 Top 攻击 IP、攻击日志、情报页的城市展示优先用它。来源：github.com/lionsoul2014/ip2region 或 gitee.com/lionsoul/ip2region 的 `data/ip2region_v4.xdb`。
+- 将 MaxMind/DB-IP 的 mmdb 放到 `data/geoip.mmdb`（国家）、`data/geoip_city.mmdb`（城市）、`geoip_asn.mmdb`（ASN）。海外 IP 城市与 ASN 依赖 mmdb；**地域访问控制策略仅认 mmdb 国家库（ISO 码）**，ip2region 只补城市展示。缺失时地理位置功能自动降级为不可用，不影响其他功能。
 - IDC / Tor 情报内置基线并自动在线刷新（缓存 `data/idc_cache.json`、`data/tor_cache.json`），无需手动放置。
 
 ---
@@ -86,6 +87,7 @@ file niubwaf-linux
     ├── niubwaf.db-wal/-shm # WAL 伴生文件
     ├── default_cert.pem / default_key.pem   # 代理默认自签名证书（自动生成）
     ├── admin_cert.pem / admin_key.pem       # 管理台自签名证书（自动生成）
+    ├── ip2region_v4.xdb                       # 可选，中国省市+运营商（推荐）
     ├── geoip.mmdb / geoip_city.mmdb / geoip_asn.mmdb   # 可选，手动放置
     ├── idc_cache.json / tor_cache.json      # 情报缓存（自动）
     ├── acme/                                # ACME 签发缓存（启用后自动）
@@ -103,7 +105,7 @@ file niubwaf-linux
 sudo mkdir -p /opt/niubwaf/data
 sudo install -m 0755 niubwaf-linux /opt/niubwaf/niubwaf
 # 可选：放置 GeoIP
-# sudo cp geoip*.mmdb /opt/niubwaf/data/
+# sudo cp ip2region_v4.xdb geoip*.mmdb /opt/niubwaf/data/
 ```
 
 ### 5.2 创建运行用户（可选但推荐）
@@ -206,7 +208,7 @@ docker compose up -d --build
 | 9 | 告警通知 | 安全设置→告警 | 默认 off；按需接 webhook/钉钉/企微 | 阈值 50/60s/冷却 300s 起 |
 | 10 | `metrics_token` | 安全设置→Prometheus | 设 token 或保持空（仅环回） | `/metrics` 在 9443 |
 | 11 | `body_inspect_kb` | 安全设置→请求体检查上限 | 默认 2048；按最大上传调 | 超限流式透传仅检前缀 |
-| 12 | GeoIP mmdb | `data/` | 放置以启用地域策略 | 缺失自动降级 |
+| 12 | GeoIP 数据 | `data/` | ip2region_v4.xdb（中国城市展示）+ mmdb（地域策略/ASN/海外城市） | 缺失自动降级 |
 | 13 | 9443 防火墙 | 主机/云安全组 | 仅运维网段 | 管理面高权限 |
 
 ---
@@ -330,8 +332,28 @@ sudo rm -rf /opt/niubwaf        # 含 data/（先备份！）
 
 - **单节点**：无分布式集群/多活（P2 规划）；横向扩展需前置 LB 多实例各自独立 `data/`（配置不共享）。
 - **性能 backlog（未修，非阻塞）**：ScoreIPs 每 60s 全表 GROUP BY；QueryLogs 前导 `%` LIKE 不走索引；exportCSV 一次性载入内存；限流器全局互斥锁。中小流量无感，超大日志量需关注。
-- **CRS 内容类型策略**：默认拦截 `text/plain` 等非白名单 POST 体（规则 920420），需按业务调优。
+- **CRS 内容类型策略**：默认放行任意 Content-Type（920420 已默认豁免，请求体仍被检测）；配置 `allowed_content_types` 后进入严格白名单模式。
 - **超大请求体**：超过 `body_inspect_kb` 仅检测前缀、其余流式透传（内存/安全权衡，已文档化）。
 - **ACME 需公网**：内网环境无法实际签发。
 - **高级能力未含（P2）**：bot/TLS 指纹、API 安全（OpenAPI/BOLA/GraphQL）、ML 检测。
 - **日志无 UI 清空**：仅按保留期自动清理。
+
+## 附录 D：检测准确性调优基线（BLAZEHTTP）
+
+用 chaitin BLAZEHTTP（33,877 条真实流量样本，658 黑 / 33,219 白）回归的调优结果：
+
+| 指标 | 调优前（干净基线） | 调优后 |
+|---|---|---|
+| 检出率 | 76.29% | **81.31%** |
+| 误报率 | 14.97% | **4.11%** |
+| 准确率 | 84.86% | **95.61%** |
+| 平均耗时 | — | 24.6 ms |
+
+主要手段（均内置默认，无需配置）：
+
+1. **方法策略**：900003 放行 `PUT/PATCH/DELETE`（911100 只保留 TRACE 等真正危险方法），修复 REST/镜像仓库推送被拦。
+2. **默认豁免低价值高噪声 CRS 规则**（对 3.4 万样本 TP=0 或贡献≈0，等价攻击由其余规则/语义引擎覆盖）：942550、930120、932260、932370、932380、943110、921150、920450、941180、932230、933180；920420 仅在未配置 `allowed_content_types` 时豁免。豁免以 `ctl:ruleRemoveById` 注入，站点级规则调优仍可进一步增删。
+3. **语义引擎增强**（规则 100200–100203）：JS 转义还原（`\xNN`/`\uNNNN`/八进制）、双层与截断 base64 还原（含 base64url）、SELECT…FROM / INSERT INTO 结构识别、括号属性访问 XSS、LFI/SSRF（危险协议、敏感系统文件、云元数据）与代码注入（PHP/JSP 标签、webshell 函数、Struts OGNL）检测。生产建议将 `semantic_mode` 设为 `block`。
+4. **自有规则 100001 精修**：命令词后要求分隔符/路径符，消除 `;cat=` 类广告像素误报。
+
+**压测注意**：BLAZEHTTP 等基准工具从单一 IP 发送全部样本，IP 信誉自动拉黑（默认开启，阈值 30）会在数十个攻击样本后封禁该 IP，导致后续白样本被连带拦截、误报率虚高（曾观测 26%+）。评估内容检测能力时应临时关闭 `reputation_enabled` 或调高 `rep_threshold`；生产环境中对持续攻击源自动封禁属预期行为。
