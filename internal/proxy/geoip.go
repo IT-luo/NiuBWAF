@@ -110,7 +110,7 @@ func (g *GeoIP) CityInfo(ip string) GeoCity {
 	defer g.mu.RUnlock()
 	var out GeoCity
 	if g.xdb != nil {
-		// 中国 IP 优先 ip2region（国内城市精度高于 GeoLite2），海外仍走 mmdb 城市库
+		// 中国 IP 优先 ip2region（国内城市精度高于 mmdb 城市库），海外仍走 mmdb 城市库
 		if reg, ok := g.xdb.lookup(ip); ok && (reg.Country == "中国" || reg.ISO == "CN") {
 			out.Country = reg.ISO
 			if out.Country == "" {

@@ -609,7 +609,7 @@ async function reputation() {
       <span id="intel-tor" class="hint"></span>
       <button class="btn ghost" onclick="intelRefresh()">${ico('refresh')}刷新情报</button>
     </div>
-    <p class="hint">中国城市/运营商优先来自 ip2region（data/ip2region.xdb，离线免费、精确到市），海外城市与 ASN 来自 GeoLite2 mmdb（data/geoip_city.mmdb、geoip_asn.mmdb）；IDC 机房归属聚合 AWS/GCP/Cloudflare 公开 CIDR（每日刷新）；Tor 出口来自官方列表（每小时刷新）。情报仅作裁决参考标签，不参与自动封禁评分。</p>
+    <p class="hint">中国城市/运营商优先来自 ip2region（data/ip2region.xdb，离线免费、精确到市），海外城市与 ASN 来自 mmdb 城市库（data/geoip_city.mmdb、geoip_asn.mmdb）；IDC 机房归属聚合主流云商公开 CIDR（每日刷新）；Tor 出口来自官方列表（每小时刷新）。情报仅作裁决参考标签，不参与自动封禁评分。</p>
     <div class="toolbar" style="margin-top:10px">
       <label class="hint">付费情报</label>
       <select id="intel-provider"><option value="off">关闭</option><option value="generic">通用 JSON 接口</option></select>
@@ -780,7 +780,7 @@ async function settings() {
       <button class="btn" onclick="saveGeo()">保存</button>
       <span id="geo-status" class="hint"></span>
     </div>
-    <p class="hint">需要将 GeoLite2/DB-IP 的 mmdb 文件放置于 data/geoip.mmdb 后重启。ip2region.xdb 仅补充城市展示，地域限制策略仍以 mmdb 国家库（ISO 码）为准。</p>
+    <p class="hint">需要将 mmdb 格式的 GeoIP 数据库文件放置于 data/geoip.mmdb 后重启。ip2region.xdb 仅补充城市展示，地域限制策略仍以 mmdb 国家库（ISO 码）为准。</p>
   </div>
   <div class="panel"><h3>可信代理（真实客户端 IP 解析）</h3>
     <div class="toolbar">

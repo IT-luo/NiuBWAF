@@ -41,7 +41,7 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o niu
 
 首次打开 `https://<host>:9443` 使用初始密码登录后会被强制修改密码。完整部署（systemd、证书、备份、升级回滚、生产配置清单）见 [DEPLOY.md](DEPLOY.md)。
 
-> GeoIP 库 `geoip.mmdb` 因 MaxMind 许可限制不随仓库分发，需自行获取后放入 `data/` 目录；缺失时归属地功能自动降级，不影响其他能力。
+> GeoIP 库 `geoip.mmdb` 因第三方地理数据许可限制不随仓库分发，需自行获取后放入 `data/` 目录；缺失时归属地功能自动降级，不影响其他能力。
 
 ## 界面预览
 

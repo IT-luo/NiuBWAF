@@ -40,7 +40,7 @@
 
 ### 2.4 可选：GeoIP 库
 - **ip2region（推荐）**：官方 `ip2region_v4.xdb`（旧名 `ip2region.xdb` 亦兼容）放到 `data/`，离线免费、无需注册；中国 IP 精确到省/市/运营商，仪表盘 Top 攻击 IP、攻击日志、情报页的城市展示优先用它。来源：github.com/lionsoul2014/ip2region 或 gitee.com/lionsoul/ip2region 的 `data/ip2region_v4.xdb`。
-- 将 MaxMind/DB-IP 的 mmdb 放到 `data/geoip.mmdb`（国家）、`data/geoip_city.mmdb`（城市）、`geoip_asn.mmdb`（ASN）。海外 IP 城市与 ASN 依赖 mmdb；**地域访问控制策略仅认 mmdb 国家库（ISO 码）**，ip2region 只补城市展示。缺失时地理位置功能自动降级为不可用，不影响其他功能。
+- 将 mmdb 格式的 GeoIP 数据库（自行获取并遵守数据源许可）放到 `data/geoip.mmdb`（国家）、`data/geoip_city.mmdb`（城市）、`geoip_asn.mmdb`（ASN）。海外 IP 城市与 ASN 依赖 mmdb；**地域访问控制策略仅认 mmdb 国家库（ISO 码）**，ip2region 只补城市展示。缺失时地理位置功能自动降级为不可用，不影响其他功能。
 - IDC / Tor 情报内置基线并自动在线刷新（缓存 `data/idc_cache.json`、`data/tor_cache.json`），无需手动放置。
 
 ---
@@ -349,9 +349,9 @@ sudo rm -rf /opt/niubwaf        # 含 data/（先备份！）
 | 准确率 | 84.86% | 95.61% | **98.55%** |
 | 平均耗时 | — | 24.6 ms | **19.1 ms** |
 
-同口径公开横评参考（同一基准官方样本）：宝塔 漏报351/误报96/准确率98.67%；SuperWAF 437/46/98.57%；ngx-lua-waf 362/475/97.51%；Coraza 171/5182/84.10%；ModSecurity 175/7381/77.56%。当前版本漏报 147 / 误报 345：漏报数为公开横评各档最低，准确率对齐宝塔/SuperWAF 档。
+当前版本漏报 147 / 误报 345 / 准确率 98.55%。
 
-生产实测（2026-11-18，Harbor 镜像仓库前置、semantic_mode=block、经公网 NAT 路径）：检出 77.96%（513/658）/ 误报 1.38% / 准确率 98.22%。检出率与本地基线一致（漏报 145，为公开横评各档最低）；误报含约 112 条上游（Harbor/nginx）对白样本直接返回 403 被基准工具计入，WAF 自身误报仍 ≈1.04%；平均耗时含 WAN 往返，不代表 WAF 处理时延（机内全链路实测 7–10ms）。
+生产实测（2026-11-18，Harbor 镜像仓库前置、semantic_mode=block、经公网 NAT 路径）：检出 77.96%（513/658）/ 误报 1.38% / 准确率 98.22%。检出率与本地基线一致；误报含约 112 条上游（Harbor/nginx）对白样本直接返回 403 被基准工具计入，WAF 自身误报仍 ≈1.04%；平均耗时含 WAN 往返，不代表 WAF 处理时延（机内全链路实测 7–10ms）。
 
 主要手段（均内置默认，无需配置）：
 
