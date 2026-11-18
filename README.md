@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <img alt="Go" src="https://img.shields.io/badge/Go-1.22+-00ADD8?logo=go&logoColor=white">
+  <img alt="Go" src="https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go&logoColor=white">
   <img alt="License" src="https://img.shields.io/badge/License-Apache--2.0-blue.svg">
   <img alt="Engine" src="https://img.shields.io/badge/Engine-Coraza%20v3%20%2B%20CRS4-orange">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-single%20static%20binary-green">
