@@ -162,6 +162,29 @@ func TestExportCSVStreamsRows(t *testing.T) {
 	}
 }
 
+func TestExportCSVFormulaInjection(t *testing.T) {
+	a := fullTestAPI(t)
+	if _, err := a.Store.DB.Exec(`INSERT INTO attack_logs(site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id)
+		VALUES(0,'=HYPERLINK("http://evil")','1.2.3.4','CN','GET','=@SUM(1+1)','waf',941100,'+cmd|''/c calc''!A0','HIGH',403,'rid')`); err != nil {
+		t.Fatalf("写入攻击日志失败: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	a.exportCSV(rec, httptest.NewRequest("GET", "/api/logs/export", nil))
+	if rec.Code != 200 {
+		t.Fatalf("导出应成功, got %d", rec.Code)
+	}
+	out := rec.Body.String()
+	for _, want := range []string{"'=HYPERLINK", "'=@SUM(1+1)", "'+cmd|"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("公式字符开头的单元格应加单引号前缀, 缺 %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, ",=HYPERLINK") || strings.Contains(out, ",=@SUM") || strings.Contains(out, ",+cmd|") {
+		t.Fatalf("导出中不应出现裸公式单元格:\n%s", out)
+	}
+}
+
 func TestBodyScanLimitSetting(t *testing.T) {
 	a := fullTestAPI(t)
 

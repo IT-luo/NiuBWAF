@@ -2,16 +2,34 @@ package proxy
 
 import (
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"math/rand"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// 挑战参数与 ID 必须不可预测：math/rand 的状态可由攻击者自己收到的 ID 序列反推
+func randIntn(n int64) int64 {
+	v, err := rand.Int(rand.Reader, big.NewInt(n))
+	if err != nil {
+		panic("crypto/rand 不可用: " + err.Error())
+	}
+	return v.Int64()
+}
+
+func randHex(n int) string {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		panic("crypto/rand 不可用: " + err.Error())
+	}
+	return hex.EncodeToString(b)
+}
 
 type challenge struct {
 	answer  uint32
@@ -75,12 +93,12 @@ func (c *Captcha) Issue(w http.ResponseWriter, ip string, siteID int64, origURL 
 			delete(c.items, k)
 		}
 	}
-	a := rand.Intn(900000) + 100000
-	b := rand.Intn(900000) + 100000
-	cc := rand.Intn(90000) + 10000
+	a := int(randIntn(900000)) + 100000
+	b := int(randIntn(900000)) + 100000
+	cc := int(randIntn(90000)) + 10000
 	// 与页面 JS 的 (Math.imul(a^b,c)+a)>>>0 保持一致
 	answer := uint32(int64(int32(int64(a^b)*int64(cc))) + int64(a))
-	id := fmt.Sprintf("%x", rand.Int63())
+	id := randHex(8)
 	origURL = safeOrigURL(origURL)
 	c.items[id] = &challenge{answer: answer, ip: ip, siteID: siteID, origURL: origURL, expires: time.Now().Add(5 * time.Minute)}
 	c.mu.Unlock()
@@ -94,7 +112,7 @@ func (c *Captcha) Issue(w http.ResponseWriter, ip string, siteID int64, origURL 
 	for i := range core {
 		codes[i] = strconv.Itoa(int(core[i]))
 	}
-	vn := fmt.Sprintf("_0x%x", rand.Int63())
+	vn := "_0x" + randHex(4)
 	script := fmt.Sprintf("var %s=[%s];var %s=String.fromCharCode.apply(null,%s);(0,eval)(%s);",
 		vn, strings.Join(codes, ","), vn+"s", vn, vn+"s")
 

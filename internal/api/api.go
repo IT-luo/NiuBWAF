@@ -694,6 +694,10 @@ func (a *API) exportCSV(w http.ResponseWriter, r *http.Request) {
 	bw.Write([]byte{0xEF, 0xBB, 0xBF})
 	bw.WriteString("时间,站点域名,客户端IP,国家,城市,方法,URL,动作,规则ID,描述,严重级别,状态码,请求ID\n")
 	csvEsc := func(s string) string {
+		// 以 = + - @ 开头的单元格会被表格软件当公式执行（CSV injection），前缀单引号强制文本
+		if s != "" && strings.ContainsRune("=+-@", rune(s[0])) {
+			s = "'" + s
+		}
 		if strings.ContainsAny(s, ",\"\n") {
 			return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
 		}
