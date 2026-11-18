@@ -1,0 +1,256 @@
+package main
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"flag"
+	"fmt"
+	"log"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+	"time"
+
+	"niubwaf/internal/api"
+	"niubwaf/internal/engine"
+	"niubwaf/internal/proxy"
+	"niubwaf/internal/store"
+	"niubwaf/internal/web"
+)
+
+func main() {
+	proxyAddr := flag.String("proxy", ":8080", "防护代理 HTTP 监听地址")
+	tlsAddr := flag.String("tls", ":8443", "防护代理 HTTPS 监听地址")
+	certFile := flag.String("cert", "", "代理默认证书文件（PEM），留空则自动生成自签名证书")
+	keyFile := flag.String("key", "", "代理默认私钥文件（PEM）")
+	adminAddr := flag.String("admin", ":9443", "管理控制台监听地址")
+	adminCert := flag.String("admin-cert", "", "管理控制台证书文件（PEM），设置后启用 HTTPS")
+	adminKey := flag.String("admin-key", "", "管理控制台私钥文件（PEM）")
+	dataDir := flag.String("data", "./data", "数据目录")
+	acmeHTTP := flag.String("acme-http", ":80", "ACME HTTP-01 挑战监听地址（仅 acme_enabled=on 时启动）")
+	flag.Parse()
+
+	fmt.Println("==============================================")
+	fmt.Println("  牛B WAF - 新一代智能 Web 应用防火墙")
+	fmt.Println("  基于 Coraza 引擎 + OWASP CRS 规则集")
+	fmt.Println("==============================================")
+
+	if err := os.MkdirAll(*dataDir, 0755); err != nil {
+		log.Fatal(err)
+	}
+
+	st, err := store.Open(filepath.Join(*dataDir, "niubwaf.db"))
+	if err != nil {
+		log.Fatalf("打开数据库失败: %v", err)
+	}
+
+	log.Println("正在加载检测引擎与 OWASP CRS 规则集...")
+	start := time.Now()
+	eng, err := engine.New()
+	if err != nil {
+		log.Fatalf("引擎初始化失败: %v", err)
+	}
+	log.Printf("引擎就绪（平衡/严格双模式），耗时 %s", time.Since(start).Round(time.Millisecond))
+
+	geo := proxy.NewGeoIP(*dataDir)
+	if geo.Available() {
+		log.Printf("GeoIP 已加载（城市库=%v ASN库=%v）", geo.CityAvailable(), geo.ASNAvailable())
+	} else {
+		log.Println("GeoIP 数据库未找到（data/geoip.mmdb），地理位置功能暂不可用")
+	}
+
+	secret := st.GetSetting("cookie_secret")
+	if secret == "" {
+		secret = store.RandToken()
+		st.SetSetting("cookie_secret", secret)
+	}
+
+	idc := proxy.NewIDCMatcher(*dataDir)
+	tor := proxy.NewTorList(*dataDir)
+	log.Printf("IP 情报源就绪（IDC CIDR %d 条 / Tor 出口 %d 个，后台自动刷新）", idc.Status()["count"], tor.Status()["count"])
+
+	p := proxy.New(st, eng, geo, idc, tor, secret)
+	p.HTTPSAddr = *tlsAddr
+	p.InitACME(*dataDir)
+	a := api.New(st, p)
+	a.DataDir = *dataDir
+	// 管理台默认强制 HTTPS：未显式提供证书时自动生成自签名管理证书
+	adminCertPath, adminKeyPath := *adminCert, *adminKey
+	if adminCertPath == "" || adminKeyPath == "" {
+		cp, kp, err := ensureAdminCert(*dataDir)
+		if err != nil {
+			log.Fatalf("管理台自签名证书生成失败: %v", err)
+		}
+		adminCertPath, adminKeyPath = cp, kp
+		log.Println("管理台使用自动生成的自签名证书（生产环境请通过 -admin-cert/-admin-key 配置正式证书）")
+	}
+	a.AdminTLS = true
+
+	if *certFile != "" && *keyFile != "" {
+		certPEM, err := os.ReadFile(*certFile)
+		if err != nil {
+			log.Fatalf("读取证书失败: %v", err)
+		}
+		keyPEM, err := os.ReadFile(*keyFile)
+		if err != nil {
+			log.Fatalf("读取私钥失败: %v", err)
+		}
+		if err := p.SetDefaultCert(certPEM, keyPEM); err != nil {
+			log.Fatalf("默认证书无效: %v", err)
+		}
+		log.Printf("代理默认证书已加载: %s", *certFile)
+	} else {
+		if err := loadOrGenerateCert(p, *dataDir); err != nil {
+			log.Fatalf("自签名证书生成失败: %v", err)
+		}
+		log.Println("代理使用自动生成的自签名证书（生产环境请通过 -cert/-key 或控制台配置正式证书）")
+	}
+
+	go func() {
+		for {
+			days := 30
+			if v := st.GetSetting("log_retention_days"); v != "" {
+				fmt.Sscanf(v, "%d", &days)
+			}
+			if days > 0 {
+				st.CleanupLogs(days)
+			}
+			time.Sleep(6 * time.Hour)
+		}
+	}()
+
+	console := http.FileServer(http.FS(web.FS))
+
+	go func() {
+		for {
+			if name, err := a.RunBackup(); err != nil {
+				log.Printf("数据库自动备份失败: %v", err)
+			} else {
+				log.Printf("数据库自动备份完成: backups/%s", name)
+			}
+			time.Sleep(6 * time.Hour)
+		}
+	}()
+
+	if p.ACMEEnabled() {
+		go func() {
+			log.Printf("ACME HTTP-01 挑战监听: %s（Let's Encrypt 需公网可达该地址；内网无法签发）", *acmeHTTP)
+			srv := &http.Server{Addr: *acmeHTTP, Handler: p.ACMEHandler(p), ReadHeaderTimeout: 10 * time.Second}
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("ACME HTTP-01 监听启动失败（不影响其他服务）: %v", err)
+			}
+		}()
+	}
+
+	go func() {
+		log.Printf("管理控制台: https://127.0.0.1%s （首次登录需修改默认密码）", *adminAddr)
+		if err := http.ListenAndServeTLS(*adminAddr, adminCertPath, adminKeyPath, a.Handler(console)); err != nil {
+			log.Fatalf("管理端启动失败: %v", err)
+		}
+	}()
+
+	go func() {
+		log.Printf("防护代理 HTTPS 监听: %s（按站点 SNI 证书，可在控制台配置）", *tlsAddr)
+		srv := &http.Server{
+			Addr:              *tlsAddr,
+			Handler:           p,
+			TLSConfig:         p.TLSConfig(),
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		if err := srv.ListenAndServeTLS("", ""); err != nil {
+			log.Fatalf("HTTPS 代理启动失败: %v", err)
+		}
+	}()
+
+	log.Printf("防护代理 HTTP 监听: %s", *proxyAddr)
+	srv := &http.Server{
+		Addr:              *proxyAddr,
+		Handler:           p,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(c)
+	}()
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatalf("代理启动失败: %v", err)
+	}
+	st.Close()
+}
+
+func generateSelfSigned(certPath, keyPath string) error {
+	if _, err := os.Stat(certPath); err == nil {
+		return nil
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return err
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return err
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "NiuBWAF", Organization: []string{"NiuBWAF"}},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().AddDate(10, 0, 0),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+		DNSNames:              []string{"localhost", "niubwaf.local"},
+		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("::1")},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	if err != nil {
+		return err
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0644); err != nil {
+		return err
+	}
+	return os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0600)
+}
+
+func loadOrGenerateCert(p *proxy.Proxy, dataDir string) error {
+	certPath := filepath.Join(dataDir, "default_cert.pem")
+	keyPath := filepath.Join(dataDir, "default_key.pem")
+	if err := generateSelfSigned(certPath, keyPath); err != nil {
+		return err
+	}
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return err
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return err
+	}
+	return p.SetDefaultCert(certPEM, keyPEM)
+}
+
+func ensureAdminCert(dataDir string) (string, string, error) {
+	certPath := filepath.Join(dataDir, "admin_cert.pem")
+	keyPath := filepath.Join(dataDir, "admin_key.pem")
+	if err := generateSelfSigned(certPath, keyPath); err != nil {
+		return "", "", err
+	}
+	return certPath, keyPath, nil
+}

@@ -1,0 +1,22 @@
+services:
+  niubwaf:
+    build: .
+    image: niubwaf:latest
+    container_name: niubwaf
+    restart: unless-stopped
+    ports:
+      - "8080:8080"   # 防护代理 HTTP
+      - "8443:8443"   # 防护代理 HTTPS（站点证书在控制台配置，或用下方默认证书）
+      - "9443:9443"   # 管理控制台
+    volumes:
+      - niubwaf-data:/app/data
+      # 正式证书（可选）：取消注释并修改 command
+      # - ./certs:/app/certs:ro
+    # command: ["-proxy", ":8080", "-tls", ":8443", "-admin", ":9443", "-data", "/app/data",
+    #           "-cert", "/app/certs/fullchain.pem", "-key", "/app/certs/privkey.pem",
+    #           "-admin-cert", "/app/certs/fullchain.pem", "-admin-key", "/app/certs/privkey.pem"]
+    environment:
+      - TZ=Asia/Shanghai
+
+volumes:
+  niubwaf-data:
