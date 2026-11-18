@@ -203,7 +203,7 @@ Include @owasp_crs/*.conf
 		WithDirectives(directives))
 }
 
-// defaultExclusions 内置默认豁免规则（基于 BLAZEHTTP 3.4 万真实流量样本回归：
+// defaultExclusions 内置默认豁免规则（基于公开基准 3.4 万真实流量样本回归：
 // 这些规则对遥测/日志/REST 类正常流量误报量大且检出贡献≈0，等价攻击已由
 // 932235/930100/942100/语义引擎等覆盖）：
 //   - 942550 JSON SQLi：JSON API 常规字段误报（FP 195 / TP 0）
