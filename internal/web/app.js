@@ -90,11 +90,13 @@ const areaGrad = (rgb) => new echarts.graphic.LinearGradient(0, 0, 0, 1, [
   {offset: 0, color: `rgba(${rgb},.3)`}, {offset: 1, color: `rgba(${rgb},0)`}]);
 
 let liveES = null;
+let dashTimer = null;
 function closeLive() { if (liveES) { liveES.close(); liveES = null; } }
 
 function route() {
   disposeCharts(); closeLive();
   if (repTimer) { clearInterval(repTimer); repTimer = null; }
+  if (dashTimer) { clearInterval(dashTimer); dashTimer = null; }
   const view = (location.hash.replace('#/', '') || 'dashboard').split('?')[0];
   document.querySelectorAll('.sidebar nav a[data-view]').forEach(a =>
     a.classList.toggle('active', a.dataset.view === view));
@@ -106,7 +108,7 @@ window.addEventListener('hashchange', route);
 /* ---------------- 仪表盘 ---------------- */
 async function dashboard() {
   const m = $('#main');
-  m.innerHTML = pageHead('仪表盘', '全局防护态势 · 数据实时聚合') + `
+  m.innerHTML = pageHead('仪表盘', '全局防护态势 · 数据实时聚合 · 每 10 秒自动刷新') + `
   <div class="cards" id="stat-cards"></div>
   <div class="panel"><h3>流量趋势（近 24 小时）</h3><div id="trend" class="chart"></div></div>
   <div class="grid2">
@@ -117,7 +119,8 @@ async function dashboard() {
     <table><thead><tr><th>时间</th><th>站点</th><th>IP</th><th>动作</th><th>描述</th></tr></thead>
     <tbody id="live-body">${emptyHTML(5, '等待事件…')}</tbody></table>
   </div>`;
-  try {
+  let trendChart = null, ipsChart = null, rulesChart = null;
+  const paint = async first => {
     const [stats, trend, ips, rules] = await Promise.all([
       api('/api/stats'), api('/api/trend?hours=24'), api('/api/top/ips'), api('/api/top/rules')]);
     $('#stat-cards').innerHTML = `
@@ -127,8 +130,8 @@ async function dashboard() {
       ${card('累计拦截', stats.total_blocks, 'red', 'shield', 'red')}
       ${card('防护站点', stats.sites_enabled + ' / ' + stats.sites, 'green', 'globe', 'green')}
       ${card('GeoIP 库', stats.geoip_available ? '已加载' : '未加载', stats.geoip_available ? 'green' : '', 'pin', 'amber')}`;
-    countUp();
-    mkChart($('#trend'), {
+    if (first) countUp(); else fmtCards();
+    const trendOpt = {
       tooltip: {trigger: 'axis', ...tipStyle},
       legend: {data: ['请求', '拦截'], textStyle: {color: '#94a3b8'}, icon: 'roundRect', itemWidth: 12, itemHeight: 4},
       grid: {left: 50, right: 20, top: 40, bottom: 30},
@@ -137,9 +140,19 @@ async function dashboard() {
       series: [
         {name: '请求', type: 'line', smooth: true, showSymbol: false, data: trend.map(p => p.reqs), lineStyle: {width: 2, color: '#38bdf8'}, itemStyle: {color: '#38bdf8'}, areaStyle: {color: areaGrad('56,189,248')}},
         {name: '拦截', type: 'line', smooth: true, showSymbol: false, data: trend.map(p => p.blocks), lineStyle: {width: 2, color: '#fb7185'}, itemStyle: {color: '#fb7185'}, areaStyle: {color: areaGrad('251,113,133')}}]
-    });
-    barChart($('#top-ips'), ips, '#fbbf24');
-    barChart($('#top-rules'), rules.map(r => ({key: r.key.length > 26 ? r.key.slice(0, 26) + '…' : r.key, count: r.count})), '#fb7185');
+    };
+    if (first) trendChart = mkChart($('#trend'), trendOpt); else trendChart.setOption(trendOpt);
+    const ruleKvs = rules.map(r => ({key: r.key.length > 26 ? r.key.slice(0, 26) + '…' : r.key, count: r.count}));
+    if (first) {
+      ipsChart = barChart($('#top-ips'), ips, '#fbbf24');
+      rulesChart = barChart($('#top-rules'), ruleKvs, '#fb7185');
+    } else {
+      ipsChart.setOption(barOpt(ips, '#fbbf24'));
+      rulesChart.setOption(barOpt(ruleKvs, '#fb7185'));
+    }
+  };
+  try {
+    await paint(true);
     const recent = await api('/api/logs?size=8');
     renderLiveRows(recent.list);
     liveES = new EventSource('/api/events');
@@ -151,7 +164,16 @@ async function dashboard() {
       tb.insertAdjacentHTML('afterbegin', liveRow(d));
       while (tb.children.length > 12) tb.lastChild.remove();
     };
+    dashTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') paint(false).catch(() => {});
+    }, 10000);
   } catch (e) { if (e.message !== '未登录') toast(e.message, true); }
+}
+function fmtCards() {
+  document.querySelectorAll('#stat-cards .num').forEach(el => {
+    const raw = el.textContent.trim();
+    if (/^\d+$/.test(raw)) el.textContent = (+raw).toLocaleString();
+  });
 }
 function card(label, num, cls, iconName, iconCls) {
   return `<div class="card"><div class="card-top"><div class="label">${label}</div><div class="card-icon ${iconCls}">${ico(iconName)}</div></div><div class="num ${cls || ''}">${num}</div></div>`;
@@ -173,15 +195,16 @@ function countUp() {
     requestAnimationFrame(step);
   });
 }
-function barChart(el, kvs, color) {
-  mkChart(el, {
+function barOpt(kvs, color) {
+  return {
     tooltip: tipStyle, grid: {left: 10, right: 30, top: 10, bottom: 10, containLabel: true},
     xAxis: {type: 'value', ...axisStyle},
     yAxis: {type: 'category', inverse: true, data: kvs.map(k => k.key), ...axisStyle, axisLabel: {color: '#7d8db0', fontSize: 11, width: 150, overflow: 'truncate'}},
     series: [{type: 'bar', data: kvs.map(k => k.count), barMaxWidth: 14,
       itemStyle: {borderRadius: [0, 6, 6, 0], color: new echarts.graphic.LinearGradient(0, 0, 1, 0, [{offset: 0, color: color + '40'}, {offset: 1, color}])}}]
-  });
+  };
 }
+function barChart(el, kvs, color) { return mkChart(el, barOpt(kvs, color)); }
 const actionTag = a => ({waf: '<span class="tag red">WAF拦截</span>', resp: '<span class="tag red">响应拦截</span>', cc: '<span class="tag orange">CC限频</span>', blacklist: '<span class="tag red">黑名单</span>', geo: '<span class="tag blue">地区限制</span>', semantic: '<span class="tag blue">语义检测</span>', reputation: '<span class="tag orange">信誉封禁</span>', custom: '<span class="tag violet">自定义</span>', dynamic: '<span class="tag cyan">动态防护</span>'}[a] || esc(a));
 function liveRow(d) {
   return `<tr><td class="mono">${esc(d.ts)}</td><td>${esc(d.domain)}</td><td class="mono">${esc(d.ip)}</td><td>${actionTag(d.action)}</td><td class="url-cell" title="${esc(d.msg)}">${esc(d.msg)}</td></tr>`;
