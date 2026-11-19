@@ -107,3 +107,41 @@ func TestCountWriterHijackUnsupported(t *testing.T) {
 		t.Error("底层不支持 Hijack 时应返回错误")
 	}
 }
+
+func TestStatusWriterWriteHeaderOnce(t *testing.T) {
+	base := &flushRW{}
+	sw := &statusWriter{ResponseWriter: base}
+	sw.WriteHeader(http.StatusForbidden)
+	sw.WriteHeader(http.StatusOK) // 重复调用应被忽略，不再透传
+	if sw.code != http.StatusForbidden || base.status != http.StatusForbidden {
+		t.Fatalf("重复 WriteHeader 应忽略: sw=%d base=%d", sw.code, base.status)
+	}
+	sw2 := &statusWriter{ResponseWriter: &flushRW{}}
+	if _, err := sw2.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if sw2.code != http.StatusOK {
+		t.Fatalf("隐式 Write 应记 200, got %d", sw2.code)
+	}
+}
+
+func TestStatusWriterHijackRecords101(t *testing.T) {
+	c1, c2 := net.Pipe()
+	defer c1.Close()
+	defer c2.Close()
+	base := &hijackRW{conn: c1, rw: bufio.NewReadWriter(bufio.NewReader(c1), bufio.NewWriter(c1))}
+	sw := &statusWriter{ResponseWriter: base}
+	if _, _, err := sw.Hijack(); err != nil {
+		t.Fatal(err)
+	}
+	if sw.code != http.StatusSwitchingProtocols {
+		t.Fatalf("Hijack 成功应记 101, got %d", sw.code)
+	}
+	sw2 := &statusWriter{ResponseWriter: &flushRW{}}
+	if _, _, err := sw2.Hijack(); err == nil {
+		t.Fatal("底层不支持 Hijack 应报错")
+	}
+	if sw2.code != 0 {
+		t.Fatalf("Hijack 失败不应记状态码, got %d", sw2.code)
+	}
+}

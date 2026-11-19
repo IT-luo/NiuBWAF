@@ -102,6 +102,7 @@ type Proxy struct {
 	Limiter *Limiter
 	Cap     *Captcha
 	Hub     *Hub
+	Ana     *Analytics
 	threat  *ThreatIntel
 	// HTTPSAddr 用于 HTTP→HTTPS 跳转时构造目标地址，如 ":8443"
 	HTTPSAddr string
@@ -134,6 +135,7 @@ func New(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *IDCMatcher, tor *
 	p := &Proxy{
 		Store: st, Engine: eng, Geo: geo, IDC: idc, Tor: tor,
 		Limiter: NewLimiter(), Cap: NewCaptcha(secret), Hub: NewHub(),
+		Ana:       NewAnalytics(st, geo),
 		dynSecret: []byte(secret), threat: NewThreatIntel(st),
 	}
 	p.Reload()
@@ -145,6 +147,7 @@ func New(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *IDCMatcher, tor *
 	go p.healthLoop()
 	go p.reputationLoop()
 	go p.alertLoop()
+	go p.qpsLoop()
 	return p
 }
 
@@ -406,6 +409,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 	metricSite, metricBlocked := "", false
+	var sw *statusWriter
 	defer func() {
 		metrics.Default.ObserveDuration(time.Since(start).Seconds())
 		if metricSite != "" {
@@ -414,6 +418,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				result = "blocked"
 			}
 			metrics.Default.IncRequest(metricSite, result)
+		}
+		if sw != nil {
+			p.Ana.Record(ReqStat{
+				IP: ip, Host: metricSite, Path: truncStr(r.URL.Path, pathMaxLen),
+				UA: r.Header.Get("User-Agent"), Referer: refererHost(r.Referer(), metricSite),
+				Status: sw.code, Blocked: metricBlocked,
+			})
 		}
 	}()
 
@@ -439,6 +450,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}))
 		return
 	}
+	sw = &statusWriter{ResponseWriter: w}
+	w = sw
 
 	if site.Enabled && site.HTTPRedirect && r.TLS == nil && p.HTTPSAddr != "" {
 		target := "https://" + host
@@ -827,6 +840,54 @@ type countWriter struct {
 	n int64
 }
 
+// statusWriter 记录响应状态码供流量分析聚合（未显式 WriteHeader 视为 200）
+type statusWriter struct {
+	http.ResponseWriter
+	code int
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	if s.code != 0 {
+		return // 与 net/http 一致：重复 WriteHeader 忽略，避免 superfluous 日志
+	}
+	s.code = code
+	s.ResponseWriter.WriteHeader(code)
+}
+
+func (s *statusWriter) Write(b []byte) (int, error) {
+	if s.code == 0 {
+		s.code = http.StatusOK
+	}
+	return s.ResponseWriter.Write(b)
+}
+
+func (s *statusWriter) Unwrap() http.ResponseWriter { return s.ResponseWriter }
+
+func (s *statusWriter) Flush() {
+	if f, ok := s.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (s *statusWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	if h, ok := s.ResponseWriter.(http.Hijacker); ok {
+		conn, rw, err := h.Hijack()
+		if err == nil && s.code == 0 {
+			// 劫持成功（如 WebSocket 升级）记为 101，流量分析不再出现状态码 0
+			s.code = http.StatusSwitchingProtocols
+		}
+		return conn, rw, err
+	}
+	return nil, nil, fmt.Errorf("niubwaf: 底层 ResponseWriter 不支持连接劫持")
+}
+
+func truncStr(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
 func (c *countWriter) Write(b []byte) (int, error) {
 	n, err := c.ResponseWriter.Write(b)
 	c.n += int64(n)
@@ -860,6 +921,8 @@ type multiReadCloser struct {
 func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, msg string, ruleID, status int, reqID string) {
 	metrics.Default.IncAttack(action)
 	geo := p.Geo.CityInfo(ip)
+	lat, lon := geoCoords(geo)
+	p.Ana.Event(EvStat{IP: ip, Action: action, Msg: msg, RuleID: ruleID, Status: status, Country: geo.Country, City: geo.City, Lat: lat, Lon: lon, URL: r.URL.RequestURI(), Domain: site.Domain})
 	l := &store.AttackLog{
 		SiteID: site.ID, Domain: site.Domain, ClientIP: ip, Country: geo.Country,
 		Method: r.Method, URL: r.URL.RequestURI(), Action: action,
@@ -871,7 +934,7 @@ func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, 
 	p.Hub.Broadcast(map[string]any{
 		"type": "attack", "ts": nowStr(), "domain": site.Domain, "ip": ip,
 		"country": geo.Country, "city": geo.City, "method": r.Method, "url": l.URL,
-		"action": action, "msg": msg, "status": status,
+		"action": action, "msg": msg, "status": status, "lat": lat, "lon": lon,
 	})
 }
 

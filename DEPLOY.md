@@ -262,7 +262,9 @@ Docker 环境升级见 §6 末。
 - **指标**：`GET https://<admin>:9443/metrics`（Prometheus 文本格式）。无 token 仅环回可抓；设 `metrics_token` 后需 `Authorization: Bearer <token>`。含请求量/时延直方图、攻击计数、上游健康、信誉封禁数、响应字节、Go 运行时。
 - **上游健康**：`GET /api/upstreams`；控制台站点表绿/红点。
 - **攻击日志/报表**：控制台「攻击日志」（筛选/导出 CSV/一键豁免误报）与「防护报告」。
-- **实时大屏**：`/screen.html`。
+- **实时大屏**：`/screen.html`（含全球攻击轨迹点阵地图与实时弧线）。
+- **流量分析 / 安全态势**：控制台 `#/traffic`、`#/posture`；聚合数据来自 `GET /api/analytics?hours=6|24|72|168`（小时桶内存累加 + SQLite 保留 7 天）。
+- **实时 QPS**：仪表盘与流量分析页的 QPS 面板、大屏地图角标；`GET /api/qps`（近 60 秒序列 + 5s 滚动均值 + 60s 峰值），SSE `/api/events` 每秒推送 `type=qps` 帧；秒级桶仅内存保留 120s，重启清零。
 - **资源**：systemd `MemoryMax` 兜底；SQLite 连接池上限 8。
 
 ---

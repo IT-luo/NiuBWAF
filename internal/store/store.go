@@ -361,6 +361,10 @@ func (s *Store) migrate() error {
 			note TEXT DEFAULT '',
 			created_at TEXT DEFAULT (datetime('now','localtime'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS analytics_hour(
+			ts INTEGER PRIMARY KEY,
+			data TEXT NOT NULL
+		)`,
 	}
 	for _, q := range stmts {
 		if _, err := s.DB.Exec(q); err != nil {
@@ -837,6 +841,35 @@ func (s *Store) AddTraffic(siteID int64, blocked bool, bytes int64) {
 	v.bytes += bytes
 	s.traffic[trafficKey{minute, siteID}] = v
 	s.tMu.Unlock()
+}
+
+// SaveAnalyticsHour upsert 小时级分析桶（JSON 载荷）
+func (s *Store) SaveAnalyticsHour(ts int64, data string) error {
+	_, err := s.DB.Exec("INSERT INTO analytics_hour(ts, data) VALUES(?, ?) ON CONFLICT(ts) DO UPDATE SET data=excluded.data", ts, data)
+	return err
+}
+
+func (s *Store) LoadAnalyticsHours(since int64) (map[int64]string, error) {
+	rows, err := s.DB.Query("SELECT ts, data FROM analytics_hour WHERE ts >= ?", since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]string{}
+	for rows.Next() {
+		var ts int64
+		var data string
+		if err := rows.Scan(&ts, &data); err != nil {
+			return nil, err
+		}
+		out[ts] = data
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) PruneAnalytics(before int64) error {
+	_, err := s.DB.Exec("DELETE FROM analytics_hour WHERE ts < ?", before)
+	return err
 }
 
 type TrendPoint struct {

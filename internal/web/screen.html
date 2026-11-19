@@ -44,6 +44,12 @@ header{display:flex;align-items:center;justify-content:space-between;padding:22p
 @keyframes flash{0%{background:rgba(56,189,248,.14)}100%{background:transparent}}
 .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#34d399;margin-right:2px;animation:pulse 1.8s infinite}
 @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.5)}70%{box-shadow:0 0 0 7px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
+#map-box{position:relative;height:400px;margin-bottom:14px}
+#c-map{position:absolute;inset:0;width:100%;height:100%}
+.map-stats{position:absolute;left:12px;bottom:10px;display:flex;gap:12px;pointer-events:none}
+.map-stats div{background:rgba(7,11,22,.55);border:1px solid var(--border);border-radius:10px;padding:6px 12px;text-align:center;backdrop-filter:blur(6px)}
+.map-stats b{display:block;font-size:17px;font-weight:800;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-variant-numeric:tabular-nums}
+.map-stats span{font-size:10px;color:var(--faint);letter-spacing:1px}
 footer{text-align:center;color:var(--faint);font-size:12px;padding:10px 0 22px;position:relative;z-index:1}
 @media(max-width:1100px){.grid{grid-template-columns:1fr}.big-stats{grid-template-columns:1fr 1fr}}
 </style>
@@ -68,7 +74,18 @@ footer{text-align:center;color:var(--faint);font-size:12px;padding:10px 0 22px;p
       <div class="panel" style="margin-bottom:16px"><h3>攻击源 IP Top10</h3><div id="c-ips" class="chart"></div></div>
       <div class="panel"><h3>攻击来源国家/地区</h3><div id="c-geo" class="chart" style="height:180px"></div></div>
     </div>
-    <div class="panel"><h3>流量趋势（近 24 小时）</h3><div id="c-trend" class="chart" style="height:560px"></div></div>
+    <div class="panel"><h3><span class="dot"></span>全球攻击轨迹</h3>
+      <div id="map-box"><canvas id="c-map"></canvas>
+        <div class="map-stats">
+          <div><b id="m-qps">0</b><span>实时 QPS</span></div>
+          <div><b id="m-qp">0</b><span>60s 峰值</span></div>
+          <div><b id="m-blocked">0</b><span>24H 拦截</span></div>
+          <div><b id="m-srcs">0</b><span>攻击源地域</span></div>
+          <div><b id="m-events">0</b><span>实时事件</span></div>
+        </div>
+      </div>
+      <h3>流量趋势（近 24 小时）</h3><div id="c-trend" class="chart" style="height:170px"></div>
+    </div>
     <div class="panel"><h3><span class="dot"></span>实时攻击事件</h3><div id="feed"></div></div>
   </div>
 </div>
@@ -83,7 +100,148 @@ const area = rgb => new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:
 const trendC = echarts.init($('#c-trend'));
 const ipsC = echarts.init($('#c-ips'));
 const geoC = echarts.init($('#c-geo'));
-window.addEventListener('resize', () => [trendC, ipsC, geoC].forEach(c => c.resize()));
+
+/* ---- 攻击轨迹点阵地图（陆地栅格由 Natural Earth 110m 生成，仅含海陆轮廓，无第三方版权数据） ---- */
+const MAP_W=120,MAP_H=48,MAP_LAT0=84,MAP_STEP=3;
+const MAP_BITS="AAAAgH/wHwAAAAAAAAAAAAAA8Mf/PwALAAAYAAAAAACY9OP/HwAAAATAAQAAAAAYfQP+HwAAQID/LwgAwAPA0x/8BwAwAOz///8B/v////////8BDBAAAAAAwP///z04YAD3//////9/4P//HwwwAMD7//////86AMH/H1wAAETz/////wcCAAD/f/wAAAT5/////wEDAAD+//0BAPr//////w8BAAD4/z8AAPj//////w8AAAD4/z8AAPi/3v///wsAAAD4/x8AALof7v///wkAAAD4/wcAAA7O3///bwAAAAD4/wcAAA7p3///XwQAAADw/wMAAHwA////DwMAAADg/wEAAP4Z////nwAAAACADwEAAP9/7///HwAAAAAADwAAgP//H///DwAAAAAABgIAgP///vj7AwAAAAAAThAAgP//fPB4AQAAAAAAeAAAwP//PXD4EAAAAAAAwAAAwP//D2DgAAAAAAAAgLgAgP//H2CAAAAAAAAAAPwAAP//HwAAIAAAAAAAAPwHAML/DwAQDAAAAAAAAPwHAID/BwBgBwAAAAAAAP4fAID/AwBAFgEAAAAAAP5/AAD/AQBAAA4AAAAAAP7/AAD/AQAAAxwAAAAAAPz/AAD/AQAAAAAAAAAAAPh/AAD/EwAAgAkA////////////////////AAAAAOB/AAD/CAAA8B8AAAAAAOA/AAD+DAAA/D8AAAAAAPAPAAB+AAAA/H8AAAAAAPAPAAB+AAAA/H8AAAAAAPAHAAA8AAAA+H8AAAAAAPADAAAEAAAACDwAAAAAAPgBAAAAAAAAADhAAAAAAHgAAAAAAAAAAABAAAAAADAAAAAAAAAAAAAgAAAAADgAAAAAAAAAAAAQAAAAABgAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+const mapCv=$('#c-map'),mapCtx=mapCv.getContext('2d');
+const HOME={lon:104,lat:34};
+// 纵向按陆地行范围裁剪投影，让陆地铺满画布；跳过整行填充的纬线伪影
+let mapRow0=0,mapRowSpan=MAP_H;
+const mx=lon=>(lon+180)/360;
+const my=lat=>((MAP_LAT0-Math.max(-60,Math.min(MAP_LAT0,lat)))/MAP_STEP-mapRow0+0.5)/mapRowSpan;
+let dotLayer=null,boxW=0,boxH=0;
+function buildDots(){
+  const dpr=devicePixelRatio||1;
+  boxW=mapCv.clientWidth;boxH=mapCv.clientHeight;
+  if(!boxW||!boxH)return;
+  mapCv.width=boxW*dpr;mapCv.height=boxH*dpr;mapCtx.setTransform(dpr,0,0,dpr,0,0);
+  const raw=atob(MAP_BITS),bits=new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++)bits[i]=raw.charCodeAt(i);
+  const on=(c,r)=>!!(bits[(r*MAP_W+c)>>3]&(1<<((r*MAP_W+c)&7)));
+  const skip=new Set();
+  let r0=MAP_H,r1=-1;
+  for(let r=0;r<MAP_H;r++){
+    let cnt=0;for(let c=0;c<MAP_W;c++)if(on(c,r))cnt++;
+    if(cnt>=MAP_W-2){skip.add(r);continue;}
+    if(!cnt)continue;
+    if(r<r0)r0=r;
+    if(r>r1)r1=r;
+  }
+  if(r1<0){r0=0;r1=MAP_H-1;}
+  mapRow0=r0;mapRowSpan=r1-r0+1;
+  dotLayer=document.createElement('canvas');dotLayer.width=boxW*dpr;dotLayer.height=boxH*dpr;
+  const dc=dotLayer.getContext('2d');dc.setTransform(dpr,0,0,dpr,0,0);
+  const bg=dc.createRadialGradient(boxW/2,boxH*0.45,10,boxW/2,boxH*0.45,boxW*0.62);
+  bg.addColorStop(0,'rgba(59,130,246,.09)');bg.addColorStop(1,'rgba(59,130,246,0)');
+  dc.fillStyle=bg;dc.fillRect(0,0,boxW,boxH);
+  const r=Math.max(1.1,Math.min(boxW/MAP_W,boxH/mapRowSpan)*0.34);
+  for(let row=mapRow0;row<mapRow0+mapRowSpan;row++){
+    if(skip.has(row))continue;
+    const t=(row-mapRow0)/mapRowSpan;
+    const alpha=(0.30+0.34*Math.sin(Math.PI*(0.12+0.88*t))).toFixed(3);
+    dc.fillStyle=`rgba(${Math.round(92-34*t)},${Math.round(146+36*t)},238,${alpha})`;
+    for(let c=0;c<MAP_W;c++){
+      if(!on(c,row))continue;
+      dc.beginPath();
+      dc.arc((c+0.5)/MAP_W*boxW,(row-mapRow0+0.5)/mapRowSpan*boxH,r,0,Math.PI*2);
+      dc.fill();
+    }
+  }
+}
+let arcs=[],evCount=0,seeded=false,ripples=[];
+function addArc(lon,lat,label,n,live){
+  if(!lon&&!lat)return;
+  const x=mx(lon),y=my(lat);
+  const dup=arcs.find(a=>Math.abs(a.x-x)<0.012&&Math.abs(a.y-y)<0.012);
+  if(dup){dup.n+=(n||1);dup.born=performance.now();dup.live=false;if(label)dup.label=label;return;}
+  arcs.push({x,y,label:label||'',n:n||1,born:performance.now(),seed:Math.random()*1000,live:!!live,lastT:0});
+  if(arcs.length>48)arcs.shift();
+}
+function frame(now){
+  if(dotLayer&&boxW){
+    mapCtx.clearRect(0,0,boxW,boxH);
+    mapCtx.drawImage(dotLayer,0,0,boxW,boxH);
+    arcs=arcs.filter(a=>!a.live||now-a.born<14000);
+    ripples=ripples.filter(r=>now-r.born<1500);
+    const hx=mx(HOME.lon)*boxW,hy=my(HOME.lat)*boxH;
+    for(const a of arcs){
+      const sx=a.x*boxW,sy=a.y*boxH,dx=hx,dy=hy;
+      const dist=Math.hypot(dx-sx,dy-sy)||1;
+      const cxp=(sx+dx)/2-(dy-sy)*0.22,cyp=(sy+dy)/2+(dx-sx)*0.22-dist*0.08;
+      // 轨迹线：琥珀(源)→玫红(本站)渐变
+      const alpha=Math.min(0.6,0.18+a.n*0.04);
+      const grad=mapCtx.createLinearGradient(sx,sy,dx,dy);
+      grad.addColorStop(0,`rgba(251,191,36,${(alpha*0.65).toFixed(3)})`);
+      grad.addColorStop(1,`rgba(251,113,133,${alpha.toFixed(3)})`);
+      mapCtx.beginPath();mapCtx.moveTo(sx,sy);mapCtx.quadraticCurveTo(cxp,cyp,dx,dy);
+      mapCtx.strokeStyle=grad;
+      mapCtx.lineWidth=Math.min(2.6,0.8+Math.log2(1+a.n)*0.5);mapCtx.stroke();
+      // 彗头 + 渐隐拖尾；每绕完一圈在本站激起拦截涟漪
+      const t=((now-a.born)/2600+a.seed)%1;
+      if(t<a.lastT)ripples.push({born:now});
+      a.lastT=t;
+      for(let k=8;k>=0;k--){
+        const tt=t-k*0.025;
+        if(tt<0)continue;
+        const it=1-tt;
+        const px=it*it*sx+2*it*tt*cxp+tt*tt*dx,py=it*it*sy+2*it*tt*cyp+tt*tt*dy;
+        mapCtx.beginPath();mapCtx.arc(px,py,k===0?2.4:1.8*(1-k/10),0,Math.PI*2);
+        mapCtx.fillStyle=`rgba(254,205,211,${((1-k/9)*0.85).toFixed(3)})`;
+        if(k===0){mapCtx.shadowColor='#fb7185';mapCtx.shadowBlur=12;}
+        mapCtx.fill();mapCtx.shadowBlur=0;
+      }
+      // 源点：光晕 + 扩散环 + 核心
+      const sr=(now%1800)/1800;
+      mapCtx.beginPath();mapCtx.arc(sx,sy,2+sr*9,0,Math.PI*2);
+      mapCtx.strokeStyle=`rgba(251,191,36,${(0.45*(1-sr)).toFixed(3)})`;mapCtx.lineWidth=1;mapCtx.stroke();
+      mapCtx.beginPath();mapCtx.arc(sx,sy,4.5,0,Math.PI*2);mapCtx.fillStyle='rgba(251,191,36,.16)';mapCtx.fill();
+      mapCtx.beginPath();mapCtx.arc(sx,sy,2,0,Math.PI*2);mapCtx.fillStyle='#fbbf24';mapCtx.fill();
+    }
+    // 拦截到达涟漪
+    for(const rp of ripples){
+      const p=(now-rp.born)/1500;
+      mapCtx.beginPath();mapCtx.arc(hx,hy,7+p*32,0,Math.PI*2);
+      mapCtx.strokeStyle=`rgba(251,113,133,${(0.5*(1-p)).toFixed(3)})`;mapCtx.lineWidth=1.4;mapCtx.stroke();
+    }
+    // 本站：双层脉冲 + 高亮核心 + 标签
+    const pr=(now%2400)/2400;
+    for(const off of [0,0.5]){
+      const p=(pr+off)%1;
+      mapCtx.beginPath();mapCtx.arc(hx,hy,6+p*26,0,Math.PI*2);
+      mapCtx.strokeStyle=`rgba(34,211,238,${(0.5*(1-p)).toFixed(3)})`;mapCtx.lineWidth=1.6;mapCtx.stroke();
+    }
+    mapCtx.beginPath();mapCtx.arc(hx,hy,9,0,Math.PI*2);mapCtx.fillStyle='rgba(34,211,238,.18)';mapCtx.fill();
+    mapCtx.beginPath();mapCtx.arc(hx,hy,5,0,Math.PI*2);
+    mapCtx.fillStyle='#22d3ee';mapCtx.shadowColor='#22d3ee';mapCtx.shadowBlur=16;mapCtx.fill();mapCtx.shadowBlur=0;
+    mapCtx.font='600 11px sans-serif';
+    mapCtx.fillStyle='rgba(7,11,22,.72)';
+    mapCtx.beginPath();mapCtx.roundRect(hx+8,hy-20,36,17,4);mapCtx.fill();
+    mapCtx.fillStyle='rgba(103,232,249,.95)';mapCtx.fillText('本站',hx+12,hy-8);
+    // 攻击源标签（带底板，防地图点阵干扰阅读；相邻标签自动下移避让）
+    mapCtx.font='600 10.5px sans-serif';
+    const placed=[];
+    arcs.slice(-8).forEach(a=>{
+      if(!a.label)return;
+      const txt=a.label+(a.n>1?' ×'+a.n:'');
+      const lx=a.x*boxW+8;
+      let ly=a.y*boxH-10;
+      const w=mapCtx.measureText(txt).width;
+      for(const p of placed){
+        if(Math.abs(p.ly-ly)<16&&Math.abs(p.lx-lx)<Math.max(p.w,w)+18)ly=p.ly+20;
+      }
+      placed.push({lx,ly,w});
+      mapCtx.fillStyle='rgba(7,11,22,.72)';
+      mapCtx.beginPath();mapCtx.roundRect(lx-4,ly-12,w+8,16,4);mapCtx.fill();
+      mapCtx.fillStyle='rgba(251,191,36,.95)';
+      mapCtx.fillText(txt,lx,ly);
+    });
+  }
+  requestAnimationFrame(frame);
+}
+buildDots();
+requestAnimationFrame(frame);
+window.addEventListener('resize', () => { [trendC, ipsC, geoC].forEach(c => c.resize()); buildDots(); });
 
 setInterval(() => $('#clock').textContent = new Date().toLocaleString('zh-CN', {hour12: false}), 1000);
 
@@ -91,14 +249,17 @@ async function j(p) { const r = await fetch(p); if (!r.ok) throw new Error(r.sta
 
 async function refresh() {
   try {
-    const [st, trend, ips, geo] = await Promise.all([j('/api/stats'), j('/api/trend?hours=24'), j('/api/top/ips'), j('/api/top/countries')]);
+    const [st, trend, ips, geo, an] = await Promise.all([j('/api/stats'), j('/api/trend?hours=24'), j('/api/top/ips'), j('/api/top/countries'), j('/api/analytics?hours=24')]);
     $('#s-reqs').textContent = st.today_reqs.toLocaleString();
     $('#s-blocks').textContent = st.today_blocks.toLocaleString();
     $('#s-sites').textContent = st.sites_enabled;
     $('#s-total').textContent = st.total_blocks.toLocaleString();
+    $('#m-blocked').textContent = ((an.totals && an.totals.blocked) || 0).toLocaleString();
+    $('#m-srcs').textContent = an.arc_srcs || (an.arcs || []).length;
+    if (!seeded) { seeded = true; (an.arcs || []).forEach(a => addArc(a.lon, a.lat, a.name || a.key, a.count, false)); }
     trendC.setOption({
       tooltip:{trigger:'axis',...tip}, legend:{data:['请求','拦截'],textStyle:{color:'#94a3b8'},icon:'roundRect',itemWidth:12,itemHeight:4},
-      grid:{left:55,right:20,top:40,bottom:30},
+      grid:{left:55,right:20,top:30,bottom:22},
       xAxis:{type:'category',boundaryGap:false,data:trend.map(p=>p.minute.slice(11)),...axis},
       yAxis:{type:'value',...axis},
       series:[
@@ -121,12 +282,20 @@ async function refresh() {
 }
 refresh();
 setInterval(refresh, 10000);
+j('/api/qps').then(d => { $('#m-qps').textContent = d.qps; $('#m-qp').textContent = d.peak; }).catch(() => {});
 
 const tag = a => ({waf:'<span class="tag red">WAF拦截</span>',resp:'<span class="tag red">响应拦截</span>',cc:'<span class="tag orange">CC限频</span>',blacklist:'<span class="tag red">黑名单</span>',geo:'<span class="tag blue">地区限制</span>',semantic:'<span class="tag blue">语义检测</span>',reputation:'<span class="tag orange">信誉封禁</span>',custom:'<span class="tag violet">自定义</span>',dynamic:'<span class="tag cyan">动态防护</span>',bot:'<span class="tag violet">Bot防护</span>'}[a] || esc(a));
 const es = new EventSource('/api/events');
 es.onmessage = ev => {
   const d = JSON.parse(ev.data);
+  if (d.type === 'qps') {
+    $('#m-qps').textContent = d.qps;
+    $('#m-qp').textContent = d.peak;
+    return;
+  }
   if (d.type !== 'attack') return;
+  evCount++; $('#m-events').textContent = evCount;
+  if (d.lat || d.lon) addArc(d.lon, d.lat, d.city || d.country || d.ip, 1, true);
   const feed = $('#feed');
   feed.insertAdjacentHTML('afterbegin', `<div class="ev"><span class="t">${esc(d.ts)}</span>${tag(d.action)}<span class="ip">${esc(d.ip)}</span>${d.city ? ' · ' + esc(d.city) : (d.country ? ' · ' + esc(d.country) : '')} → ${esc(d.domain)}<span class="m">${esc(d.method)} ${esc(d.url)} · ${esc(d.msg)}</span></div>`);
   while (feed.children.length > 60) feed.lastChild.remove();

@@ -90,8 +90,12 @@ const areaGrad = (rgb) => new echarts.graphic.LinearGradient(0, 0, 0, 1, [
   {offset: 0, color: `rgba(${rgb},.3)`}, {offset: 1, color: `rgba(${rgb},0)`}]);
 
 let liveES = null;
+let qpsES = null;
 let dashTimer = null;
-function closeLive() { if (liveES) { liveES.close(); liveES = null; } }
+function closeLive() {
+  if (liveES) { liveES.close(); liveES = null; }
+  if (qpsES) { qpsES.close(); qpsES = null; }
+}
 
 function route() {
   disposeCharts(); closeLive();
@@ -100,7 +104,7 @@ function route() {
   const view = (location.hash.replace('#/', '') || 'dashboard').split('?')[0];
   document.querySelectorAll('.sidebar nav a[data-view]').forEach(a =>
     a.classList.toggle('active', a.dataset.view === view));
-  const views = {dashboard, sites, logs, tuning, rules, ips, reputation, settings, audit};
+  const views = {dashboard, traffic, posture, sites, logs, tuning, rules, ips, reputation, settings, audit};
   (views[view] || dashboard)();
 }
 window.addEventListener('hashchange', route);
@@ -110,6 +114,7 @@ async function dashboard() {
   const m = $('#main');
   m.innerHTML = pageHead('仪表盘', '全局防护态势 · 数据实时聚合 · 每 10 秒自动刷新') + `
   <div class="cards" id="stat-cards"></div>
+  ${qpsPanel('q')}
   <div class="panel"><h3>流量趋势（近 24 小时）</h3><div id="trend" class="chart"></div></div>
   <div class="grid2">
     <div class="panel"><h3>攻击源 IP Top10</h3><div id="top-ips" class="chart"></div></div>
@@ -154,11 +159,13 @@ async function dashboard() {
   };
   try {
     await paint(true);
+    qpsInit('q');
     const recent = await api('/api/logs?size=8');
     renderLiveRows(recent.list);
     liveES = new EventSource('/api/events');
     liveES.onmessage = ev => {
       const d = JSON.parse(ev.data);
+      if (d.type === 'qps') { qpsTick('q', d); return; }
       if (d.type !== 'attack') return;
       const tb = $('#live-body');
       if (tb.querySelector('.empty')) tb.innerHTML = '';
@@ -215,6 +222,283 @@ function liveRow(d) {
 function renderLiveRows(list) {
   const tb = $('#live-body');
   tb.innerHTML = list.length ? list.map(liveRow).join('') : emptyHTML(5, '暂无攻击事件');
+}
+
+/* ---------------- 实时 QPS 组件（SSE 每秒一帧驱动） ---------------- */
+const qpsState = {};
+function qpsPanel(id) {
+  return `<div class="panel qps-panel"><h3><span class="live-dot"></span>实时 QPS<span class="qps-hint">5s 滚动均值 · 近 60 秒曲线</span></h3>
+  <div class="qps-row">
+    <div class="qps-item"><div class="qps-v" id="${id}-cur">0</div><div class="qps-l">当前 QPS</div></div>
+    <div class="qps-item"><div class="qps-v amber" id="${id}-peak">0</div><div class="qps-l">60s 峰值</div></div>
+    <div class="qps-item"><div class="qps-v red" id="${id}-blk">0</div><div class="qps-l">拦截 QPS</div></div>
+    <canvas class="qps-spark" id="${id}-spark"></canvas>
+  </div></div>`;
+}
+function qpsSet(id, d) {
+  const cur = $('#' + id + '-cur');
+  if (!cur) return;
+  cur.textContent = d.qps;
+  $('#' + id + '-peak').textContent = d.peak;
+  $('#' + id + '-blk').textContent = d.blocked_qps;
+}
+function qpsDraw(id) {
+  const st = qpsState[id], cv = $('#' + id + '-spark');
+  if (!st || !cv) return;
+  const dpr = window.devicePixelRatio || 1, W = cv.clientWidth, H = cv.clientHeight;
+  if (!W) return;
+  if (cv.width !== W * dpr) { cv.width = W * dpr; cv.height = H * dpr; }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const max = Math.max(1, ...st.series.map(p => p.req));
+  const n = st.series.length;
+  const line = (key, color, fill) => {
+    ctx.beginPath();
+    st.series.forEach((p, i) => {
+      const x = n > 1 ? i * W / (n - 1) : 0, y = H - 2 - (p[key] / max) * (H - 6);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    });
+    ctx.strokeStyle = color; ctx.lineWidth = 1.6; ctx.stroke();
+    if (fill && n > 1) {
+      ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+      ctx.fillStyle = fill; ctx.fill();
+    }
+  };
+  line('req', '#38bdf8', 'rgba(56,189,248,.10)');
+  line('blocked', '#fb7185');
+}
+async function qpsInit(id) {
+  try {
+    const d = await api('/api/qps');
+    qpsState[id] = {series: d.series || []};
+    qpsSet(id, d);
+    qpsDraw(id);
+  } catch (e) { /* 播种失败不影响 SSE 后续驱动 */ }
+}
+function qpsTick(id, d) {
+  const st = qpsState[id];
+  if (!st) return;
+  st.series.push({ts: d.ts, req: d.req, blocked: d.blocked});
+  if (st.series.length > 60) st.series.shift();
+  qpsSet(id, d);
+  qpsDraw(id);
+}
+function qpsListen(id) {
+  qpsES = new EventSource('/api/events');
+  qpsES.onmessage = ev => {
+    const d = JSON.parse(ev.data);
+    if (d.type === 'qps') qpsTick(id, d);
+  };
+}
+
+/* ---------------- 分析公共组件 ---------------- */
+const fmtN = n => (+n || 0).toLocaleString();
+const DONUT_COLORS = ['#38bdf8', '#a78bfa', '#34d399', '#fbbf24', '#fb7185', '#22d3ee', '#f472b6', '#facc15', '#60a5fa', '#94a3b8'];
+const STATUS_NAME = {200: 'OK', 201: 'Created', 204: 'No Content', 301: 'Moved', 302: 'Found', 304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized', 403: 'Forbidden', 404: 'Not Found', 405: 'Not Allowed', 429: 'Too Many Requests', 500: 'Server Error', 502: 'Bad Gateway', 503: 'Unavailable', 504: 'Timeout'};
+function donutOpt(kvs, center) {
+  return {
+    color: DONUT_COLORS,
+    tooltip: {...tipStyle, formatter: p => `${p.name}<br/><b>${fmtN(p.value)}</b>（${p.percent}%）`},
+    title: center ? {text: center.num, subtext: center.label, left: 'center', top: '40%', textStyle: {color: '#e6edf7', fontSize: 20, fontWeight: 700}, subtextStyle: {color: '#7d8db0', fontSize: 11}} : undefined,
+    series: [{type: 'pie', radius: ['54%', '74%'], center: ['50%', '50%'],
+      data: kvs.map(k => ({name: k.name || k.key, value: k.count})),
+      label: {color: '#94a3b8', fontSize: 11, formatter: '{b} {d}%'},
+      labelLine: {length: 8, length2: 8, lineStyle: {color: 'rgba(148,163,184,.3)'}},
+      itemStyle: {borderColor: '#0e1526', borderWidth: 2}}]
+  };
+}
+function rankList(kvs, blocked) {
+  const arr = (kvs || []).map(k => ({name: k.name || k.key, count: blocked ? (+k.blocked || 0) : (+k.count || 0)}))
+    .filter(k => !blocked || k.count > 0);
+  if (!arr.length) return '<div class="rank-empty">暂无数据</div>';
+  const max = Math.max(...arr.map(k => k.count)) || 1;
+  return `<div class="rank-list">${arr.map((k, i) =>
+    `<div class="rank-row${blocked ? ' blocked' : ''}"><span class="rank-i${i < 3 ? ' hot' : ''}">${i + 1}</span><span class="rank-k" title="${esc(k.name)}">${esc(k.name)}</span><span class="rank-bar"><i style="width:${(k.count / max * 100).toFixed(1)}%"></i></span><span class="rank-v">${fmtN(k.count)}</span></div>`).join('')}</div>`;
+}
+const SPANS = [[6, '6小时'], [24, '24小时'], [72, '3天'], [168, '7天']];
+const spanSeg = (id, cur) => `<div class="seg" id="${id}">${SPANS.map(([v, t]) => `<button class="btn${v === cur ? ' on' : ''}" data-h="${v}">${t}</button>`).join('')}</div>`;
+const hourLbl = (ts, span) => {
+  const d = new Date(ts * 1000), p = n => String(n).padStart(2, '0');
+  return span > 48 ? `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}时` : `${p(d.getHours())}:00`;
+};
+
+/* ---------------- 流量分析 ---------------- */
+async function traffic() {
+  const m = $('#main');
+  let span = 24, geoMode = 'world', geoMetric = 'visit', geoData = null;
+  m.innerHTML = pageHead('流量分析', '请求构成 · 客户端画像 · 地域与来源洞察 · 每 30 秒自动刷新', spanSeg('t-span', span)) + `
+  <div class="cards" id="t-cards"></div>
+  ${qpsPanel('tq')}
+  <div class="panel"><h3>请求 / 拦截趋势（按小时）</h3><div id="t-trend" class="chart"></div></div>
+  <div class="grid2">
+    <div class="panel"><h3>状态码分布</h3><div id="t-status" class="chart"></div></div>
+    <div class="panel"><div class="panel-head"><h3>地域分布</h3><div class="seg" id="t-geo-mode"><button class="btn on" data-v="world">世界</button><button class="btn" data-v="cn">中国</button></div><div class="seg" id="t-geo-metric"><button class="btn on" data-v="visit">访问</button><button class="btn" data-v="block">仅拦截</button></div></div><div id="t-geo"></div></div>
+  </div>
+  <div class="grid2">
+    <div class="panel"><h3>客户端画像</h3><div class="sub-h">操作系统</div><div id="t-os"></div><div class="sub-h">浏览器</div><div id="t-br"></div><div class="sub-h">自动化工具 / 爬虫</div><div id="t-tool"></div></div>
+    <div class="panel"><h3>Top 来源域名（Referer）</h3><div id="t-ref"></div></div>
+  </div>
+  <div class="grid2">
+    <div class="panel"><h3>Top 受访页面</h3><div id="t-path"></div></div>
+    <div class="panel"><h3>Top 受访域名</h3><div id="t-host"></div></div>
+  </div>`;
+  let trendC = null, statusC = null;
+  const paintGeo = () => {
+    const el = $('#t-geo');
+    if (!el || !geoData) return;
+    const arr = geoMode === 'world' ? (geoData.countries || []) : (geoData.provinces || []);
+    el.innerHTML = rankList(arr.slice(0, 10), geoMetric === 'block');
+  };
+  const paint = async first => {
+    const s = await api('/api/analytics?hours=' + span);
+    geoData = s;
+    const t = s.totals || {};
+    $('#t-cards').innerHTML = `
+      ${card('请求量', fmtN(t.req), '', 'activity', '')}
+      ${card('拦截量', fmtN(t.blocked), 'red', 'zap', 'red')}
+      ${card('拦截率', (t.block_rate || 0) + '%', 'red', 'shield', 'red')}
+      ${card('独立 IP', fmtN(t.uv), 'green', 'globe', 'green')}
+      ${card('4xx 占比', (t.rate_4xx || 0) + '%', '', 'report', 'violet')}
+      ${card('5xx 占比', (t.rate_5xx || 0) + '%', '', 'layers', 'violet')}`;
+    const hrs = s.hours || [];
+    const trendOpt = {
+      tooltip: {trigger: 'axis', ...tipStyle},
+      legend: {data: ['请求', '拦截', '独立IP'], textStyle: {color: '#94a3b8'}, icon: 'roundRect', itemWidth: 12, itemHeight: 4},
+      grid: {left: 50, right: 20, top: 40, bottom: 30},
+      xAxis: {type: 'category', boundaryGap: false, data: hrs.map(p => hourLbl(p.ts, span)), ...axisStyle},
+      yAxis: {type: 'value', ...axisStyle},
+      series: [
+        {name: '请求', type: 'line', smooth: true, showSymbol: false, data: hrs.map(p => p.req), lineStyle: {width: 2, color: '#38bdf8'}, itemStyle: {color: '#38bdf8'}, areaStyle: {color: areaGrad('56,189,248')}},
+        {name: '拦截', type: 'line', smooth: true, showSymbol: false, data: hrs.map(p => p.blocked), lineStyle: {width: 2, color: '#fb7185'}, itemStyle: {color: '#fb7185'}, areaStyle: {color: areaGrad('251,113,133')}},
+        {name: '独立IP', type: 'line', smooth: true, showSymbol: false, data: hrs.map(p => p.uv), lineStyle: {width: 1.5, color: '#34d399', type: 'dashed'}, itemStyle: {color: '#34d399'}}]
+    };
+    if (first) trendC = mkChart($('#t-trend'), trendOpt); else trendC.setOption(trendOpt, true);
+    const stOpt = donutOpt((s.status || []).slice(0, 9).map(k => ({key: k.key + ' ' + (STATUS_NAME[k.key] || ''), count: k.count})), {num: fmtN(t.req), label: '总请求'});
+    if (first) statusC = mkChart($('#t-status'), stOpt); else statusC.setOption(stOpt, true);
+    paintGeo();
+    $('#t-os').innerHTML = rankList((s.os || []).slice(0, 5));
+    $('#t-br').innerHTML = rankList((s.browser || []).slice(0, 5));
+    $('#t-tool').innerHTML = rankList((s.tool || []).slice(0, 5));
+    $('#t-ref').innerHTML = rankList((s.referer || []).slice(0, 10));
+    $('#t-path').innerHTML = rankList((s.path || []).slice(0, 10));
+    $('#t-host').innerHTML = rankList((s.host || []).slice(0, 10));
+  };
+  $('#t-span').addEventListener('click', e => {
+    const b = e.target.closest('button[data-h]'); if (!b) return;
+    span = +b.dataset.h;
+    $('#t-span').querySelectorAll('.btn').forEach(x => x.classList.toggle('on', x === b));
+    paint(false).catch(err => toast(err.message, true));
+  });
+  $('#t-geo-mode').addEventListener('click', e => {
+    const b = e.target.closest('button[data-v]'); if (!b) return;
+    geoMode = b.dataset.v;
+    $('#t-geo-mode').querySelectorAll('.btn').forEach(x => x.classList.toggle('on', x === b));
+    paintGeo();
+  });
+  $('#t-geo-metric').addEventListener('click', e => {
+    const b = e.target.closest('button[data-v]'); if (!b) return;
+    geoMetric = b.dataset.v;
+    $('#t-geo-metric').querySelectorAll('.btn').forEach(x => x.classList.toggle('on', x === b));
+    paintGeo();
+  });
+  try {
+    await paint(true);
+    qpsInit('tq');
+    qpsListen('tq');
+    dashTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') paint(false).catch(() => {});
+    }, 30000);
+  } catch (e) { if (e.message !== '未登录') toast(e.message, true); }
+}
+
+/* ---------------- 安全态势 ---------------- */
+const MOD_ICON = {'攻击防护': 'shield', 'IP 黑名单': 'zap', '信誉封禁': 'report', 'CC 限流': 'activity', 'Bot 防护': 'search', '动态防护': 'layers', '自定义规则': 'report', '地域管控': 'globe', '人机验证': 'pin'};
+async function posture() {
+  const m = $('#main');
+  let span = 24, curMod = '';
+  m.innerHTML = pageHead('安全态势', '防护模块命中 · 攻击类型与来源 · 每 30 秒自动刷新', spanSeg('p-span', span)) + `
+  <div class="cards" id="p-cards"></div>
+  <div class="grid2">
+    <div class="panel"><h3>防护模块命中趋势（堆叠）</h3><div id="p-modtrend" class="chart"></div></div>
+    <div class="panel"><h3>攻击类型分布</h3><div id="p-cat" class="chart"></div></div>
+  </div>
+  <div class="grid2">
+    <div class="panel"><h3>攻击源 IP Top10</h3><div id="p-ips" class="chart"></div></div>
+    <div class="panel"><div class="panel-head"><h3>模块 × 攻击源</h3><select id="p-modsel"></select></div><div id="p-modip" class="chart"></div></div>
+  </div>
+  <div class="grid2">
+    <div class="panel"><h3>Top 被攻击页面</h3><div id="p-path"></div></div>
+    <div class="panel"><h3>Top 被攻击站点</h3><div id="p-host"></div></div>
+  </div>
+  <div class="panel"><h3><span class="live-dot"></span>实时攻击事件</h3>
+    <table><thead><tr><th>时间</th><th>站点</th><th>IP</th><th>动作</th><th>描述</th></tr></thead>
+    <tbody id="live-body">${emptyHTML(5, '等待事件…')}</tbody></table>
+  </div>`;
+  let mtC = null, catC = null, ipsC = null, mipC = null, modIPs = {};
+  const paint = async first => {
+    const s = await api('/api/analytics?hours=' + span);
+    const mods = s.modules || [];
+    $('#p-cards').innerHTML = mods.length
+      ? mods.slice(0, 6).map(mo => card(mo.key, fmtN(mo.count), 'red', MOD_ICON[mo.key] || 'zap', 'red')).join('')
+      : card('安全事件', '0', 'green', 'shield', 'green');
+    const top5 = mods.slice(0, 5).map(mo => mo.key);
+    const hrs = s.hours || [];
+    const mtOpt = {
+      color: DONUT_COLORS,
+      tooltip: {trigger: 'axis', ...tipStyle},
+      legend: {data: top5, textStyle: {color: '#94a3b8'}, icon: 'roundRect', itemWidth: 12, itemHeight: 4},
+      grid: {left: 50, right: 20, top: 40, bottom: 30},
+      xAxis: {type: 'category', boundaryGap: false, data: hrs.map(p => hourLbl(p.ts, span)), ...axisStyle},
+      yAxis: {type: 'value', ...axisStyle},
+      series: top5.map(name => ({name, type: 'line', smooth: true, showSymbol: false, stack: 'mod',
+        lineStyle: {width: 1.5}, areaStyle: {opacity: .22},
+        data: hrs.map(p => (p.modules || {})[name] || 0)}))
+    };
+    if (first) mtC = mkChart($('#p-modtrend'), mtOpt); else mtC.setOption(mtOpt, true);
+    const cats = s.categories || [];
+    const catOpt = donutOpt(cats, {num: fmtN(cats.reduce((a, c) => a + c.count, 0)), label: '安全事件'});
+    if (first) catC = mkChart($('#p-cat'), catOpt); else catC.setOption(catOpt, true);
+    const ipsOpt = barOpt((s.attack_ips || []).map(k => ({key: k.key, count: k.count})), '#fb7185');
+    if (first) ipsC = mkChart($('#p-ips'), ipsOpt); else ipsC.setOption(ipsOpt, true);
+    modIPs = s.module_ips || {};
+    const names = Object.keys(modIPs);
+    if (!curMod || !names.includes(curMod)) curMod = names[0] || '';
+    const sel = $('#p-modsel');
+    sel.innerHTML = names.length ? names.map(k => `<option value="${esc(k)}"${k === curMod ? ' selected' : ''}>${esc(k)}</option>`).join('') : '<option value="">暂无数据</option>';
+    const mipOpt = curMod ? barOpt(modIPs[curMod] || [], '#fbbf24') : {title: {text: '暂无数据', left: 'center', top: 'center', textStyle: {color: '#5a6b8c', fontSize: 13, fontWeight: 400}}};
+    if (first) mipC = mkChart($('#p-modip'), mipOpt); else mipC.setOption(mipOpt, true);
+    $('#p-path').innerHTML = rankList((s.attack_paths || []).slice(0, 10));
+    $('#p-host').innerHTML = rankList((s.attack_hosts || []).slice(0, 10));
+  };
+  $('#p-modsel').addEventListener('change', () => {
+    curMod = $('#p-modsel').value;
+    if (mipC) mipC.setOption(barOpt(modIPs[curMod] || [], '#fbbf24'), true);
+  });
+  $('#p-span').addEventListener('click', e => {
+    const b = e.target.closest('button[data-h]'); if (!b) return;
+    span = +b.dataset.h;
+    $('#p-span').querySelectorAll('.btn').forEach(x => x.classList.toggle('on', x === b));
+    paint(false).catch(err => toast(err.message, true));
+  });
+  try {
+    await paint(true);
+    const recent = await api('/api/logs?size=8');
+    renderLiveRows(recent.list);
+    liveES = new EventSource('/api/events');
+    liveES.onmessage = ev => {
+      const d = JSON.parse(ev.data);
+      if (d.type !== 'attack') return;
+      const tb = $('#live-body');
+      if (!tb) return;
+      if (tb.querySelector('.empty')) tb.innerHTML = '';
+      tb.insertAdjacentHTML('afterbegin', liveRow(d));
+      while (tb.children.length > 12) tb.lastChild.remove();
+    };
+    dashTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') paint(false).catch(() => {});
+    }, 30000);
+  } catch (e) { if (e.message !== '未登录') toast(e.message, true); }
 }
 
 /* ---------------- 防护站点 ---------------- */

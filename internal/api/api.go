@@ -268,6 +268,14 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, t)
+	case path == "/api/analytics" && r.Method == "GET":
+		hours, _ := strconv.Atoi(r.URL.Query().Get("hours"))
+		if hours <= 0 || hours > 168 {
+			hours = 24
+		}
+		writeJSON(w, a.Proxy.Ana.Snapshot(hours))
+	case path == "/api/qps" && r.Method == "GET":
+		writeJSON(w, a.Proxy.Ana.QPS(true))
 	case strings.HasPrefix(path, "/api/top/") && r.Method == "GET":
 		a.top(w, r, strings.TrimPrefix(path, "/api/top/"))
 	case path == "/api/sites" && r.Method == "GET":
