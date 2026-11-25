@@ -722,7 +722,18 @@ func isFullHost(s string) bool {
 }
 
 func (s *Store) QueryLogs(ip, domain, action string, limit, offset int) ([]AttackLog, int, error) {
+	return s.queryLogs(ip, domain, action, limit, offset, false)
+}
+
+func (s *Store) QueryAttackLogs(ip, domain, action string, limit, offset int) ([]AttackLog, int, error) {
+	return s.queryLogs(ip, domain, action, limit, offset, true)
+}
+
+func (s *Store) queryLogs(ip, domain, action string, limit, offset int, attackOnly bool) ([]AttackLog, int, error) {
 	where, args := logWhere(ip, domain, action)
+	if attackOnly {
+		where += " AND status<>200"
+	}
 	var total int
 	s.DB.QueryRow(`SELECT COUNT(*) FROM attack_logs`+where, args...).Scan(&total)
 	rows, err := s.DB.Query(`SELECT id,ts,site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id,query_redacted
@@ -741,6 +752,26 @@ func (s *Store) QueryLogs(ip, domain, action string, limit, offset int) ([]Attac
 		out = append(out, l)
 	}
 	return out, total, nil
+}
+
+// EachAttackForAnalytics 遍历指定时段的已处置日志，用于修复旧版小时汇总。
+func (s *Store) EachAttackForAnalytics(from, to time.Time, fn func(AttackLog)) error {
+	rows, err := s.DB.Query(`SELECT COALESCE(client_ip,''),COALESCE(country,''),COALESCE(domain,''),
+		COALESCE(url,''),COALESCE(action,''),COALESCE(msg,''),COALESCE(rule_id,0),status
+		FROM attack_logs WHERE ts >= ? AND ts < ? AND status<>200 ORDER BY ts, id`,
+		from.Local().Format(time.DateTime), to.Local().Format(time.DateTime))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var l AttackLog
+		if err := rows.Scan(&l.ClientIP, &l.Country, &l.Domain, &l.URL, &l.Action, &l.Msg, &l.RuleID, &l.Status); err != nil {
+			return err
+		}
+		fn(l)
+	}
+	return rows.Err()
 }
 
 // EachLog 流式遍历攻击日志（不在内存累积），供 CSV 导出等大批量场景使用
@@ -816,15 +847,15 @@ func (s *Store) DeleteIP(id int64) error {
 	return err
 }
 
-// ScoreIPs 聚合滑动窗口内的攻击评分：仅统计真实攻击检测（waf/resp/cc/semantic），
-// 排除 blacklist/geo/reputation 等处置动作，避免封禁后自我累积导致永不解封。
+// ScoreIPs 聚合滑动窗口内的攻击评分：仅统计已处置的真实攻击检测（waf/resp/cc/semantic），
+// 排除观察记录及 blacklist/geo/reputation 等处置动作，避免封禁后自我累积导致永不解封。
 // 权重 CRITICAL=3 / WARNING=2 / 其它=1。
 func (s *Store) ScoreIPs(windowStart string, threshold int) ([]IPScore, error) {
 	rows, err := s.DB.Query(`SELECT client_ip,
 		SUM(CASE severity WHEN 'CRITICAL' THEN 3 WHEN 'WARNING' THEN 2 ELSE 1 END) score,
 		COUNT(*) cnt, MAX(ts) last_ts
 		FROM attack_logs
-		WHERE ts >= ? AND client_ip != '' AND action IN ('waf','resp','cc','semantic')
+		WHERE ts >= ? AND client_ip != '' AND status<>200 AND action IN ('waf','resp','cc','semantic')
 		GROUP BY client_ip HAVING score >= ?`, windowStart, threshold)
 	if err != nil {
 		return nil, err
@@ -912,7 +943,7 @@ func (s *Store) PruneReputation(before string) {
 
 func (s *Store) IPAttackCount(ip string) int {
 	var n int
-	s.DB.QueryRow(`SELECT COUNT(*) FROM attack_logs WHERE client_ip=? AND action IN ('waf','resp','cc','semantic')`, ip).Scan(&n)
+	s.DB.QueryRow(`SELECT COUNT(*) FROM attack_logs WHERE client_ip=? AND status<>200 AND action IN ('waf','resp','cc','semantic')`, ip).Scan(&n)
 	return n
 }
 
@@ -1051,19 +1082,19 @@ type KV struct {
 }
 
 func (s *Store) TopIPs(limit int) ([]KV, error) {
-	return s.topKV(`SELECT client_ip, COUNT(*) c FROM attack_logs GROUP BY client_ip ORDER BY c DESC LIMIT ?`, limit)
+	return s.topKV(`SELECT client_ip, COUNT(*) c FROM attack_logs WHERE status<>200 GROUP BY client_ip ORDER BY c DESC LIMIT ?`, limit)
 }
 
 func (s *Store) TopRules(limit int) ([]KV, error) {
-	return s.topKV(`SELECT COALESCE(NULLIF(msg,''),'规则'||rule_id), COUNT(*) c FROM attack_logs GROUP BY msg ORDER BY c DESC LIMIT ?`, limit)
+	return s.topKV(`SELECT COALESCE(NULLIF(msg,''),'规则'||rule_id), COUNT(*) c FROM attack_logs WHERE status<>200 GROUP BY msg ORDER BY c DESC LIMIT ?`, limit)
 }
 
 func (s *Store) TopDomains(limit int) ([]KV, error) {
-	return s.topKV(`SELECT domain, COUNT(*) c FROM attack_logs GROUP BY domain ORDER BY c DESC LIMIT ?`, limit)
+	return s.topKV(`SELECT domain, COUNT(*) c FROM attack_logs WHERE status<>200 GROUP BY domain ORDER BY c DESC LIMIT ?`, limit)
 }
 
 func (s *Store) TopCountries(limit int) ([]KV, error) {
-	return s.topKV(`SELECT COALESCE(NULLIF(country,''),'未知'), COUNT(*) c FROM attack_logs GROUP BY country ORDER BY c DESC LIMIT ?`, limit)
+	return s.topKV(`SELECT COALESCE(NULLIF(country,''),'未知'), COUNT(*) c FROM attack_logs WHERE status<>200 GROUP BY country ORDER BY c DESC LIMIT ?`, limit)
 }
 
 func (s *Store) topKV(q string, limit int) ([]KV, error) {
@@ -1165,6 +1196,6 @@ func (s *Store) DeleteRule(id int64) error {
 // AttackCountSince 统计窗口内攻击事件数，供告警阈值判定（日志异步落盘，约 1s 延迟）
 func (s *Store) AttackCountSince(since string) int {
 	var n int
-	s.DB.QueryRow(`SELECT COUNT(*) FROM attack_logs WHERE ts >= ?`, since).Scan(&n)
+	s.DB.QueryRow(`SELECT COUNT(*) FROM attack_logs WHERE ts >= ? AND status<>200`, since).Scan(&n)
 	return n
 }

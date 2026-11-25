@@ -346,7 +346,7 @@ es.onmessage = ev => {
     $('#m-qp').textContent = d.peak;
     return;
   }
-  if (d.type !== 'attack') return;
+  if (d.type !== 'attack' || d.status === 200) return;
   evCount++; $('#m-events').textContent = evCount;
   if (d.lat || d.lon) addArc(d.lon, d.lat, d.city || d.country || d.ip, 1, true);
   const feed = $('#feed');
@@ -354,8 +354,8 @@ es.onmessage = ev => {
   feed.insertAdjacentHTML('afterbegin', `<div class="ev"><span class="t">${esc(d.ts)}</span>${tag(d.action)}<span class="ip">${esc(d.ip)}</span>${d.city ? ' · ' + esc(d.city) : (d.country ? ' · ' + esc(d.country) : '')} → ${esc(d.domain)}<span class="m">${esc(d.method)} ${esc(d.url)} · ${esc(d.msg)}</span></div>`);
   while (feed.children.length > 60) feed.lastChild.remove();
 };
-j('/api/logs?size=20').then(d => {
-  d.list.reverse().forEach(l => es.onmessage({data: JSON.stringify({type:'attack',ts:l.ts,ip:l.client_ip,country:l.country,city:l.city,domain:l.domain,method:l.method,url:l.url,action:l.action,msg:l.msg})}));
+j('/api/logs?size=20&attack_only=1').then(d => {
+  d.list.reverse().forEach(l => es.onmessage({data: JSON.stringify({type:'attack',ts:l.ts,ip:l.client_ip,country:l.country,city:l.city,domain:l.domain,method:l.method,url:l.url,action:l.action,msg:l.msg,status:l.status})}));
 }).catch(() => {});
 </script>
 </body>

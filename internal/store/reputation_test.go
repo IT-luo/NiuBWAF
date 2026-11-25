@@ -17,7 +17,11 @@ func repTestStore(t *testing.T) *Store {
 }
 
 func insertLog(s *Store, ip, action, severity, ts string) {
-	s.DB.Exec(`INSERT INTO attack_logs(ts,client_ip,action,severity,status) VALUES(?,?,?,?,403)`, ts, ip, action, severity)
+	insertLogStatus(s, ip, action, severity, ts, 403)
+}
+
+func insertLogStatus(s *Store, ip, action, severity, ts string, status int) {
+	s.DB.Exec(`INSERT INTO attack_logs(ts,client_ip,action,severity,status) VALUES(?,?,?,?,?)`, ts, ip, action, severity, status)
 }
 
 func TestScoreIPsWeightingAndFilter(t *testing.T) {
@@ -41,6 +45,10 @@ func TestScoreIPsWeightingAndFilter(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		insertLog(s, "10.0.0.4", "waf", "CRITICAL", old)
 	}
+	// E: 状态 200 的语义观察不计分
+	for i := 0; i < 50; i++ {
+		insertLogStatus(s, "10.0.0.5", "semantic", "CRITICAL", now, 200)
+	}
 	windowStart := time.Now().Add(-24 * time.Hour).Format("2006-01-02 15:04:05")
 	scores, err := s.ScoreIPs(windowStart, 10)
 	if err != nil {
@@ -61,6 +69,9 @@ func TestScoreIPsWeightingAndFilter(t *testing.T) {
 	}
 	if _, ok := got["10.0.0.4"]; ok {
 		t.Error("D 窗口外攻击不应计分")
+	}
+	if _, ok := got["10.0.0.5"]; ok {
+		t.Error("E 状态 200 的语义观察不应计分")
 	}
 	// 阈值过滤
 	hi, _ := s.ScoreIPs(windowStart, 30)
@@ -110,6 +121,7 @@ func TestReputationBanLifecycle(t *testing.T) {
 		t.Errorf("信誉列表应至少 2 条, got %d", len(list))
 	}
 	insertLog(s, "9.9.9.9", "waf", "CRITICAL", nowStr)
+	insertLogStatus(s, "9.9.9.9", "semantic", "CRITICAL", nowStr, 200)
 	if n := s.IPAttackCount("9.9.9.9"); n != 1 {
 		t.Errorf("IPAttackCount 期望 1, got %d", n)
 	}

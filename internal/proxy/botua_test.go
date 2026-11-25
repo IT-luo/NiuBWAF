@@ -1,12 +1,16 @@
 package proxy
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"niubwaf/internal/engine"
+	"niubwaf/internal/metrics"
 	"niubwaf/internal/store"
 )
 
@@ -20,6 +24,7 @@ func TestClassifyBotUA(t *testing.T) {
 		"Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
 		"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
 		"Dart/3.2 (dart:io)", // 说明：不在库内 → 普通
+		healthCheckUserAgent,
 	}
 	for _, ua := range normal {
 		if kind, sig := classifyBotUA(ua); kind != "" {
@@ -173,5 +178,94 @@ func TestBotServeHTTP(t *testing.T) {
 	p = newSite(t, "log", false)
 	if rec := doReq(p, pyreq); rec.Code != http.StatusOK {
 		t.Errorf("log 模式脚本 UA 应放行 200, got %d", rec.Code)
+	}
+}
+
+func TestBotObservationDoesNotCountAsAttack(t *testing.T) {
+	oldRegistry := metrics.Default
+	registry := metrics.New()
+	metrics.Default = registry
+	t.Cleanup(func() { metrics.Default = oldRegistry })
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("origin-ok"))
+	}))
+	defer upstream.Close()
+	st, err := store.Open(filepath.Join(t.TempDir(), "bot-observation.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	site := &store.Site{Name: "bot", Domain: "bot.test", Upstream: upstream.URL, Enabled: true, WAFMode: "balanced", BotMode: "log"}
+	if err := st.CreateSite(site); err != nil {
+		t.Fatal(err)
+	}
+	p := newBotTestProxy(t, st, upstream.URL)
+	p.Ana = NewAnalytics(st, &GeoIP{})
+	events := p.Hub.Subscribe()
+	defer p.Hub.Unsubscribe(events)
+	readEvent := func() map[string]any {
+		t.Helper()
+		select {
+		case msg := <-events:
+			var event map[string]any
+			if err := json.Unmarshal(msg, &event); err != nil {
+				t.Fatal(err)
+			}
+			return event
+		case <-time.After(time.Second):
+			t.Fatal("未收到 Bot 事件")
+			return nil
+		}
+	}
+
+	if rec := doReq(p, "Go-http-client/1.1"); rec.Code != http.StatusOK {
+		t.Fatalf("观察模式应放行, got %d", rec.Code)
+	}
+	event := readEvent()
+	if event["type"] != "observation" || event["status"] != float64(http.StatusOK) {
+		t.Fatalf("观察事件类型错误: %+v", event)
+	}
+	if snapshot := p.Ana.Snapshot(24); len(snapshot.Modules) != 0 || len(snapshot.AttackIPs) != 0 || len(snapshot.Arcs) != 0 {
+		t.Fatalf("观察事件不得进入攻击分析: %+v", snapshot)
+	}
+	if rendered := registry.Render(); strings.Contains(rendered, "niubwaf_attacks_total{") {
+		t.Fatalf("观察事件不得增加攻击指标:\n%s", rendered)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		logs, total, err := st.QueryLogs("", "", "", 10, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if total == 1 {
+			if logs[0].Status != http.StatusOK || logs[0].Action != "bot" {
+				t.Fatalf("原始观察日志未正确保留: %+v", logs[0])
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("观察日志未落盘: total=%d", total)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	site.BotMode = "block"
+	if _, err := st.UpdateSite(site, false); err != nil {
+		t.Fatal(err)
+	}
+	p.Reload()
+	if rec := doReq(p, "Go-http-client/1.1"); rec.Code != http.StatusForbidden {
+		t.Fatalf("真实 Bot 拦截仍应返回 403, got %d", rec.Code)
+	}
+	event = readEvent()
+	if event["type"] != "attack" || event["status"] != float64(http.StatusForbidden) {
+		t.Fatalf("真实 Bot 拦截应进入攻击流: %+v", event)
+	}
+	if snapshot := p.Ana.Snapshot(24); len(snapshot.AttackIPs) != 1 || snapshot.AttackIPs[0].Count != 1 {
+		t.Fatalf("真实 Bot 拦截统计错误: %+v", snapshot.AttackIPs)
+	}
+	if rendered := registry.Render(); !strings.Contains(rendered, `niubwaf_attacks_total{action="bot"} 1`) {
+		t.Fatalf("真实 Bot 拦截指标错误:\n%s", rendered)
 	}
 }

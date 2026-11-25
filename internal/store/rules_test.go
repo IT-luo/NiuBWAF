@@ -35,6 +35,28 @@ func TestCustomRuleCRUD(t *testing.T) {
 	}
 }
 
+func TestTopStatsExcludeObservations(t *testing.T) {
+	s := repTestStore(t)
+	now := time.Now().Format("2006-01-02 15:04:05")
+	s.DB.Exec(`INSERT INTO attack_logs(ts,client_ip,domain,country,action,msg,severity,status) VALUES(?,?,?,?,?,?,?,?)`, now, "1.1.1.1", "real.test", "CN", "waf", "真实拦截", "CRITICAL", 403)
+	s.DB.Exec(`INSERT INTO attack_logs(ts,client_ip,domain,country,action,msg,severity,status) VALUES(?,?,?,?,?,?,?,?)`, now, "2.2.2.2", "observed.test", "US", "bot", "Bot 观察", "WARNING", 200)
+	checks := []struct {
+		name string
+		fn   func(int) ([]KV, error)
+	}{
+		{"TopIPs", s.TopIPs}, {"TopRules", s.TopRules}, {"TopDomains", s.TopDomains}, {"TopCountries", s.TopCountries},
+	}
+	for _, check := range checks {
+		got, err := check.fn(10)
+		if err != nil {
+			t.Fatalf("%s: %v", check.name, err)
+		}
+		if len(got) != 1 || got[0].Count != 1 {
+			t.Errorf("%s 应仅保留真实处置, got %+v", check.name, got)
+		}
+	}
+}
+
 func TestAttackCountSince(t *testing.T) {
 	s := repTestStore(t)
 	now := time.Now().Format("2006-01-02 15:04:05")
@@ -42,6 +64,7 @@ func TestAttackCountSince(t *testing.T) {
 	insertLog(s, "1.1.1.1", "waf", "CRITICAL", now)
 	insertLog(s, "1.1.1.1", "waf", "CRITICAL", now)
 	insertLog(s, "1.1.1.1", "waf", "CRITICAL", old)
+	insertLogStatus(s, "2.2.2.2", "bot", "WARNING", now, 200)
 	since := time.Now().Add(-time.Hour).Format("2006-01-02 15:04:05")
 	if n := s.AttackCountSince(since); n != 2 {
 		t.Fatalf("窗口内计数=%d 期望 2", n)

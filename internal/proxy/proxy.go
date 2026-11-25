@@ -183,6 +183,8 @@ func NewWithUpstreamLimit(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *
 	return p
 }
 
+const healthCheckUserAgent = "NiuBWAF-HealthCheck/1.0"
+
 // healthLoop 主动探测上游：任意 HTTP 响应视为健康，连接失败摘除 5 秒
 func (p *Proxy) healthLoop() {
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -200,12 +202,11 @@ func (p *Proxy) healthLoop() {
 		var ups []metrics.UpstreamSample
 		for _, st := range all {
 			for _, t := range st.targets {
-				resp, err := client.Get(t.u.String() + "/")
+				err := probeUpstream(client, t.u.String()+"/")
 				up := err == nil
 				if err != nil {
 					atomic.StoreInt64(&t.downUntil, time.Now().Unix()+5)
 				} else {
-					resp.Body.Close()
 					atomic.StoreInt64(&t.downUntil, 0)
 				}
 				ups = append(ups, metrics.UpstreamSample{Site: st.domain, URL: t.u.String(), Up: up})
@@ -213,6 +214,20 @@ func (p *Proxy) healthLoop() {
 		}
 		metrics.Default.SetUpstreams(ups)
 	}
+}
+
+func probeUpstream(client *http.Client, target string) error {
+	req, err := http.NewRequest(http.MethodGet, target, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", healthCheckUserAgent)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return nil
 }
 
 type TargetStatus struct {
@@ -1417,11 +1432,16 @@ type multiReadCloser struct {
 }
 
 func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, msg string, ruleID, status int, reqID string) {
-	metrics.Default.IncAttack(action)
+	observation := status == http.StatusOK
+	if !observation {
+		metrics.Default.IncAttack(action)
+	}
 	geo := p.Geo.CityInfo(ip)
 	lat, lon := geoCoords(geo)
 	logURL := r.URL.EscapedPath()
-	p.Ana.Event(EvStat{IP: ip, Action: action, Msg: msg, RuleID: ruleID, Status: status, Country: geo.Country, City: geo.City, Lat: lat, Lon: lon, URL: logURL, Domain: site.Domain})
+	if !observation {
+		p.Ana.Event(EvStat{IP: ip, Action: action, Msg: msg, RuleID: ruleID, Status: status, Country: geo.Country, City: geo.City, Lat: lat, Lon: lon, URL: logURL, Domain: site.Domain})
+	}
 	l := &store.AttackLog{
 		SiteID: site.ID, Domain: site.Domain, ClientIP: ip, Country: geo.Country,
 		Method: r.Method, URL: logURL, QueryRedacted: r.URL.RawQuery != "", Action: action,
@@ -1430,8 +1450,12 @@ func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, 
 	if err := p.Store.LogAttack(l); err != nil {
 		log.Printf("写入攻击日志失败: %v", err)
 	}
+	eventType := "attack"
+	if observation {
+		eventType = "observation"
+	}
 	p.Hub.Broadcast(map[string]any{
-		"type": "attack", "ts": nowStr(), "domain": site.Domain, "ip": ip,
+		"type": eventType, "ts": nowStr(), "domain": site.Domain, "ip": ip,
 		"country": geo.Country, "city": geo.City, "method": r.Method, "url": l.URL,
 		"action": action, "msg": msg, "status": status, "lat": lat, "lon": lon,
 	})

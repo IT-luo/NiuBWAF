@@ -213,14 +213,14 @@ async function dashboard() {
     await paint(true);
     if (!trendEl.isConnected || $('#app').classList.contains('hidden')) return;
     qpsInit('q');
-    const recent = await api('/api/logs?size=8');
+    const recent = await api('/api/logs?size=8&attack_only=1');
     if (!trendEl.isConnected || $('#app').classList.contains('hidden')) return;
     renderLiveRows(recent.list || []);
     liveES = new EventSource('/api/events');
     liveES.onmessage = ev => {
       const d = JSON.parse(ev.data);
       if (d.type === 'qps') { qpsTick('q', d); return; }
-      if (d.type !== 'attack') return;
+      if (d.type !== 'attack' || d.status === 200) return;
       const tb = $('#live-body');
       if (tb.querySelector('.empty')) tb.innerHTML = '';
       tb.insertAdjacentHTML('afterbegin', liveRow(d));

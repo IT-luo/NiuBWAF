@@ -3,9 +3,12 @@ package proxy
 import (
 	"encoding/json"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"niubwaf/internal/store"
 )
 
 type fakeAnaStore struct {
@@ -35,6 +38,10 @@ func (f *fakeAnaStore) PruneAnalytics(before int64) error {
 			delete(f.rows, k)
 		}
 	}
+	return nil
+}
+
+func (f *fakeAnaStore) EachAttackForAnalytics(time.Time, time.Time, func(store.AttackLog)) error {
 	return nil
 }
 
@@ -195,6 +202,7 @@ func TestAnalyticsEventAggregation(t *testing.T) {
 	a.Event(EvStat{IP: "9.9.9.9", Action: "waf", RuleID: 941100, Msg: "XSS Filter", Status: 403, Country: "US", City: "Ashburn", Lat: 39.04, Lon: -77.49, URL: "/search?q=<script>", Domain: "a.com"})
 	a.Event(EvStat{IP: "8.8.8.8", Action: "cc", Msg: "访问频率超限，触发人机验证", Status: http.StatusTooManyRequests, Domain: "b.com", URL: "/api"})
 	a.Event(EvStat{IP: "7.7.7.7", Action: "bot", Msg: "Bot 防护", RuleID: 200001, Status: 403, Country: "CN", Domain: "a.com", URL: "/"})
+	a.Event(EvStat{IP: "6.6.6.6", Action: "bot", Msg: "Bot 防护观察：Go-http-client", RuleID: 200001, Status: http.StatusOK, Country: "US", City: "Observed", Lat: 1, Lon: 2, Domain: "observed.test", URL: "/observed"})
 
 	s := a.Snapshot(24)
 	if v, _ := kvFind(s.Modules, "攻击防护"); v != 2 {
@@ -214,6 +222,9 @@ func TestAnalyticsEventAggregation(t *testing.T) {
 	}
 	if v, _ := kvFind(s.AttackIPs, "9.9.9.9"); v != 2 {
 		t.Fatalf("attack ip = %d", v)
+	}
+	if _, ok := kvFind(s.AttackIPs, "6.6.6.6"); ok {
+		t.Fatal("状态 200 的观察事件不得进入攻击 IP 统计")
 	}
 	if v, _ := kvFind(s.AttackPaths, "/login"); v != 1 {
 		t.Fatalf("attack path = %d", v)
@@ -334,6 +345,51 @@ func TestAnalyticsCurrentHourRestore(t *testing.T) {
 	if v, _ := kvFind(s3.RefererPage, "https://b.com/from"); v != 2 {
 		t.Fatalf("二次重启后来源页面统计 = %d, want 2", v)
 	}
+}
+
+func TestAnalyticsRestoresLegacyAttackStats(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "legacy-analytics.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(st.Close)
+	oldHour := hourOf(time.Now()) - 3600
+	legacy := newBucket(oldHour)
+	legacy.AttacksFiltered = false
+	legacy.Req, legacy.Blocked, legacy.UV = 8, 1, 2
+	legitimate := EvStat{IP: "192.0.2.1", Country: "US", Lat: 39, Lon: -98,
+		Domain: "site.test", URL: "/blocked", Action: "bot", Status: http.StatusForbidden}
+	observation := EvStat{IP: "192.0.2.2", Country: "CN", Lat: 35, Lon: 105,
+		Domain: "site.test", URL: "/", Action: "bot", Status: http.StatusOK}
+	for _, ev := range []EvStat{legitimate, observation} {
+		legacy.recordAttack(ev)
+		_, err := st.DB.Exec(`INSERT INTO attack_logs(ts,client_ip,country,domain,url,action,status) VALUES(?,?,?,?,?,?,?)`,
+			time.Unix(oldHour+5, 0).Local().Format(time.DateTime), ev.IP, ev.Country, ev.Domain, ev.URL, ev.Action, ev.Status)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveAnalyticsHour(oldHour, string(data)); err != nil {
+		t.Fatal(err)
+	}
+	check := func(s *AnaSnapshot) {
+		t.Helper()
+		if s.Totals.Req != 8 || s.Totals.Blocked != 1 || s.Totals.UV != 2 {
+			t.Fatalf("流量统计变化: %+v", s.Totals)
+		}
+		if len(s.AttackIPs) != 1 || s.AttackIPs[0].Key != legitimate.IP || len(s.Arcs) != 1 || s.Arcs[0].Count != 1 {
+			t.Fatalf("历史攻击统计未正确恢复: IP=%+v arcs=%+v", s.AttackIPs, s.Arcs)
+		}
+	}
+	check(NewAnalytics(st, nil).Snapshot(24))
+	if _, err := st.ClearLogs(); err != nil {
+		t.Fatal(err)
+	}
+	check(NewAnalytics(st, nil).Snapshot(24))
 }
 
 func TestAnalyticsSealReleasesIPSet(t *testing.T) {

@@ -19,6 +19,36 @@ func seedAttackLog(t *testing.T, a *API, ip, domain, action string) {
 	}
 }
 
+func TestAttackLogFeedFiltersBeforePaging(t *testing.T) {
+	a := fullTestAPI(t)
+	seedAttackLog(t, a, "192.0.2.1", "site.test", "waf")
+	seedAttackLog(t, a, "192.0.2.2", "site.test", "bot")
+	if _, err := a.Store.DB.Exec(`UPDATE attack_logs SET status=200 WHERE action='bot'`); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		query  string
+		action string
+		total  int
+	}{
+		{"?size=1", "bot", 2},
+		{"?size=1&attack_only=1", "waf", 1},
+	} {
+		rec := httptest.NewRecorder()
+		a.logs(rec, httptest.NewRequest(http.MethodGet, "/api/logs"+tc.query, nil))
+		var response struct {
+			List  []struct{ Action string }
+			Total int
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+			t.Fatal(err)
+		}
+		if response.Total != tc.total || len(response.List) != 1 || response.List[0].Action != tc.action {
+			t.Fatalf("查询 %s: %s", tc.query, rec.Body)
+		}
+	}
+}
+
 func TestAllowedContentTypesSetting(t *testing.T) {
 	a := fullTestAPI(t)
 

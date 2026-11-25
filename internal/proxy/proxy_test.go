@@ -1,6 +1,8 @@
 package proxy
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"sync/atomic"
 	"testing"
@@ -14,6 +16,21 @@ func mkSite(urls ...string) *cachedSite {
 		s.targets = append(s.targets, &upstreamTarget{u: u})
 	}
 	return s
+}
+
+func TestProbeUpstreamUserAgent(t *testing.T) {
+	ua := make(chan string, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ua <- r.UserAgent()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer upstream.Close()
+	if err := probeUpstream(upstream.Client(), upstream.URL); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-ua; got != healthCheckUserAgent {
+		t.Fatalf("健康检查 UA = %q, 期望 %q", got, healthCheckUserAgent)
+	}
 }
 
 func TestPickRoundRobin(t *testing.T) {

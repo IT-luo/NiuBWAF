@@ -1069,7 +1069,11 @@ func (a *API) logs(w http.ResponseWriter, r *http.Request) {
 	if size < 1 || size > 200 {
 		size = 20
 	}
-	list, total, err := a.Store.QueryLogs(q.Get("ip"), q.Get("domain"), q.Get("action"), size, (page-1)*size)
+	query := a.Store.QueryLogs
+	if q.Get("attack_only") == "1" {
+		query = a.Store.QueryAttackLogs
+	}
+	list, total, err := query(q.Get("ip"), q.Get("domain"), q.Get("action"), size, (page-1)*size)
 	if err != nil {
 		writeErr(w, 500, err.Error())
 		return

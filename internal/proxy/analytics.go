@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"niubwaf/internal/store"
 )
 
 // 分析聚合：小时桶内存累加 + SQLite 落盘，支撑流量分析 / 安全态势 / 大屏攻击轨迹。
@@ -62,6 +64,8 @@ type hourBucket struct {
 	ModIP       map[string]map[string]int64 `json:"mod_ip,omitempty"`
 	Arc         map[string]*arcSrc          `json:"arc,omitempty"`
 
+	AttacksFiltered bool `json:"attacks_filtered,omitempty"`
+
 	ips    map[string]struct{} `json:"-"`
 	uvBase int64               `json:"-"` // 重启恢复当前小时桶时的 UV 基数（历史 IP 集合不可恢复）
 	sealed bool                `json:"-"`
@@ -75,7 +79,7 @@ func newBucket(hour int64) *hourBucket {
 		Country: map[string]int64{}, CnBlock: map[string]int64{}, Prov: map[string]int64{}, ProvBlock: map[string]int64{},
 		Module: map[string]int64{}, Category: map[string]int64{}, AttackIP: map[string]int64{},
 		AtkPath: map[string]int64{}, AtkHost: map[string]int64{},
-		ModIP: map[string]map[string]int64{}, Arc: map[string]*arcSrc{}, ips: map[string]struct{}{},
+		ModIP: map[string]map[string]int64{}, Arc: map[string]*arcSrc{}, ips: map[string]struct{}{}, AttacksFiltered: true,
 	}
 }
 
@@ -111,24 +115,23 @@ type geoLookup interface {
 	CityInfo(ip string) GeoCity
 }
 
+type analyticsStore interface {
+	SaveAnalyticsHour(ts int64, data string) error
+	LoadAnalyticsHours(since int64) (map[int64]string, error)
+	PruneAnalytics(before int64) error
+	EachAttackForAnalytics(from, to time.Time, fn func(store.AttackLog)) error
+}
+
 type Analytics struct {
-	mu sync.Mutex
-	st interface {
-		SaveAnalyticsHour(ts int64, data string) error
-		LoadAnalyticsHours(since int64) (map[int64]string, error)
-		PruneAnalytics(before int64) error
-	}
+	mu   sync.Mutex
+	st   analyticsStore
 	geo  geoLookup
 	cur  *hourBucket
 	hist []*hourBucket
 	secs [120]SecPoint // 秒级环形桶（仅内存，重启清零），支撑实时 QPS
 }
 
-func NewAnalytics(st interface {
-	SaveAnalyticsHour(ts int64, data string) error
-	LoadAnalyticsHours(since int64) (map[int64]string, error)
-	PruneAnalytics(before int64) error
-}, geo *GeoIP) *Analytics {
+func NewAnalytics(st analyticsStore, geo *GeoIP) *Analytics {
 	a := &Analytics{st: st, cur: newBucket(hourOf(time.Now()))}
 	if geo != nil {
 		a.geo = geo // 仅在非 nil 时装箱，避免接口包裹 nil 指针后判空失效
@@ -139,6 +142,11 @@ func NewAnalytics(st interface {
 			b := &hourBucket{}
 			if json.Unmarshal([]byte(data), b) != nil || b.TS != ts {
 				continue
+			}
+			if !b.AttacksFiltered {
+				if err := a.rebuildAttackStats(b); err != nil {
+					log.Printf("修正历史攻击统计失败(ts=%d): %v", ts, err)
+				}
 			}
 			if ts == curHour {
 				// 当前小时桶恢复为活桶继续累加：若放入 hist，cur 的周期落盘会
@@ -160,6 +168,39 @@ func NewAnalytics(st interface {
 		}
 	}()
 	return a
+}
+
+// rebuildAttackStats 利用保留的原始日志修复旧版混入观察事件的攻击汇总。
+func (a *Analytics) rebuildAttackStats(b *hourBucket) error {
+	if len(b.Module) == 0 {
+		b.AttacksFiltered = true
+		return nil
+	}
+	from := time.Unix(b.TS, 0)
+	rebuilt := newBucket(b.TS)
+	err := a.st.EachAttackForAnalytics(from, from.Add(time.Hour), func(l store.AttackLog) {
+		var geo GeoCity
+		if a.geo != nil {
+			geo = a.geo.CityInfo(l.ClientIP)
+		}
+		if geo.Country == "" {
+			geo.Country = l.Country
+		}
+		lat, lon := geoCoords(geo)
+		rebuilt.recordAttack(EvStat{IP: l.ClientIP, Action: l.Action, Msg: l.Msg, RuleID: l.RuleID, Status: l.Status,
+			Country: geo.Country, City: geo.City, Lat: lat, Lon: lon, URL: l.URL, Domain: l.Domain})
+	})
+	if err != nil {
+		return err
+	}
+	b.Module, b.Category, b.AttackIP = rebuilt.Module, rebuilt.Category, rebuilt.AttackIP
+	b.AtkPath, b.AtkHost, b.ModIP, b.Arc = rebuilt.AtkPath, rebuilt.AtkHost, rebuilt.ModIP, rebuilt.Arc
+	b.AttacksFiltered = true
+	data, err := json.Marshal(b)
+	if err != nil {
+		return err
+	}
+	return a.st.SaveAnalyticsHour(b.TS, string(data))
 }
 
 func hourOf(t time.Time) int64 {
@@ -360,11 +401,19 @@ func (a *Analytics) Record(rs ReqStat) {
 }
 
 func (a *Analytics) Event(ev EvStat) {
-	if a == nil {
+	if a == nil || ev.Status == http.StatusOK {
 		return
 	}
 	a.mu.Lock()
 	b, sealed := a.touch()
+	b.recordAttack(ev)
+	a.mu.Unlock()
+	if sealed != nil {
+		a.persistSealed(sealed)
+	}
+}
+
+func (b *hourBucket) recordAttack(ev EvStat) {
 	mod := moduleOf(ev.Action)
 	incMap(b.Module, mod)
 	if ev.Status == http.StatusTooManyRequests {
@@ -394,10 +443,6 @@ func (a *Analytics) Event(ev EvStat) {
 			b.Arc[label] = &arcSrc{Label: label, Country: ev.Country, Lat: ev.Lat, Lon: ev.Lon}
 			b.Arc[label].N = 1
 		}
-	}
-	a.mu.Unlock()
-	if sealed != nil {
-		a.persistSealed(sealed)
 	}
 }
 
