@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"html"
 	"net/http"
 	"strings"
 	"time"
@@ -17,10 +18,10 @@ func (a *API) report(w http.ResponseWriter, r *http.Request) {
 	topDomains, _ := a.Store.TopDomains(10)
 	topCountries, _ := a.Store.TopCountries(10)
 	logs, total, _ := a.Store.QueryLogs("", "", "", 50, 0)
-	a.Store.Audit("admin", "导出防护报告", "")
+	a.audit(r, "导出防护报告", "")
 
 	var b strings.Builder
-	b.WriteString(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>牛B WAF 防护报告</title><style>
+	b.WriteString(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>牛B WAF 防护报告</title><style>
 body{font-family:"Microsoft YaHei",sans-serif;margin:40px auto;max-width:900px;color:#222;line-height:1.6}
 h1{color:#1a56b0;border-bottom:3px solid #1a56b0;padding-bottom:10px}
 h2{color:#1a56b0;margin-top:32px;font-size:18px}
@@ -48,14 +49,14 @@ th{background:#eef3fb}
 		if !s.Enabled {
 			status = "停用"
 		}
-		fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`, s.Name, s.Domain, s.Upstream, s.WAFMode, status)
+		fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`, html.EscapeString(s.Name), html.EscapeString(s.Domain), html.EscapeString(s.Upstream), html.EscapeString(s.WAFMode), status)
 	}
 	b.WriteString(`</table>`)
 
 	kvTable := func(title string, kvs []store.KV) {
 		fmt.Fprintf(&b, `<h2>%s</h2><table><tr><th>#</th><th>项目</th><th>次数</th></tr>`, title)
 		for i, kv := range kvs {
-			fmt.Fprintf(&b, `<tr><td>%d</td><td>%s</td><td>%d</td></tr>`, i+1, kv.Key, kv.Count)
+			fmt.Fprintf(&b, `<tr><td>%d</td><td>%s</td><td>%d</td></tr>`, i+1, html.EscapeString(kv.Key), kv.Count)
 		}
 		b.WriteString(`</table>`)
 	}
@@ -68,12 +69,13 @@ th{background:#eef3fb}
 	b.WriteString(`<table><tr><th>时间</th><th>站点</th><th>IP</th><th>动作</th><th>描述</th><th>状态码</th></tr>`)
 	for _, l := range logs {
 		fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%d</td></tr>`,
-			l.Ts, l.Domain, l.ClientIP, l.Action, l.Msg, l.Status)
+			html.EscapeString(l.Ts), html.EscapeString(l.Domain), html.EscapeString(l.ClientIP), html.EscapeString(l.Action), html.EscapeString(l.Msg), l.Status)
 	}
 	b.WriteString(`</table>`)
 	b.WriteString(`<p class="meta" style="margin-top:40px">—— 报告结束 · 牛B WAF ——</p></body></html>`)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")
 	w.Header().Set("Content-Disposition", "attachment; filename=niubwaf-report.html")
 	w.Write([]byte(b.String()))
 }

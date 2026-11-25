@@ -1,79 +1,100 @@
 package proxy
 
 import (
+	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
-	"strconv"
 	"strings"
 	"testing"
 )
 
-func TestJSChallengeFlow(t *testing.T) {
-	c := NewCaptcha("test-secret")
-	w := httptest.NewRecorder()
-	c.Issue(w, "1.2.3.4", 7, "/orig?q=1")
-	if w.Code != http.StatusTooManyRequests {
-		t.Fatalf("挑战页状态码 = %d,  want 429", w.Code)
+func configuredTestCaptcha(secret string) *Captcha {
+	c := NewCaptcha(secret)
+	c.siteKey = "test-site-key"
+	c.verify = func(_ context.Context, token, _ string, _ *challenge) bool {
+		return token == "verified-token"
 	}
-	page := w.Body.String()
-	if !strings.Contains(page, "<script>") || strings.Contains(page, "Math.imul") {
-		t.Fatal("挑战页应包含混淆脚本且不含明文算法")
-	}
+	return c
+}
 
-	c.mu.Lock()
-	var id string
-	var ch *challenge
-	for k, v := range c.items {
-		id, ch = k, v
-	}
-	c.mu.Unlock()
-	if ch == nil {
-		t.Fatal("挑战未注册")
-	}
+type captchaTestTransport func(*http.Request) (*http.Response, error)
 
-	// 错误答案 → 403
-	bad := httptest.NewRecorder()
-	req := httptest.NewRequest("POST", "/__niubwaf/captcha", strings.NewReader(url.Values{"challenge": {id}, "answer": {"0"}}.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	c.Verify(bad, req, "1.2.3.4")
-	if bad.Code != http.StatusForbidden {
-		t.Fatalf("错误答案状态码 = %d, want 403", bad.Code)
-	}
+func (f captchaTestTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
 
-	// 正确答案（模拟浏览器 JS 计算结果）→ 302 + cookie
-	c.mu.Lock()
-	c.items[id] = ch
-	c.mu.Unlock()
-	good := httptest.NewRecorder()
-	req = httptest.NewRequest("POST", "/__niubwaf/captcha", strings.NewReader(url.Values{"challenge": {id}, "answer": {strconv.FormatUint(uint64(ch.answer), 10)}}.Encode()))
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	c.Verify(good, req, "1.2.3.4")
-	if good.Code != http.StatusFound {
-		t.Fatalf("正确答案状态码 = %d, want 302", good.Code)
+func TestTurnstileValidationBindsServiceResponse(t *testing.T) {
+	for _, tt := range []struct {
+		name, result string
+		want         bool
+	}{
+		{"verified", `{"success":true,"hostname":"site.test","action":"niubwaf","cdata":"challenge-id"}`, true},
+		{"wrong hostname", `{"success":true,"hostname":"other.test","action":"niubwaf","cdata":"challenge-id"}`, false},
+		{"wrong action", `{"success":true,"hostname":"site.test","action":"other","cdata":"challenge-id"}`, false},
+		{"wrong challenge", `{"success":true,"hostname":"site.test","action":"niubwaf","cdata":"old-id"}`, false},
+		{"service rejection", `{"success":false}`, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &http.Client{Transport: captchaTestTransport(func(r *http.Request) (*http.Response, error) {
+				if r.Method != http.MethodPost || r.URL.Host != "challenges.cloudflare.com" {
+					t.Fatalf("预期发送至固定验证端点, got %s %s", r.Method, r.URL.Host)
+				}
+				if err := r.ParseForm(); err != nil || r.PostForm.Get("response") != "fixture" {
+					t.Fatal("服务端验证请求缺少令牌")
+				}
+				return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(tt.result))}, nil
+			})}
+			verify := turnstileVerifier(client, "test-secret")
+			if got := verify(context.Background(), "fixture", "challenge-id", &challenge{host: "site.test"}); got != tt.want {
+				t.Fatalf("验证结果 = %v, want %v", got, tt.want)
+			}
+		})
 	}
-	if loc := good.Header().Get("Location"); loc != "/orig?q=1" {
-		t.Fatalf("跳转地址 = %q, want /orig?q=1", loc)
-	}
-	ck := good.Result().Cookies()
-	var pass *http.Cookie
-	for _, k := range ck {
-		if k.Name == "niub_pass" {
-			pass = k
+}
+
+func TestCaptchaFlow(t *testing.T) {
+	const host, ip = "site.test", "192.0.2.15"
+	const endpoint = "https://" + host + "/__niubwaf/captcha"
+	c := configuredTestCaptcha("test-secret")
+
+	issue := func() string {
+		rec := httptest.NewRecorder()
+		c.Issue(rec, ip, host, 7, captchaBot, "/orig?q=1")
+		if rec.Code != http.StatusTooManyRequests ||
+			!strings.Contains(rec.Body.String(), "challenges.cloudflare.com/turnstile/") {
+			t.Fatalf("期望 Turnstile 验证页, got %d", rec.Code)
 		}
+		id, _ := captchaOnlyChallenge(t, c)
+		return id
 	}
-	if pass == nil {
-		t.Fatal("未下发 niub_pass cookie")
+
+	bad := httptest.NewRecorder()
+	c.Verify(bad, captchaVerifyRequest(endpoint, issue(), "rejected-token"), ip)
+	if bad.Code != http.StatusForbidden || bad.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("验证失败时仍接受请求, got %d", bad.Code)
 	}
-	r2 := httptest.NewRequest("GET", "/orig", nil)
-	r2.AddCookie(pass)
-	if !c.ValidCookie(r2, "1.2.3.4", 7) {
-		t.Fatal("合法 cookie 校验失败")
+
+	id := issue()
+	wrongHost := httptest.NewRecorder()
+	c.Verify(wrongHost, captchaVerifyRequest("https://other.test/__niubwaf/captcha", id, "verified-token"), ip)
+	if wrongHost.Code != http.StatusForbidden {
+		t.Fatal("挑战必须绑定域名")
 	}
-	if c.ValidCookie(r2, "1.2.3.5", 7) {
-		t.Fatal("cookie 不应跨 IP 生效")
+	good := httptest.NewRecorder()
+	c.Verify(good, captchaVerifyRequest(endpoint, id, "verified-token"), ip)
+	if good.Code != http.StatusSeeOther || good.Header().Get("Location") != "/orig?q=1" {
+		t.Fatalf("验证成功后应跳回原路径, got %d", good.Code)
 	}
-	if c.ValidCookie(r2, "1.2.3.4", 8) {
-		t.Fatal("cookie 不应跨站点生效")
+	r := httptest.NewRequest("GET", "https://"+host+"/orig", nil)
+	for _, cookie := range good.Result().Cookies() {
+		r.AddCookie(cookie)
+	}
+	if !c.ValidCookie(r, ip, 7, captchaBot) {
+		t.Fatal("合法 Cookie 校验失败")
+	}
+	if c.ValidCookie(r, ip, 7, captchaRate) || c.ValidCookie(r, ip, 8, captchaBot) ||
+		c.ValidCookie(r, "192.0.2.16", 7, captchaBot) {
+		t.Fatal("Cookie 必须绑定来源 IP、站点和用途")
 	}
 }

@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -22,9 +23,12 @@ import (
 
 	"niubwaf/internal/api"
 	"niubwaf/internal/engine"
+	"niubwaf/internal/monitor"
 	"niubwaf/internal/proxy"
 	"niubwaf/internal/store"
 	"niubwaf/internal/web"
+
+	"golang.org/x/net/netutil"
 )
 
 func main() {
@@ -32,12 +36,16 @@ func main() {
 	tlsAddr := flag.String("tls", ":8443", "防护代理 HTTPS 监听地址")
 	certFile := flag.String("cert", "", "代理默认证书文件（PEM），留空则自动生成自签名证书")
 	keyFile := flag.String("key", "", "代理默认私钥文件（PEM）")
-	adminAddr := flag.String("admin", ":9443", "管理控制台监听地址")
-	adminCert := flag.String("admin-cert", "", "管理控制台证书文件（PEM），设置后启用 HTTPS")
+	adminAddr := flag.String("admin", "127.0.0.1:9443", "管理控制台监听地址")
+	adminCert := flag.String("admin-cert", "", "管理控制台证书文件（PEM），留空自动生成自签名证书")
 	adminKey := flag.String("admin-key", "", "管理控制台私钥文件（PEM）")
 	dataDir := flag.String("data", "./data", "数据目录")
+	upstreamConnections := flag.Int("upstream-connections", proxy.DefaultUpstreamConnections, "每个上游源站的连接上限")
 	acmeHTTP := flag.String("acme-http", ":80", "ACME HTTP-01 挑战监听地址（仅 acme_enabled=on 时启动）")
 	flag.Parse()
+	if *upstreamConnections <= 0 {
+		log.Fatal("-upstream-connections 必须为正整数")
+	}
 
 	fmt.Println("==============================================")
 	fmt.Println("  牛B WAF - 新一代智能 Web 应用防火墙")
@@ -59,7 +67,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("引擎初始化失败: %v", err)
 	}
-	log.Printf("引擎就绪（平衡/严格双模式），耗时 %s", time.Since(start).Round(time.Millisecond))
+	log.Printf("引擎就绪（OWASP CRS %s，平衡/严格双模式），耗时 %s", engine.CRSVersion, time.Since(start).Round(time.Millisecond))
 
 	geo := proxy.NewGeoIP(*dataDir)
 	if geo.Available() || geo.CityAvailable() {
@@ -78,7 +86,10 @@ func main() {
 	tor := proxy.NewTorList(*dataDir)
 	log.Printf("IP 情报源就绪（IDC CIDR %d 条 / Tor 出口 %d 个，后台自动刷新）", idc.Status()["count"], tor.Status()["count"])
 
-	p := proxy.New(st, eng, geo, idc, tor, secret)
+	p := proxy.NewWithUpstreamLimit(st, eng, geo, idc, tor, secret, *upstreamConnections)
+	if p.Cap.ConfigureTurnstile(os.Getenv("NIUBWAF_TURNSTILE_SITE_KEY"), os.Getenv("NIUBWAF_TURNSTILE_SECRET_KEY")) {
+		log.Println("Turnstile 人机验证已配置")
+	}
 	p.HTTPSAddr = *tlsAddr
 	p.InitACME(*dataDir)
 	a := api.New(st, p)
@@ -114,6 +125,45 @@ func main() {
 		}
 		log.Println("代理使用自动生成的自签名证书（生产环境请通过 -cert/-key 或控制台配置正式证书）")
 	}
+
+	defaultCertPath := filepath.Join(*dataDir, "default_cert.pem")
+	if *certFile != "" && *keyFile != "" {
+		defaultCertPath = *certFile
+	}
+	inspector, err := monitor.New(monitor.Config{
+		Store: st, DataDir: *dataDir, DefaultCertFile: defaultCertPath, AdminCertFile: adminCertPath,
+		UpstreamSource: monitor.UpstreamSourceFunc(func(ctx context.Context) ([]monitor.UpstreamStatus, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			statuses := p.UpstreamHealth()
+			out := make([]monitor.UpstreamStatus, 0, len(statuses))
+			for _, status := range statuses {
+				item := monitor.UpstreamStatus{SiteID: status.SiteID, Domain: status.Domain, Targets: make([]monitor.TargetStatus, 0, len(status.Targets))}
+				for _, target := range status.Targets {
+					item.Targets = append(item.Targets, monitor.TargetStatus{URL: target.URL, Up: target.Up})
+				}
+				out = append(out, item)
+			}
+			return out, nil
+		}),
+		GeoSource: monitor.GeoSourceFunc(func(ctx context.Context) ([]monitor.GeoData, error) {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			statuses := geo.DataStatus()
+			out := make([]monitor.GeoData, 0, len(statuses))
+			for _, status := range statuses {
+				out = append(out, monitor.GeoData{Kind: status.Kind, Path: status.Path, BuildTime: status.BuildTime, ModTime: status.ModTime})
+			}
+			return out, nil
+		}),
+		Notifier: p,
+	})
+	if err != nil {
+		log.Fatalf("巡检模块初始化失败: %v", err)
+	}
+	a.Inspector = inspector
 
 	go func() {
 		for {
@@ -151,44 +201,139 @@ func main() {
 		}()
 	}
 
-	go func() {
-		log.Printf("管理控制台: https://127.0.0.1%s （首次登录需修改默认密码）", *adminAddr)
-		if err := http.ListenAndServeTLS(*adminAddr, adminCertPath, adminKeyPath, a.Handler(console)); err != nil {
-			log.Fatalf("管理端启动失败: %v", err)
-		}
-	}()
-
-	go func() {
-		log.Printf("防护代理 HTTPS 监听: %s（按站点 SNI 证书，可在控制台配置）", *tlsAddr)
-		srv := &http.Server{
-			Addr:              *tlsAddr,
-			Handler:           p,
-			TLSConfig:         p.TLSConfig(),
-			ReadHeaderTimeout: 10 * time.Second,
-		}
-		if err := srv.ListenAndServeTLS("", ""); err != nil {
-			log.Fatalf("HTTPS 代理启动失败: %v", err)
-		}
-	}()
-
-	log.Printf("防护代理 HTTP 监听: %s", *proxyAddr)
-	srv := &http.Server{
+	adminServer := &http.Server{
+		Addr:              *adminAddr,
+		Handler:           a.Handler(console),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       2 * time.Minute,
+		MaxHeaderBytes:    1 << 20,
+	}
+	proxyTLSServer := &http.Server{
+		Addr:              *tlsAddr,
+		Handler:           p,
+		TLSConfig:         p.TLSConfig(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+	proxyServer := &http.Server{
 		Addr:              *proxyAddr,
 		Handler:           p,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       2 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
 	}
+
+	// ReadTimeout 约束从接受到读完请求体的时间；不设置全局 WriteTimeout，避免截断 SSE/WebSocket 长响应。
+	services := []httpService{
+		{name: "管理控制台", server: adminServer, useTLS: true, certFile: adminCertPath, keyFile: adminKeyPath, maxConnections: 32},
+		{name: "HTTPS 防护代理", server: proxyTLSServer, useTLS: true, maxConnections: 1024},
+		{name: "HTTP 防护代理", server: proxyServer, maxConnections: 1024},
+	}
+	log.Printf("管理控制台: https://%s （首次登录需修改初始密码）", *adminAddr)
+	log.Printf("防护代理 HTTPS 监听: %s（按站点 SNI 证书，可在控制台配置）", *tlsAddr)
+	log.Printf("防护代理 HTTP 监听: %s", *proxyAddr)
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	go func() {
-		<-ctx.Done()
-		c, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		srv.Shutdown(c)
-	}()
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("代理启动失败: %v", err)
-	}
+	inspector.Start(ctx)
+	runErr := runHTTPServices(ctx, services)
+	stop()
+	inspector.Wait()
 	st.Close()
+	if runErr != nil {
+		log.Fatalf("HTTP 服务异常终止: %v", runErr)
+	}
+}
+
+type httpService struct {
+	name           string
+	server         *http.Server
+	useTLS         bool
+	certFile       string
+	keyFile        string
+	maxConnections int
+}
+
+type httpServiceResult struct {
+	name string
+	err  error
+}
+
+func (s httpService) serve() error {
+	listener, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		return fmt.Errorf("%s监听 %s 失败: %w", s.name, s.server.Addr, err)
+	}
+	limitedListener := netutil.LimitListener(listener, s.maxConnections)
+	defer limitedListener.Close()
+
+	if s.useTLS {
+		err = s.server.ServeTLS(limitedListener, s.certFile, s.keyFile)
+	} else {
+		err = s.server.Serve(limitedListener)
+	}
+	if err == nil || errors.Is(err, http.ErrServerClosed) {
+		return nil
+	}
+	return fmt.Errorf("%s服务失败: %w", s.name, err)
+}
+
+func runHTTPServices(ctx context.Context, services []httpService) error {
+	if len(services) == 0 {
+		return nil
+	}
+
+	results := make(chan httpServiceResult, len(services))
+	for _, service := range services {
+		go func() {
+			results <- httpServiceResult{name: service.name, err: service.serve()}
+		}()
+	}
+
+	remaining := len(services)
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case result := <-results:
+		remaining--
+		if result.err != nil {
+			runErr = result.err
+		} else {
+			runErr = fmt.Errorf("%s意外停止", result.name)
+		}
+	}
+
+	// 并发关闭所有监听器，避免某个长连接阻塞其他服务的优雅关闭。
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	shutdownResults := make(chan error, len(services))
+	for _, service := range services {
+		go func() {
+			if err := service.server.Shutdown(shutdownCtx); err != nil {
+				log.Printf("%s优雅关闭失败，强制关闭: %v", service.name, err)
+				if closeErr := service.server.Close(); closeErr != nil {
+					shutdownResults <- fmt.Errorf("%s强制关闭失败: %w", service.name, closeErr)
+					return
+				}
+			}
+			shutdownResults <- nil
+		}()
+	}
+	for range services {
+		if err := <-shutdownResults; err != nil {
+			runErr = errors.Join(runErr, err)
+		}
+	}
+
+	// 等待所有 Listen/Serve 路径退出，避免遗漏启动或运行错误。
+	for ; remaining > 0; remaining-- {
+		if result := <-results; result.err != nil {
+			runErr = errors.Join(runErr, result.err)
+		}
+	}
+	return runErr
 }
 
 func generateSelfSigned(certPath, keyPath string) error {

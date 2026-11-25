@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
+
+const RuleActionRateLimit = "rate_limit"
 
 // RuleDef 是自定义规则的原始定义（与存储层解耦，由代理转换传入）
 type RuleDef struct {
@@ -20,6 +23,7 @@ type RuleDef struct {
 	Conditions  string
 	Action      string
 	ActionParam string
+	Shadow      bool
 }
 
 // RuleCondition 单条匹配条件：field 取值字段，op 操作符，value 比较值，name 用于 header/param 字段名
@@ -46,18 +50,22 @@ type CompiledRule struct {
 	Logic       string
 	Action      string
 	ActionParam string
+	Shadow      bool
+	Rate        int
+	Burst       int
 	Conditions  []compiledCond
 }
 
 // RuleInput 规则评估所需的请求快照
 type RuleInput struct {
-	ClientIP string
-	Method   string
-	Path     string
-	URL      string
-	Header   http.Header
-	Query    url.Values
-	Country  string
+	QueryRedacted bool // 历史记录只保留路径时，完整 URL 和查询参数不可用。
+	ClientIP      string
+	Method        string
+	Path          string
+	URL           string
+	Header        http.Header
+	Query         url.Values
+	Country       string
 }
 
 var ruleFields = map[string]bool{"ip": true, "path": true, "url": true, "method": true, "header": true, "param": true, "country": true}
@@ -67,7 +75,14 @@ const maxCondValueScan = 16384
 
 // CompileRule 解析并预编译规则；条件非法（正则/CIDR/字段/操作符）时返回错误，供 API 拒绝保存
 func CompileRule(d RuleDef) (CompiledRule, error) {
-	cr := CompiledRule{ID: d.ID, SiteID: d.SiteID, Name: d.Name, Priority: d.Priority, Action: d.Action, ActionParam: d.ActionParam}
+	cr := CompiledRule{ID: d.ID, SiteID: d.SiteID, Name: d.Name, Priority: d.Priority, Action: d.Action, ActionParam: d.ActionParam, Shadow: d.Shadow}
+	if d.Action == RuleActionRateLimit {
+		rate, burst, err := parseRateLimit(d.ActionParam)
+		if err != nil {
+			return cr, err
+		}
+		cr.Rate, cr.Burst = rate, burst
+	}
 	cr.Logic = "and"
 	if d.Logic == "or" {
 		cr.Logic = "or"
@@ -90,6 +105,23 @@ func CompileRule(d RuleDef) (CompiledRule, error) {
 		cr.Conditions = append(cr.Conditions, cc)
 	}
 	return cr, nil
+}
+
+// parseRateLimit 接受 action_param 的「每秒请求数」或「每秒请求数,突发容量」。
+func parseRateLimit(param string) (rate, burst int, err error) {
+	const maxRate = 1_000_000
+	rateText, burstText, hasBurst := strings.Cut(param, ",")
+	rate, err = strconv.Atoi(strings.TrimSpace(rateText))
+	if err != nil || rate < 1 || rate > maxRate {
+		return 0, 0, fmt.Errorf("限流速率须为 1–%d 之间的整数", maxRate)
+	}
+	if hasBurst {
+		burst, err = strconv.Atoi(strings.TrimSpace(burstText))
+		if err != nil || burst < 0 || burst > maxRate {
+			return 0, 0, fmt.Errorf("突发容量须为 0–%d 之间的整数", maxRate)
+		}
+	}
+	return rate, burst, nil
 }
 
 func compileCond(c RuleCondition) (compiledCond, error) {
@@ -239,6 +271,64 @@ func (cr *CompiledRule) Match(in *RuleInput) bool {
 		}
 	}
 	return true
+}
+
+// MatchState 是日志回放的三值匹配结果。攻击日志没有请求头，不能把
+// header 条件的“无法确定”当成实时匹配中的 false。
+type MatchState uint8
+
+const (
+	MatchFalse MatchState = iota
+	MatchTrue
+	MatchUnknown
+)
+
+// MatchReplay 在 attack_logs 可用字段上评估规则。AND 任一 false 即为 false，
+// 否则任一 unknown 即为 unknown；OR 任一 true 即为 true，否则任一 unknown
+// 即为 unknown。实时请求仍使用上面的布尔 Match，语义保持不变。
+func (cr *CompiledRule) MatchReplay(in *RuleInput) MatchState {
+	if len(cr.Conditions) == 0 {
+		return MatchFalse
+	}
+	if cr.Logic == "or" {
+		state := MatchFalse
+		for i := range cr.Conditions {
+			var condState MatchState
+			if !cr.Conditions[i].availableForReplay(in) {
+				condState = MatchUnknown
+			} else if cr.Conditions[i].match(in) {
+				condState = MatchTrue
+			}
+			if condState == MatchTrue {
+				return MatchTrue
+			}
+			if condState == MatchUnknown {
+				state = MatchUnknown
+			}
+		}
+		return state
+	}
+
+	state := MatchTrue
+	for i := range cr.Conditions {
+		var condState MatchState
+		if !cr.Conditions[i].availableForReplay(in) {
+			condState = MatchUnknown
+		} else if cr.Conditions[i].match(in) {
+			condState = MatchTrue
+		}
+		if condState == MatchFalse {
+			return MatchFalse
+		}
+		if condState == MatchUnknown {
+			state = MatchUnknown
+		}
+	}
+	return state
+}
+
+func (c *compiledCond) availableForReplay(in *RuleInput) bool {
+	return c.field != "header" && !(in.QueryRedacted && (c.field == "url" || c.field == "param"))
 }
 
 // MatchRule 返回按优先级排序后首个命中的规则

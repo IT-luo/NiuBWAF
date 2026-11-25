@@ -8,34 +8,83 @@ import (
 )
 
 const DefaultBlockPage = `<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>牛B WAF - 请求被拦截</title>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>请求已拦截 · 牛B WAF</title>
 <style>
-body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:radial-gradient(900px 460px at 50% -10%,rgba(251,113,133,.1),transparent 60%),radial-gradient(800px 500px at 100% 110%,rgba(99,102,241,.08),transparent 55%),#070a12;font-family:"Inter","SF Pro Display",-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#e6edf7;padding:20px}
-.card{background:linear-gradient(180deg,rgba(23,32,55,.8),rgba(13,19,35,.86));border:1px solid rgba(148,163,184,.2);border-radius:22px;padding:44px 52px;max-width:560px;width:100%;text-align:center;box-shadow:0 24px 80px rgba(2,6,16,.6)}
-.mark{width:60px;height:60px;margin:0 auto 16px;border-radius:17px;background:linear-gradient(135deg,#fb7185,#f43f5e);display:flex;align-items:center;justify-content:center;box-shadow:0 8px 28px rgba(244,63,94,.4)}
-.mark svg{width:30px;height:30px;stroke:#fff}
-.logo{font-size:21px;font-weight:800;background:linear-gradient(135deg,#22d3ee,#6366f1 55%,#a855f7);-webkit-background-clip:text;background-clip:text;color:transparent;margin-bottom:4px}
-h1{font-size:20px;margin:14px 0 8px;font-weight:700}
-p{color:#94a3b8;font-size:14px;line-height:1.7;margin:6px 0}
-.meta{margin-top:22px;padding-top:18px;border-top:1px solid rgba(148,163,184,.14);font-size:12px;color:#5b6b85;text-align:left}
-.meta div{margin:5px 0}
-code{color:#94a3b8;font-family:"SF Mono","Cascadia Code",Consolas,monospace}
-</style></head><body>
-<div class="card">
-<div class="mark"><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></svg></div>
-<div class="logo">牛B WAF</div>
-<h1>您的请求已被拦截</h1>
-<p>检测到潜在恶意行为，本次访问已被防火墙阻断。</p>
-<p>原因：{{REASON}}</p>
-<div class="meta">
-<div>请求 ID：<code>{{REQ_ID}}</code></div>
-<div>客户端 IP：<code>{{CLIENT_IP}}</code></div>
-<div>目标站点：<code>{{DOMAIN}}</code></div>
-<div>时间：<code>{{TIME}}</code></div>
-</div>
-<p style="margin-top:18px;font-size:12px">如您认为这是误拦截，请携带请求 ID 联系站点管理员。</p>
-</div></body></html>`
+:root{
+  color-scheme:light;
+  --ink:#172a46;--muted:#4c6180;--line:#dfe8f3;--paper:#fff;
+  --soft-blue:#edf4ff;--blue:#2857bd;--soft-red:#fff3f5;--red:#a5304b;
+  --mono:"Cascadia Code",Consolas,"Liberation Mono",monospace;
+}
+*,*::before,*::after{box-sizing:border-box}
+body{
+  margin:0;min-height:100vh;min-height:100svh;display:grid;place-items:center;padding:24px;
+  background:radial-gradient(ellipse at 12% 6%,#e7efff,transparent 56%),
+    radial-gradient(ellipse at 90% 90%,#e6f5f0,transparent 55%),#f5f8fc;
+  color:var(--ink);font:15px/1.55 "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+.card{
+  width:min(100%,640px);padding:clamp(20px,5vw,36px);border:1px solid var(--line);
+  border-radius:24px;background:var(--paper);box-shadow:0 20px 65px rgba(42,72,115,.12);
+}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:28px;font-size:16px;font-weight:800}
+.brand-mark,.status-mark{display:grid;place-items:center;flex:none}
+.brand-mark{width:36px;height:36px;border-radius:11px;background:var(--soft-blue);color:var(--blue)}
+.status-mark{width:52px;height:52px;border-radius:15px;color:var(--red);background:#ffe3e9}
+.brand-mark svg{width:22px;height:22px}
+.status-mark svg{width:27px;height:27px}
+.status{display:flex;align-items:flex-start;gap:15px;padding:18px;border-radius:17px;background:var(--soft-red)}
+.status-copy{flex:1;min-width:0}
+h1{margin:0 0 10px;font-size:clamp(23px,5vw,30px);line-height:1.2;letter-spacing:-.025em}
+.reason-label{display:block;color:var(--red);font-size:12px;font-weight:700;margin-bottom:2px}
+.reason{margin:0;color:var(--ink);overflow-wrap:anywhere}
+.request-id{
+  display:flex;align-items:baseline;gap:10px 16px;flex-wrap:wrap;
+  margin-top:18px;padding:13px 16px;border-radius:12px;background:var(--soft-blue);color:var(--blue);
+}
+.request-id span{font-size:12px;font-weight:700}
+code{font-family:var(--mono);overflow-wrap:anywhere}
+.request-id code{font-size:17px;font-weight:700;user-select:all}
+.details{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px 18px;margin:18px 0 0}
+.details .site{grid-column:1/-1}
+dt{font-size:12px;font-weight:650;color:var(--muted)}
+dd{margin:3px 0 0;font-size:13px;overflow-wrap:anywhere}
+.help{margin:22px 0 0;padding-top:15px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}
+@media(max-width:440px){
+  body{padding:12px}.card{border-radius:18px}.brand{margin-bottom:17px}
+  .status{padding:13px;gap:11px}.status-mark{width:40px;height:40px;border-radius:11px}
+  .status-mark svg{width:22px;height:22px}.details{grid-template-columns:minmax(0,1fr);gap:11px}
+}
+</style>
+</head>
+<body>
+<main class="card" aria-labelledby="block-title">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path fill="#fff" d="M12.55 6.5 7.05 13.1h4.9l-.5 4.4 5.55-6.6h-5z"/></svg></span>
+    <span>牛B WAF</span>
+  </div>
+  <div class="status">
+    <span class="status-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></svg></span>
+    <div class="status-copy">
+      <h1 id="block-title">请求已被拦截</h1>
+      <span class="reason-label">拦截原因</span>
+      <p class="reason">{{REASON}}</p>
+    </div>
+  </div>
+  <div class="request-id"><span>请求 ID</span><code>{{REQ_ID}}</code></div>
+  <dl class="details">
+    <div class="site"><dt>目标站点</dt><dd><code>{{DOMAIN}}</code></dd></div>
+    <div><dt>客户端 IP</dt><dd><code>{{CLIENT_IP}}</code></dd></div>
+    <div><dt>拦截时间</dt><dd><code>{{TIME}}</code></dd></div>
+  </dl>
+  <p class="help">如果您认为这是误拦截，请将请求 ID 提供给站点管理员。</p>
+</main>
+</body>
+</html>`
 
 func RenderBlockPage(tpl string, vars map[string]string) string {
 	if strings.TrimSpace(tpl) == "" {

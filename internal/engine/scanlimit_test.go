@@ -2,7 +2,11 @@ package engine
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,60 +32,33 @@ func hdr(ct string, n int) map[string][]string {
 	}
 }
 
-// 大体积请求体只送检前缀，且截断不得触发解析类误报（200002/200003）
-func TestOversizeBodyTruncatedNoFalsePositive(t *testing.T) {
+func TestBodyMustFitScanLimit(t *testing.T) {
 	e, err := New()
 	if err != nil {
-		t.Fatalf("引擎初始化失败: %v", err)
+		t.Fatal(err)
 	}
 	e.SetScanLimit(128 << 10)
 	mpCT := "multipart/form-data; boundary=" + mpBoundary
-
-	// 1) 3MB 文件上传：只送检前 128KB，必须放行（此前被 200003 误拦 400）
-	big := multipartPayload(3<<20, "hello")
-	res := e.Detect("balanced", nil, &RequestInfo{ClientIP: "1.2.3.4", ServerIP: "5.6.7.8", Method: "POST", URL: "/upload", Proto: "HTTP/1.1", Headers: hdr(mpCT, len(big)), Body: big})
-	if res.Blocked {
-		t.Errorf("大文件上传不应被拦截: rule=%d msg=%s", res.RuleID, res.Msg)
-	}
-
-	// 2) 截断后仍要能检出前缀里的攻击载荷
-	atk := multipartPayload(3<<20, "' UNION SELECT username,password FROM users-- -")
-	res2 := e.Detect("balanced", nil, &RequestInfo{ClientIP: "1.2.3.4", ServerIP: "5.6.7.8", Method: "POST", URL: "/upload", Proto: "HTTP/1.1", Headers: hdr(mpCT, len(atk)), Body: atk})
-	if !res2.Blocked {
-		t.Error("前缀中的 SQL 注入应被拦截")
-	}
-
-	// 3) 未截断的畸形 multipart（缺少闭合边界）仍须严格校验拦截
-	small := []byte(fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nx\r\n", mpBoundary))
-	res3 := e.Detect("balanced", nil, &RequestInfo{ClientIP: "1.2.3.4", ServerIP: "5.6.7.8", Method: "POST", URL: "/upload", Proto: "HTTP/1.1", Headers: hdr(mpCT, len(small)), Body: small})
-	if !res3.Blocked {
-		t.Error("未截断的畸形 multipart 应被严格校验拦截")
-	}
-
-	// 4) 超大 urlencoded（截断落在 % 转义中间）不应误报
-	ue := []byte("a=" + strings.Repeat("A", (300<<10)-1) + "%")
-	res4 := e.Detect("balanced", nil, &RequestInfo{ClientIP: "1.2.3.4", ServerIP: "5.6.7.8", Method: "POST", URL: "/upload", Proto: "HTTP/1.1", Headers: hdr("application/x-www-form-urlencoded", len(ue)), Body: ue})
-	if res4.Blocked {
-		t.Errorf("截断的 urlencoded 不应被拦截: rule=%d msg=%s", res4.RuleID, res4.Msg)
-	}
-
-	// 5) 超大 urlencoded 前缀中的 SQL 注入仍要拦截
-	ue2 := []byte("a=' UNION SELECT 1,2,3-- -&pad=" + strings.Repeat("A", 300<<10))
-	res5 := e.Detect("balanced", nil, &RequestInfo{ClientIP: "1.2.3.4", ServerIP: "5.6.7.8", Method: "POST", URL: "/upload", Proto: "HTTP/1.1", Headers: hdr("application/x-www-form-urlencoded", len(ue2)), Body: ue2})
-	if !res5.Blocked {
-		t.Error("urlencoded 前缀中的 SQL 注入应被拦截")
-	}
-
-	// 6) 超大 JSON（截断后非法）不应误报，且前缀攻击仍可检出
-	js := []byte(`{"k":"` + strings.Repeat("A", 300<<10) + `"}`)
-	res6 := e.Detect("balanced", nil, &RequestInfo{ClientIP: "1.2.3.4", ServerIP: "5.6.7.8", Method: "POST", URL: "/api", Proto: "HTTP/1.1", Headers: hdr("application/json", len(js)), Body: js})
-	if res6.Blocked {
-		t.Errorf("截断的 JSON 不应被拦截: rule=%d msg=%s", res6.RuleID, res6.Msg)
-	}
-	js2 := []byte(`{"q":"<script>alert(document.cookie)</script>","pad":"` + strings.Repeat("A", 300<<10) + `"}`)
-	res7 := e.Detect("balanced", nil, &RequestInfo{ClientIP: "1.2.3.4", ServerIP: "5.6.7.8", Method: "POST", URL: "/api", Proto: "HTTP/1.1", Headers: hdr("application/json", len(js2)), Body: js2})
-	if !res7.Blocked {
-		t.Error("JSON 前缀中的 XSS 应被拦截")
+	for _, tt := range []struct {
+		name, ct string
+		body     []byte
+		want     int
+	}{
+		{"multipart under limit", mpCT, multipartPayload(1<<10, "hello"), 0},
+		{"multipart over limit", mpCT, multipartPayload(3<<20, "hello"), 413},
+		{"multipart malformed", mpCT, []byte(fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"q\"\r\n\r\nx\r\n", mpBoundary)), 400},
+		{"form over limit", "application/x-www-form-urlencoded", []byte("a=" + strings.Repeat("A", 300<<10)), 413},
+		{"JSON over limit", "application/json", []byte(`{"k":"` + strings.Repeat("A", 300<<10) + `"}`), 413},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			res := e.Detect("balanced", nil, &RequestInfo{
+				ClientIP: "1.2.3.4", ServerIP: "5.6.7.8", Method: "POST", URL: "/upload", Proto: "HTTP/1.1",
+				Headers: hdr(tt.ct, len(tt.body)), Body: tt.body,
+			})
+			if res.Status != tt.want || res.Blocked != (tt.want != 0) {
+				t.Fatalf("检测结果 = %+v, 期望状态 %d", res, tt.want)
+			}
+		})
 	}
 }
 
@@ -102,7 +79,7 @@ func TestScanLimitBoundsCost(t *testing.T) {
 	small := detect(128 << 10)
 	huge := detect(8 << 20)
 	t.Logf("128KB=%v 8MB=%v", small, huge)
-	// 未截断时 8MB 约需 36 秒 CPU；截断后应与 128KB 同量级
+	// 未截断时 8MB 约需 36 秒 CPU；超限时应在扫描前拒绝
 	if huge > 5*time.Second {
 		t.Errorf("8MB 请求体检测耗时 %v 超过 5s，送检上限未生效", huge)
 	}
@@ -130,4 +107,51 @@ func TestSetScanLimitValidation(t *testing.T) {
 	if got := e.ScanLimit(); got != maxScanLimit {
 		t.Errorf("超过硬上限应被钳制到 %d, got %d", maxScanLimit, got)
 	}
+}
+
+func TestArgumentLimitsAreEnforced(t *testing.T) {
+	e, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := make(url.Values, 1001)
+	for i := range 1001 {
+		params.Set("arg"+strconv.Itoa(i), "ok")
+	}
+	raw := params.Encode()
+	t.Run("query", func(t *testing.T) {
+		r := &RequestInfo{
+			ClientIP: "192.0.2.1", Method: "GET", URL: "/items?" + raw, Proto: "HTTP/1.1",
+			Headers: http.Header{"Host": {"bench.local"}},
+		}
+		if got := e.Detect("balanced", nil, r); got.Status != http.StatusBadRequest || got.RuleID != 100010 {
+			t.Fatalf("查询参数限额结果 = %+v", got)
+		}
+	})
+	t.Run("form", func(t *testing.T) {
+		r := &RequestInfo{
+			ClientIP: "192.0.2.1", Method: "POST", URL: "/items", Proto: "HTTP/1.1",
+			Headers: hdr("application/x-www-form-urlencoded", len(raw)), Body: []byte(raw),
+		}
+		if got := e.Detect("balanced", nil, r); got.Status != http.StatusBadRequest || got.RuleID != 100011 {
+			t.Fatalf("请求体参数限额结果 = %+v", got)
+		}
+	})
+	t.Run("structured JSON", func(t *testing.T) {
+		fields := make(map[string]string, len(params))
+		for key := range params {
+			fields[key] = "ok"
+		}
+		body, err := json.Marshal(fields)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := &RequestInfo{
+			ClientIP: "192.0.2.1", Method: "POST", URL: "/items", Proto: "HTTP/1.1",
+			Headers: hdr("application/vnd.items+json; charset=utf-8", len(body)), Body: body,
+		}
+		if got := e.Detect("balanced", nil, r); got.Status != http.StatusBadRequest || got.RuleID != 100011 {
+			t.Fatalf("结构化 JSON 参数限额结果 = %+v", got)
+		}
+	})
 }

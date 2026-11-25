@@ -2,7 +2,6 @@ package engine
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -11,10 +10,16 @@ import (
 	"sync"
 	"sync/atomic"
 
-	crs "github.com/corazawaf/coraza-coreruleset"
+	corazaConfig "github.com/corazawaf/coraza-coreruleset/coraza/v3"
+	crs "github.com/corazawaf/coraza-coreruleset/lts/v4"
 	"github.com/corazawaf/coraza/v3"
 	"github.com/corazawaf/coraza/v3/types"
+	"github.com/jcchavezs/mergefs"
 )
+
+const CRSVersion = crs.Version
+
+var ruleFiles = mergefs.Merge(corazaConfig.FS, crs.FS)
 
 type Result struct {
 	Blocked  bool
@@ -26,6 +31,7 @@ type Result struct {
 }
 
 type Engine struct {
+	buildMu   sync.Mutex // 串行构建引擎及豁免变体，缓存命中无需持有
 	mu        sync.RWMutex
 	wafs      map[string]coraza.WAF
 	variants  map[string]coraza.WAF
@@ -36,18 +42,15 @@ type Engine struct {
 
 // defaultScanLimit 请求体送检上限默认值。CRS 正则扫描成本约 4.5µs/字节（实测 64KB
 // 二进制体单请求 ~380ms），必须设上限，否则大体积请求可被用作低成本 CPU 拒绝服务；
-// 16KB 已覆盖绝大多数攻击载荷位置，二进制 Content-Type 由代理层直接跳过扫体。
+// 16KB 已覆盖绝大多数攻击载荷位置；客户端 Content-Type 不用于跳过送检。
 const defaultScanLimit = 16 << 10
 
 // maxScanLimit 送检上限的硬上限，与 SecRequestBodyInMemoryLimit 一致，
 // 确保请求体始终留在内存、不落临时文件。
 const maxScanLimit = 1 << 20
 
-// truncatedExclusions 请求体被截断送检时豁免的规则：Coraza 的 multipart/urlencoded/JSON
-// 解析器看到不完整结构会置位 MULTIPART_STRICT_ERROR / REQBODY_ERROR，而这两条规则直接
-// deny 400，会让所有超过送检上限的正常上传被误拦。截断是我们主动做的（后端仍收到完整
-// 请求体），因此只豁免这两条“解析完整性”规则，内容检测规则照常作用于已送检的前缀。
-var truncatedExclusions = []Exclusion{{RuleID: 200002}, {RuleID: 200003}}
+// MaxUploadBodyMiB 仅用于管理员明确配置的上传接口。
+const MaxUploadBodyMiB = 64
 
 // SetScanLimit 设置请求体送检上限（字节），非正值回落默认值
 func (e *Engine) SetScanLimit(n int) {
@@ -61,15 +64,6 @@ func (e *Engine) SetScanLimit(n int) {
 }
 
 func (e *Engine) ScanLimit() int { return int(e.scanLimit.Load()) }
-
-// scanBody 按送检上限截断请求体，返回送检内容与是否发生截断
-func (e *Engine) scanBody(body []byte) ([]byte, bool) {
-	lim := int(e.scanLimit.Load())
-	if lim <= 0 || len(body) <= lim {
-		return body, false
-	}
-	return body[:lim], true
-}
 
 // crsContentTypes CRS4 默认允许的请求体 Content-Type，追加项在此基础上扩展
 var crsContentTypes = []string{
@@ -120,6 +114,8 @@ func ValidContentType(t string) bool {
 
 // SetContentTypes 更新追加允许的请求体类型；内容未变化时直接返回，避免重建引擎
 func (e *Engine) SetContentTypes(extra []string) error {
+	e.buildMu.Lock()
+	defer e.buildMu.Unlock()
 	e.mu.RLock()
 	same := len(extra) == len(e.extraCT)
 	if same {
@@ -136,7 +132,7 @@ func (e *Engine) SetContentTypes(extra []string) error {
 	}
 	wafs := map[string]coraza.WAF{}
 	for _, mode := range []string{"balanced", "strict"} {
-		w, err := e.buildWAF(mode, nil, extra)
+		w, err := e.buildWAF(mode, nil, extra, maxScanLimit)
 		if err != nil {
 			return fmt.Errorf("构建 %s 模式引擎失败: %w", mode, err)
 		}
@@ -160,7 +156,7 @@ func New() (*Engine, error) {
 	e := &Engine{wafs: map[string]coraza.WAF{}, variants: map[string]coraza.WAF{}}
 	e.scanLimit.Store(defaultScanLimit)
 	for _, mode := range []string{"balanced", "strict"} {
-		w, err := e.buildWAF(mode, nil, nil)
+		w, err := e.buildWAF(mode, nil, nil, maxScanLimit)
 		if err != nil {
 			return nil, fmt.Errorf("构建 %s 模式引擎失败: %w", mode, err)
 		}
@@ -169,31 +165,38 @@ func New() (*Engine, error) {
 	return e, nil
 }
 
-func (e *Engine) buildWAF(mode string, excl []Exclusion, extraCT []string) (coraza.WAF, error) {
+func (e *Engine) buildWAF(mode string, excl []Exclusion, extraCT []string, bodyLimit int) (coraza.WAF, error) {
 	pl := 1
 	if mode == "strict" {
 		pl = 2
 	}
+	// 用下方同阶段的本地规则保留原有参数限额规则 ID。
 	directives := fmt.Sprintf(`
 Include @coraza.conf-recommended
+SecRuleRemoveById 200004 200005
 SecRuleEngine On
 SecRequestBodyAccess On
-SecRequestBodyLimit 10485760
+SecRequestBodyLimit %d
 SecRequestBodyInMemoryLimit 1048576
-SecRequestBodyLimitAction ProcessPartial
+SecRequestBodyLimitAction Reject
+SecArgumentsLimit 1000
+SecRule ARGUMENTS_LIMIT_REACHED "@eq 1" "id:100010,phase:1,t:none,deny,status:400,log,msg:'Request query argument limit exceeded'"
+SecRule ARGUMENTS_LIMIT_REACHED "@eq 1" "id:100011,phase:2,t:none,deny,status:400,log,msg:'Request body argument limit exceeded'"
+SecRule REQUEST_HEADERS:Content-Type "@rx ^[^/;[:blank:]]+/[^;[:blank:]]+[+]json[[:blank:]]*(?:;|$)" "id:100012,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=JSON"
+SecRule REQUEST_HEADERS:Content-Type "@rx ^[^/;[:blank:]]+/[^;[:blank:]]+[+]xml[[:blank:]]*(?:;|$)" "id:100013,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=XML"
 SecResponseBodyAccess On
 SecResponseBodyLimit 1048576
 SecResponseBodyMimeType text/plain text/html text/xml application/json
 SecAuditEngine Off
-Include @crs-setup.conf.example
+Include @crs-setup-lts.conf.example
 SecAction "id:900000,phase:1,nolog,pass,t:none,setvar:tx.blocking_paranoia_level=%d,setvar:tx.detection_paranoia_level=%d"
 SecAction "id:900001,phase:1,nolog,pass,t:none,setvar:tx.inbound_anomaly_score_threshold=5,setvar:tx.outbound_anomaly_score_threshold=4"
 SecAction "id:900003,phase:1,nolog,pass,t:none,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'"
 %s%sSecRule ARGS|ARGS_NAMES|REQUEST_URI|REQUEST_BODY "(?:;|\||\x60|&&|\$\()\s*(?:cat|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php|chmod|chown|rm|dd|mkfifo|telnet)(?:[\s/\\;|&]|$)" "id:100001,phase:2,block,t:none,t:urlDecodeUni,t:lowercase,setvar:tx.anomaly_score=+5,setvar:tx.inbound_anomaly_score_pl1=+5,setvar:tx.inbound_anomaly_score_pl2=+5,msg:'牛B WAF: Unix 命令注入尝试',logdata:'Matched Data: %%{MATCHED_VAR} found within %%{MATCHED_VAR_NAME}',severity:'CRITICAL'"
-Include @owasp_crs/*.conf
-`, pl, pl, contentTypeDirectives(extraCT), exclusionDirectives(append(defaultExclusions(extraCT), excl...)))
+Include @owasp_crs_lts/*.conf
+`, bodyLimit, pl, pl, contentTypeDirectives(extraCT), exclusionDirectives(append(defaultExclusions(extraCT), excl...)))
 	return coraza.NewWAF(coraza.NewWAFConfig().
-		WithRootFS(crs.FS).
+		WithRootFS(ruleFiles).
 		WithErrorCallback(func(mr types.MatchedRule) {
 			id := mr.TransactionID()
 			v, _ := e.matched.LoadOrStore(id, &[]types.MatchedRule{})
@@ -275,35 +278,54 @@ func contentTypeDirectives(extra []string) string {
 }
 
 func (e *Engine) wafFor(mode string, excl []Exclusion) coraza.WAF {
+	w, err := e.wafForBodyLimit(mode, excl, maxScanLimit)
+	if err == nil {
+		return w
+	}
+	log.Printf("构建豁免引擎失败，回退基础引擎: %v", err)
+	e.mu.RLock()
+	defer e.mu.RUnlock()
 	if mode != "strict" {
 		mode = "balanced"
 	}
-	e.mu.RLock()
-	extraCT := e.extraCT
-	e.mu.RUnlock()
-	if len(excl) == 0 {
+	return e.wafs[mode]
+}
+
+func (e *Engine) wafForBodyLimit(mode string, excl []Exclusion, bodyLimit int) (coraza.WAF, error) {
+	if mode != "strict" {
+		mode = "balanced"
+	}
+	if len(excl) == 0 && bodyLimit == maxScanLimit {
 		e.mu.RLock()
 		defer e.mu.RUnlock()
-		return e.wafs[mode]
+		return e.wafs[mode], nil
 	}
 	parts := make([]string, len(excl))
 	for i, x := range excl {
 		parts[i] = fmt.Sprintf("%d|%s|%s", x.RuleID, x.URLPrefix, x.Param)
 	}
 	sort.Strings(parts)
-	key := mode + "#" + strings.Join(parts, ";")
+	key := fmt.Sprintf("%s#%d#%s", mode, bodyLimit, strings.Join(parts, ";"))
 	e.mu.RLock()
 	w, ok := e.variants[key]
 	e.mu.RUnlock()
 	if ok {
-		return w
+		return w, nil
 	}
-	w, err := e.buildWAF(mode, excl, extraCT)
+
+	// 存在新豁免配置时，首批并发请求共用一次规则集编译。
+	e.buildMu.Lock()
+	defer e.buildMu.Unlock()
+	e.mu.RLock()
+	w, ok = e.variants[key]
+	extraCT := e.extraCT
+	e.mu.RUnlock()
+	if ok {
+		return w, nil
+	}
+	w, err := e.buildWAF(mode, excl, extraCT, bodyLimit)
 	if err != nil {
-		log.Printf("构建豁免引擎失败，回退基础引擎: %v", err)
-		e.mu.RLock()
-		defer e.mu.RUnlock()
-		return e.wafs[mode]
+		return nil, err
 	}
 	e.mu.Lock()
 	if len(e.variants) > 128 {
@@ -311,7 +333,7 @@ func (e *Engine) wafFor(mode string, excl []Exclusion) coraza.WAF {
 	}
 	e.variants[key] = w
 	e.mu.Unlock()
-	return w
+	return w, nil
 }
 
 func (e *Engine) takeMatched(txID string) []types.MatchedRule {
@@ -332,11 +354,30 @@ type RequestInfo struct {
 }
 
 func (e *Engine) Detect(mode string, excl []Exclusion, r *RequestInfo) Result {
-	body, truncated := e.scanBody(r.Body)
-	if truncated {
-		excl = withTruncationExclusions(excl)
+	return e.detect(mode, excl, r, e.ScanLimit(), false)
+}
+
+func (e *Engine) DetectUpload(mode string, excl []Exclusion, r *RequestInfo, limit int) Result {
+	return e.detect(mode, excl, r, min(limit, MaxUploadBodyMiB<<20), true)
+}
+
+func (e *Engine) detect(mode string, excl []Exclusion, r *RequestInfo, limit int, upload bool) Result {
+	body := r.Body
+	if len(body) > limit {
+		return Result{Blocked: true, Status: http.StatusRequestEntityTooLarge, Msg: "请求体超过完整检测上限"}
 	}
-	w := e.wafFor(mode, excl)
+	var w coraza.WAF
+	if upload {
+		// Coraza 的 Reject 在达到边界时即拦截，连接器已按配置校验实际长度。
+		var err error
+		w, err = e.wafForBodyLimit(mode, excl, (MaxUploadBodyMiB<<20)+1)
+		if err != nil {
+			log.Printf("构建上传检测引擎失败: %v", err)
+			return Result{Blocked: true, Status: http.StatusServiceUnavailable, Msg: "上传检测暂不可用"}
+		}
+	} else {
+		w = e.wafFor(mode, excl)
+	}
 
 	tx := w.NewTransaction()
 	defer tx.Close()
@@ -363,12 +404,18 @@ func (e *Engine) Detect(mode string, excl []Exclusion, r *RequestInfo) Result {
 		return finish(it, e.takeMatched(txID))
 	}
 	if len(body) > 0 {
-		if it, _, err := tx.WriteRequestBody(body); err == nil && it != nil {
+		if it, _, err := tx.WriteRequestBody(body); it != nil {
 			return finish(it, e.takeMatched(txID))
+		} else if err != nil {
+			e.takeMatched(txID)
+			return Result{Blocked: true, Status: http.StatusBadRequest, Msg: "请求体无法送检"}
 		}
 	}
-	if it, err := tx.ProcessRequestBody(); err == nil && it != nil {
+	if it, err := tx.ProcessRequestBody(); it != nil {
 		return finish(it, e.takeMatched(txID))
+	} else if err != nil {
+		e.takeMatched(txID)
+		return Result{Blocked: true, Status: http.StatusBadRequest, Msg: "请求体解析失败"}
 	}
 	e.takeMatched(txID)
 	return Result{}
@@ -387,7 +434,7 @@ func (e *Engine) confirmCodeInj(uri string, body []byte) bool {
 	if check(uri) {
 		return true
 	}
-	return len(body) > 0 && check(truncUTF8(string(body), 8<<10))
+	return len(body) > 0 && check(bodyPrefixString(body, 8<<10))
 }
 
 // soleDetectionRule 返回唯一命中的检测规则 ID（排除汇总与内置控制规则），非唯一返回 0
@@ -406,13 +453,6 @@ func soleDetectionRule(matched []types.MatchedRule) int {
 	return sole
 }
 
-// withTruncationExclusions 复制豁免列表（调用方切片跨请求共享，不可原地追加）
-func withTruncationExclusions(excl []Exclusion) []Exclusion {
-	out := make([]Exclusion, 0, len(excl)+len(truncatedExclusions))
-	out = append(out, excl...)
-	return append(out, truncatedExclusions...)
-}
-
 func (e *Engine) DetectResponse(mode string, excl []Exclusion, req *RequestInfo, status int, headers http.Header, body []byte) Result {
 	w := e.wafFor(mode, excl)
 	tx := w.NewTransaction()
@@ -427,7 +467,7 @@ func (e *Engine) DetectResponse(mode string, excl []Exclusion, req *RequestInfo,
 		}
 	}
 	tx.ProcessRequestHeaders()
-	reqBody, _ := e.scanBody(req.Body)
+	reqBody := req.Body[:min(len(req.Body), e.ScanLimit())]
 	if len(reqBody) > 0 {
 		tx.WriteRequestBody(reqBody)
 		tx.ProcessRequestBody()
@@ -440,7 +480,7 @@ func (e *Engine) DetectResponse(mode string, excl []Exclusion, req *RequestInfo,
 	if it := tx.ProcessResponseHeaders(status, req.Proto); it != nil {
 		return resultFrom(it, e.takeMatched(txID))
 	}
-	respBody, _ := e.scanBody(body)
+	respBody := body[:min(len(body), e.ScanLimit())]
 	if len(respBody) > 0 {
 		if it, _, err := tx.WriteResponseBody(respBody); err == nil && it != nil {
 			return resultFrom(it, e.takeMatched(txID))
@@ -493,10 +533,6 @@ func resultFrom(it *types.Interruption, matched []types.MatchedRule) Result {
 		res.Msg = "命中防护规则"
 	}
 	return res
-}
-
-func ReadBodyLimited(r io.Reader, limit int64) ([]byte, error) {
-	return io.ReadAll(io.LimitReader(r, limit))
 }
 
 // ClientIP 解析真实客户端 IP。仅当直连对端位于可信代理网段时才采信 X-Forwarded-For /

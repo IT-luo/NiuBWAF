@@ -19,8 +19,10 @@ const (
 	ipCap       = 100000
 	keepHours   = 24 * 7 // 落盘保留 7 天
 	topN        = 10
+	trafficTopN = 50
 	arcTopN     = 12
 	pathMaxLen  = 128
+	pageMaxLen  = 512
 	referMaxLen = 128
 )
 
@@ -33,30 +35,32 @@ type arcSrc struct {
 }
 
 type hourBucket struct {
-	TS        int64                       `json:"ts"`
-	Req       int64                       `json:"req"`
-	Blocked   int64                       `json:"blocked"`
-	C4xx      int64                       `json:"c4xx"`
-	C5xx      int64                       `json:"c5xx"`
-	UV        int64                       `json:"uv"`
-	Status    map[int]int64               `json:"status,omitempty"`
-	OS        map[string]int64            `json:"os,omitempty"`
-	Browser   map[string]int64            `json:"browser,omitempty"`
-	Tool      map[string]int64            `json:"tool,omitempty"`
-	Referer   map[string]int64            `json:"referer,omitempty"`
-	Host      map[string]int64            `json:"host,omitempty"`
-	Path      map[string]int64            `json:"path,omitempty"`
-	Country   map[string]int64            `json:"country,omitempty"`
-	CnBlock   map[string]int64            `json:"country_blocked,omitempty"`
-	Prov      map[string]int64            `json:"province,omitempty"`
-	ProvBlock map[string]int64            `json:"province_blocked,omitempty"`
-	Module    map[string]int64            `json:"module,omitempty"`
-	Category  map[string]int64            `json:"category,omitempty"`
-	AttackIP  map[string]int64            `json:"attack_ip,omitempty"`
-	AtkPath   map[string]int64            `json:"attack_path,omitempty"`
-	AtkHost   map[string]int64            `json:"attack_host,omitempty"`
-	ModIP     map[string]map[string]int64 `json:"mod_ip,omitempty"`
-	Arc       map[string]*arcSrc          `json:"arc,omitempty"`
+	TS          int64                       `json:"ts"`
+	Req         int64                       `json:"req"`
+	Blocked     int64                       `json:"blocked"`
+	C4xx        int64                       `json:"c4xx"`
+	C5xx        int64                       `json:"c5xx"`
+	UV          int64                       `json:"uv"`
+	Status      map[int]int64               `json:"status,omitempty"`
+	OS          map[string]int64            `json:"os,omitempty"`
+	Browser     map[string]int64            `json:"browser,omitempty"`
+	Tool        map[string]int64            `json:"tool,omitempty"`
+	Referer     map[string]int64            `json:"referer,omitempty"`
+	RefererPage map[string]int64            `json:"referer_page,omitempty"`
+	Host        map[string]int64            `json:"host,omitempty"`
+	Path        map[string]int64            `json:"path,omitempty"`
+	Page        map[string]int64            `json:"page,omitempty"`
+	Country     map[string]int64            `json:"country,omitempty"`
+	CnBlock     map[string]int64            `json:"country_blocked,omitempty"`
+	Prov        map[string]int64            `json:"province,omitempty"`
+	ProvBlock   map[string]int64            `json:"province_blocked,omitempty"`
+	Module      map[string]int64            `json:"module,omitempty"`
+	Category    map[string]int64            `json:"category,omitempty"`
+	AttackIP    map[string]int64            `json:"attack_ip,omitempty"`
+	AtkPath     map[string]int64            `json:"attack_path,omitempty"`
+	AtkHost     map[string]int64            `json:"attack_host,omitempty"`
+	ModIP       map[string]map[string]int64 `json:"mod_ip,omitempty"`
+	Arc         map[string]*arcSrc          `json:"arc,omitempty"`
 
 	ips    map[string]struct{} `json:"-"`
 	uvBase int64               `json:"-"` // 重启恢复当前小时桶时的 UV 基数（历史 IP 集合不可恢复）
@@ -66,7 +70,8 @@ type hourBucket struct {
 func newBucket(hour int64) *hourBucket {
 	return &hourBucket{
 		TS: hour, Status: map[int]int64{}, OS: map[string]int64{}, Browser: map[string]int64{},
-		Tool: map[string]int64{}, Referer: map[string]int64{}, Host: map[string]int64{}, Path: map[string]int64{},
+		Tool: map[string]int64{}, Referer: map[string]int64{}, RefererPage: map[string]int64{},
+		Host: map[string]int64{}, Path: map[string]int64{}, Page: map[string]int64{},
 		Country: map[string]int64{}, CnBlock: map[string]int64{}, Prov: map[string]int64{}, ProvBlock: map[string]int64{},
 		Module: map[string]int64{}, Category: map[string]int64{}, AttackIP: map[string]int64{},
 		AtkPath: map[string]int64{}, AtkHost: map[string]int64{},
@@ -87,9 +92,9 @@ func incMap(m map[string]int64, k string) {
 
 // ReqStat 单请求维度（ServeHTTP 收尾埋点）
 type ReqStat struct {
-	IP, Host, Path, UA, Referer string
-	Status                      int
-	Blocked                     bool
+	IP, Host, Path, Page, UA, Referer, RefererPage string
+	Status                                         int
+	Blocked                                        bool
 }
 
 // EvStat 单安全事件维度（logAttack 埋点，geo 已含回退坐标）
@@ -178,11 +183,17 @@ func (b *hourBucket) ensureMaps() {
 	if b.Referer == nil {
 		b.Referer = map[string]int64{}
 	}
+	if b.RefererPage == nil {
+		b.RefererPage = map[string]int64{}
+	}
 	if b.Host == nil {
 		b.Host = map[string]int64{}
 	}
 	if b.Path == nil {
 		b.Path = map[string]int64{}
+	}
+	if b.Page == nil {
+		b.Page = map[string]int64{}
 	}
 	if b.Country == nil {
 		b.Country = map[string]int64{}
@@ -324,18 +335,22 @@ func (a *Analytics) Record(rs ReqStat) {
 	incMap(b.Browser, browser)
 	incMap(b.Tool, tool)
 	incMap(b.Referer, rs.Referer)
+	incMap(b.RefererPage, rs.RefererPage)
 	incMap(b.Host, rs.Host)
 	incMap(b.Path, rs.Path)
-	if g.Country != "" {
-		incMap(b.Country, g.Country)
+	incMap(b.Page, rs.Page)
+	country := g.Country
+	if country == "" {
+		country = "UNKNOWN"
+	}
+	incMap(b.Country, country)
+	if rs.Blocked {
+		incMap(b.CnBlock, country)
+	}
+	if country == "CN" && g.Region != "" {
+		incMap(b.Prov, g.Region)
 		if rs.Blocked {
-			incMap(b.CnBlock, g.Country)
-		}
-		if g.Country == "CN" && g.Region != "" {
-			incMap(b.Prov, g.Region)
-			if rs.Blocked {
-				incMap(b.ProvBlock, g.Region)
-			}
+			incMap(b.ProvBlock, g.Region)
 		}
 	}
 	a.mu.Unlock()
@@ -357,7 +372,8 @@ func (a *Analytics) Event(ev EvStat) {
 	}
 	incMap(b.Category, categoryOf(ev.Action, ev.RuleID, ev.Msg))
 	incMap(b.AttackIP, ev.IP)
-	incMap(b.AtkPath, truncStr(ev.URL, pathMaxLen))
+	path, _, _ := strings.Cut(ev.URL, "?")
+	incMap(b.AtkPath, truncStr(path, pathMaxLen))
 	incMap(b.AtkHost, ev.Domain)
 	if m, ok := b.ModIP[mod]; ok {
 		incMap(m, ev.IP)
@@ -403,6 +419,8 @@ func moduleOf(action string) string {
 		return "自定义规则"
 	case "geo":
 		return "地域管控"
+	case "api_schema":
+		return "API 契约"
 	}
 	return action
 }
@@ -419,6 +437,8 @@ func categoryOf(action string, ruleID int, msg string) string {
 		return "动态防护"
 	case "custom":
 		return "自定义规则"
+	case "api_schema":
+		return "API 契约"
 	case "resp":
 		return "信息泄露"
 	}
@@ -484,19 +504,42 @@ func classifyUA(ua string) (os, browser, tool string) {
 	return
 }
 
-func refererHost(referer, selfHost string) string {
+func externalReferer(referer, selfHost string) (host, page string) {
 	if referer == "" || len(referer) > referMaxLen*4 {
-		return ""
+		return "", ""
 	}
 	u, err := url.Parse(referer)
 	if err != nil || u.Host == "" {
+		return "", ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return "", ""
+	}
+	host = strings.ToLower(u.Hostname())
+	if host == "" || host == strings.ToLower(stripPort(selfHost)) {
+		return "", ""
+	}
+	path := u.EscapedPath()
+	if path == "" {
+		path = "/"
+	}
+	page = truncStr(scheme+"://"+strings.ToLower(u.Host)+path, pageMaxLen)
+	return host, page
+}
+
+func visitedPage(secure bool, host, path string) string {
+	if host == "" {
 		return ""
 	}
-	h := strings.ToLower(stripPort(u.Host))
-	if h == selfHost || h == "" {
-		return ""
+	scheme := "http"
+	if secure {
+		scheme = "https"
 	}
-	return h
+	if path == "" || path[0] != '/' {
+		path = "/" + path
+	}
+	return truncStr(scheme+"://"+host+path, pageMaxLen)
 }
 
 type KV struct {
@@ -543,8 +586,10 @@ type AnaSnapshot struct {
 	Browser     []KV            `json:"browser"`
 	Tool        []KV            `json:"tool"`
 	Referer     []KV            `json:"referer"`
+	RefererPage []KV            `json:"referer_page"`
 	Host        []KV            `json:"host"`
 	Path        []KV            `json:"path"`
+	Page        []KV            `json:"page"`
 	Countries   []GeoKV         `json:"countries"`
 	Provinces   []GeoKV         `json:"provinces"`
 	Modules     []KV            `json:"modules"`
@@ -603,7 +648,8 @@ func (a *Analytics) Snapshot(hours int) *AnaSnapshot {
 	s := &AnaSnapshot{ModuleIPs: map[string][]KV{}}
 	status := map[int]int64{}
 	osM, brM, toolM := map[string]int64{}, map[string]int64{}, map[string]int64{}
-	refM, hostM, pathM := map[string]int64{}, map[string]int64{}, map[string]int64{}
+	refM, refPageM := map[string]int64{}, map[string]int64{}
+	hostM, pathM, pageM := map[string]int64{}, map[string]int64{}, map[string]int64{}
 	cnM, cnB, provM, provB := map[string]int64{}, map[string]int64{}, map[string]int64{}, map[string]int64{}
 	modM, catM, atkM := map[string]int64{}, map[string]int64{}, map[string]int64{}
 	atkPathM, atkHostM := map[string]int64{}, map[string]int64{}
@@ -633,8 +679,10 @@ func (a *Analytics) Snapshot(hours int) *AnaSnapshot {
 		mergeAdd(brM, bk.Browser)
 		mergeAdd(toolM, bk.Tool)
 		mergeAdd(refM, bk.Referer)
+		mergeAdd(refPageM, bk.RefererPage)
 		mergeAdd(hostM, bk.Host)
 		mergeAdd(pathM, bk.Path)
+		mergeAdd(pageM, bk.Page)
 		mergeAdd(cnM, bk.Country)
 		mergeAdd(cnB, bk.CnBlock)
 		mergeAdd(provM, bk.Prov)
@@ -642,7 +690,10 @@ func (a *Analytics) Snapshot(hours int) *AnaSnapshot {
 		mergeAdd(modM, bk.Module)
 		mergeAdd(catM, bk.Category)
 		mergeAdd(atkM, bk.AttackIP)
-		mergeAdd(atkPathM, bk.AtkPath)
+		for rawPath, count := range bk.AtkPath {
+			path, _, _ := strings.Cut(rawPath, "?")
+			atkPathM[path] += count
+		}
 		mergeAdd(atkHostM, bk.AtkHost)
 		for mod, ips := range bk.ModIP {
 			if _, ok := modIP[mod]; !ok {
@@ -674,14 +725,14 @@ func (a *Analytics) Snapshot(hours int) *AnaSnapshot {
 	s.OS = topKV(osM, 8)
 	s.Browser = topKV(brM, 8)
 	s.Tool = topKV(toolM, 10)
-	s.Referer = topKV(refM, topN)
-	s.Host = topKV(hostM, topN)
+	s.Referer = topKV(refM, trafficTopN)
+	s.RefererPage = topKV(refPageM, trafficTopN)
+	s.Host = topKV(hostM, trafficTopN)
 	s.Path = topKV(pathM, topN)
-	for code, name := range countryNames {
-		if c, ok := cnM[code]; ok {
-			cent := countryCentroid[code]
-			s.Countries = append(s.Countries, GeoKV{Key: code, Name: name, Count: c, Blocked: cnB[code], Lat: cent[0], Lon: cent[1]})
-		}
+	s.Page = topKV(pageM, trafficTopN)
+	for code, c := range cnM {
+		cent := countryCentroid[code]
+		s.Countries = append(s.Countries, GeoKV{Key: code, Name: countryName(code), Count: c, Blocked: cnB[code], Lat: cent[0], Lon: cent[1]})
 	}
 	sort.Slice(s.Countries, func(i, j int) bool { return s.Countries[i].Count > s.Countries[j].Count })
 	for name, cnt := range provM {

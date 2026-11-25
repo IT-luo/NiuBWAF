@@ -48,7 +48,7 @@ func TestAllowedContentTypesSetting(t *testing.T) {
 
 	put := func(body string) *httptest.ResponseRecorder {
 		r := httptest.NewRecorder()
-		req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(body))
+		req := testJSONRequest("PUT", "/api/settings", body)
 		a.putSettings(r, req)
 		return r
 	}
@@ -201,7 +201,7 @@ func TestBodyScanLimitSetting(t *testing.T) {
 
 	put := func(body string) *httptest.ResponseRecorder {
 		r := httptest.NewRecorder()
-		a.putSettings(r, httptest.NewRequest("PUT", "/api/settings", strings.NewReader(body)))
+		a.putSettings(r, testJSONRequest("PUT", "/api/settings", body))
 		return r
 	}
 	for _, bad := range []string{`{"body_scan_kb":"10"}`, `{"body_scan_kb":"4096"}`, `{"body_scan_kb":"abc"}`} {

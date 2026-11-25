@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/base64"
 	"net/url"
+	"regexp/syntax"
 	"strings"
 	"testing"
 )
@@ -16,17 +17,78 @@ func hasVariant(vs []string, sub string) bool {
 	return false
 }
 
+func TestSemanticProbeMarkers(t *testing.T) {
+	for _, g := range []struct {
+		probes []semanticProbe
+		chars  string
+		word   string
+	}{
+		{xssProbes, xssProbeMarkerChars, xssProbeMarkerWord},
+		{lfiProbes, lfiProbeMarkerChars, ""},
+		{codeInjProbes, codeProbeMarkerChars, ""},
+	} {
+		for _, p := range g.probes {
+			tree, err := syntax.Parse(p.re.String(), syntax.Perl)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if canMatchWithoutMarker(tree, g.chars, g.word) {
+				t.Errorf("cannot prove that %q requires a prefilter marker", p.name)
+			}
+		}
+	}
+}
+
+// Conservative proof: unknown or optional nodes may match without a marker.
+func canMatchWithoutMarker(re *syntax.Regexp, chars, word string) bool {
+	switch re.Op {
+	case syntax.OpNoMatch:
+		return false
+	case syntax.OpLiteral:
+		text := string(re.Rune)
+		hasWord := re.Flags&syntax.FoldCase == 0 && word != "" && strings.Contains(text, word)
+		return !strings.ContainsAny(text, chars) && !hasWord
+	case syntax.OpCharClass:
+		for i := 0; i < len(re.Rune); i += 2 {
+			for r := re.Rune[i]; r <= re.Rune[i+1]; r++ {
+				if !strings.ContainsRune(chars, r) {
+					return true
+				}
+			}
+		}
+		return false
+	case syntax.OpConcat:
+		for _, sub := range re.Sub {
+			if !canMatchWithoutMarker(sub, chars, word) {
+				return false
+			}
+		}
+	case syntax.OpAlternate:
+		for _, sub := range re.Sub {
+			if canMatchWithoutMarker(sub, chars, word) {
+				return true
+			}
+		}
+		return false
+	case syntax.OpCapture, syntax.OpPlus:
+		return canMatchWithoutMarker(re.Sub[0], chars, word)
+	case syntax.OpRepeat:
+		return re.Min == 0 || canMatchWithoutMarker(re.Sub[0], chars, word)
+	}
+	return true
+}
+
 func TestNormalize(t *testing.T) {
 	cases := []struct {
 		in, want string
 	}{
-		{"%2555nion%2520select", "union select"},      // 双重 URL 编码
-		{"%u0055nion select", "union select"},        // IIS %u
-		{"&#85;NION SELECT", "union select"},         // HTML 实体
-		{"ＵＮＩＯＮ ＳＥＬＥＣＴ", "union select"},       // 全角 NFKC
-		{"UNION/**/SELECT", "union select"},          // 块注释折叠
-		{"/*!50000UNION*/ SELECT", "union select"},   // MySQL 可执行注释
-		{"%3Cscript%3E", "<script>"},                 // 编码标签
+		{"%2555nion%2520select", "union select"},   // 双重 URL 编码
+		{"%u0055nion select", "union select"},      // IIS %u
+		{"&#85;NION SELECT", "union select"},       // HTML 实体
+		{"ＵＮＩＯＮ ＳＥＬＥＣＴ", "union select"},           // 全角 NFKC
+		{"UNION/**/SELECT", "union select"},        // 块注释折叠
+		{"/*!50000UNION*/ SELECT", "union select"}, // MySQL 可执行注释
+		{"%3Cscript%3E", "<script>"},               // 编码标签
 	}
 	for _, c := range cases {
 		vs := Normalize(c.in)
@@ -100,9 +162,9 @@ func TestSemanticSQL(t *testing.T) {
 		"1' AND '1'='1",
 		"' UNION SELECT 0x61646d696e,CHAR(65,66)",
 		"%2555nion%2520select%25201,2", // 双重编码绕过 CRS
-		"ＵＮＩＯＮ ＳＥＬＥＣＴ 1,2",   // 全角绕过
-		"UNION/**/SELECT 1,2",        // 注释分隔绕过
-		"SELECT * FROM all_tables",   // libinjection 漏报的裸查询结构
+		"ＵＮＩＯＮ ＳＥＬＥＣＴ 1,2",             // 全角绕过
+		"UNION/**/SELECT 1,2",          // 注释分隔绕过
+		"SELECT * FROM all_tables",     // libinjection 漏报的裸查询结构
 		"1; INSERT INTO logs VALUES(1)",
 	}
 	for _, p := range positives {

@@ -4,176 +4,241 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>牛B WAF 实时安全大屏</title>
+<link rel="stylesheet" href="style.css">
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-:root{--grad:linear-gradient(135deg,#22d3ee,#6366f1 55%,#a855f7);--border:rgba(148,163,184,.13);--dim:#94a3b8;--faint:#5b6b85;--mono:"SF Mono","Cascadia Code",Consolas,monospace}
-body{background:radial-gradient(1100px 500px at 15% -10%,rgba(34,211,238,.1),transparent 60%),radial-gradient(900px 500px at 100% 0%,rgba(168,85,247,.09),transparent 55%),#070a12;color:#e6edf7;font-family:"Inter","SF Pro Display",-apple-system,"Segoe UI","PingFang SC","HarmonyOS Sans SC","MiSans","Microsoft YaHei",sans-serif;min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}
-body::before{content:"";position:fixed;inset:0;pointer-events:none;background-image:linear-gradient(rgba(148,163,184,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(148,163,184,.035) 1px,transparent 1px);background-size:44px 44px;mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 30%,transparent 100%)}
-header{display:flex;align-items:center;justify-content:space-between;padding:22px 36px;border-bottom:1px solid var(--border);position:relative;z-index:1}
-.title{display:flex;align-items:center;gap:14px;font-size:25px;font-weight:800;letter-spacing:1px}
-.title .mark{width:42px;height:42px;display:flex;align-items:center;justify-content:center}
-.title .mark svg{width:38px;height:38px;filter:drop-shadow(0 6px 18px rgba(99,102,241,.55));animation:markGlow 4.5s ease-in-out infinite}
-@keyframes markGlow{0%,100%{filter:drop-shadow(0 6px 18px rgba(99,102,241,.55))}50%{filter:drop-shadow(0 8px 26px rgba(168,85,247,.75))}}
-.title .t{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.title small{font-size:11px;color:var(--faint);font-weight:500;margin-left:6px;letter-spacing:2.5px}
-#clock{font-size:17px;color:var(--dim);font-family:var(--mono);font-variant-numeric:tabular-nums}
-.wrap{position:relative;z-index:1}
-.big-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;padding:22px 36px 0}
-.stat{background:linear-gradient(180deg,rgba(23,32,55,.66),rgba(13,19,35,.72));backdrop-filter:blur(14px);border:1px solid var(--border);border-radius:16px;padding:22px;text-align:center;position:relative;overflow:hidden}
-.stat::after{content:"";position:absolute;top:0;left:0;right:0;height:2px;background:var(--grad);opacity:.7}
-.stat .n{font-size:40px;font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-1px;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.stat .n.red{background:none;color:#fb7185}.stat .n.green{background:none;color:#34d399}
-.stat .l{color:var(--dim);font-size:12.5px;margin-top:6px;letter-spacing:1px}
-.grid{display:grid;grid-template-columns:1fr 1.4fr 1fr;gap:16px;padding:18px 36px}
-.panel{background:linear-gradient(180deg,rgba(23,32,55,.66),rgba(13,19,35,.72));backdrop-filter:blur(14px);border:1px solid var(--border);border-radius:16px;padding:18px;box-shadow:0 8px 32px rgba(2,6,16,.3)}
-.panel h3{font-size:13px;color:var(--dim);margin-bottom:12px;font-weight:600;display:flex;align-items:center;gap:8px}
-.panel h3::before{content:"";width:3px;height:13px;border-radius:2px;background:var(--grad)}
-.chart{width:100%;height:250px}
-#feed{max-height:430px;overflow-y:auto;font-size:12px}
-#feed::-webkit-scrollbar{width:5px}#feed::-webkit-scrollbar-thumb{background:rgba(148,163,184,.25);border-radius:3px}
-.ev{padding:9px 10px;border-bottom:1px solid rgba(148,163,184,.07);animation:flash 1.2s;border-radius:8px}
+.wallboard{background:radial-gradient(ellipse at 85% 0%,#e0f5ee 0%,transparent 55%),var(--bg)}
+.wall-header,.wallboard .wrap,.wall-footer{width:min(100%,1760px);margin:auto;padding-inline:28px}
+.wall-header{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding-block:19px}
+.wall-header .title{display:flex;align-items:center;gap:12px;font-size:clamp(19px,2.5vw,25px);font-weight:800;line-height:1.2}
+.wall-header .logo-mark{width:43px;height:43px;border-radius:13px;background:#fff;box-shadow:var(--shadow)}
+.wall-actions{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+#clock{font-size:12px;color:var(--dim);font-family:var(--mono);font-variant-numeric:tabular-nums}
+.big-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:16px}
+.stat{background:var(--panel);border:1px solid var(--border);border-radius:var(--r-lg);padding:15px 18px;box-shadow:var(--shadow)}
+.stat .n{font-size:clamp(22px,2.7vw,35px);font-weight:800;font-variant-numeric:tabular-nums;letter-spacing:-.04em;line-height:1.25;color:var(--sky);overflow-wrap:anywhere}
+.stat .n.red{color:var(--red)}
+.stat .n.green{color:var(--green)}
+.stat .l{color:var(--dim);font-size:12px;margin-bottom:5px;font-weight:650}
+.wall-grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,2.1fr) minmax(0,1.1fr);grid-template-areas:"leaders map events";gap:14px}
+.wall-leaders{grid-area:leaders}
+.wall-map{grid-area:map}
+.wall-map-heading{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}
+.wall-map-heading h3{margin:0}
+.wall-map-heading button{flex:none}
+.wall-events{grid-area:events}
+.wallboard .panel{padding:15px;margin-bottom:0}
+.wall-leaders .panel+.panel{margin-top:14px}
+.wallboard .chart{height:222px}
+.wallboard .chart-geo{height:165px}
+#feed{max-height:560px;overflow:auto;font-size:12px;scrollbar-width:thin}
+.ev{padding:9px 4px;border-bottom:1px solid var(--border);overflow-wrap:anywhere;animation:flash 1s ease-out}
+.ev:last-child{border-bottom:0}
 .ev .t{color:var(--faint);font-family:var(--mono)}
-.ev .ip{color:#fbbf24;font-family:var(--mono)}
+.ev .ip{color:var(--amber);font-family:var(--mono)}
 .ev .m{color:var(--dim);display:block;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.tag{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;margin:0 6px;border:1px solid transparent}
-.tag.red{background:rgba(251,113,133,.1);color:#fb7185;border-color:rgba(251,113,133,.25)}
-.tag.orange{background:rgba(251,191,36,.1);color:#fbbf24;border-color:rgba(251,191,36,.25)}
-.tag.blue{background:rgba(56,189,248,.1);color:#38bdf8;border-color:rgba(56,189,248,.25)}
-.tag.violet{background:rgba(168,85,247,.1);color:#c084fc;border-color:rgba(168,85,247,.25)}
-.tag.cyan{background:rgba(34,211,238,.1);color:#22d3ee;border-color:rgba(34,211,238,.25)}
-@keyframes flash{0%{background:rgba(56,189,248,.14)}100%{background:transparent}}
-.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#34d399;margin-right:2px;animation:pulse 1.8s infinite}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(52,211,153,.5)}70%{box-shadow:0 0 0 7px rgba(52,211,153,0)}100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}}
-#map-box{position:relative;height:400px;margin-bottom:14px}
-#c-map{position:absolute;inset:0;width:100%;height:100%}
-.map-stats{position:absolute;left:12px;bottom:10px;display:flex;gap:12px;pointer-events:none}
-.map-stats div{background:rgba(7,11,22,.55);border:1px solid var(--border);border-radius:10px;padding:6px 12px;text-align:center;backdrop-filter:blur(6px)}
-.map-stats b{display:block;font-size:17px;font-weight:800;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-variant-numeric:tabular-nums}
-.map-stats span{font-size:10px;color:var(--faint);letter-spacing:1px}
-footer{text-align:center;color:var(--faint);font-size:12px;padding:10px 0 22px;position:relative;z-index:1}
-@media(max-width:1100px){.grid{grid-template-columns:1fr}.big-stats{grid-template-columns:1fr 1fr}}
+.ev .tag{margin:3px 5px;padding:1px 6px}
+@keyframes flash{from{background:var(--blue-soft)}to{background:transparent}}
+#map-box{position:relative;height:clamp(270px,34vw,425px);margin-bottom:14px;border-radius:14px;overflow:hidden;background:radial-gradient(ellipse at center,#f8fcff,#eaf4fa)}
+#c-vector,#c-map{position:absolute;inset:0;width:100%;height:100%}
+#c-map{pointer-events:none}
+.map-legend{position:absolute;left:9px;bottom:8px;display:flex;gap:9px;padding:4px 7px;border-radius:7px;background:#fff;color:var(--dim);font-size:10px;pointer-events:none}
+.map-legend span{display:flex;align-items:center;gap:4px}
+.map-legend i{display:inline-block;width:6px;height:6px;border-radius:50%}
+.map-legend .source{background:#bc771e}
+.map-legend .target{background:#16899e}
+.map-legend .path{width:13px;height:2px;border-radius:2px;background:linear-gradient(90deg,#bc771e,#d14c6b)}
+.map-source{position:absolute;right:9px;top:8px;color:var(--faint);font-size:9px;pointer-events:none}
+.china-map-dialog{width:min(820px,calc(100% - 24px));max-height:calc(100% - 24px);margin:auto;padding:16px;border:1px solid var(--border);border-radius:16px;background:var(--panel);color:var(--text);box-shadow:var(--shadow-raised)}
+.china-map-dialog::backdrop{background:rgba(23,42,70,.38)}
+.china-map-dialog h2{margin:0;font-size:17px}
+.china-map-dialog figure{margin:0}
+.china-map-dialog img{display:block;width:100%;height:auto;max-height:calc(100dvh - 168px);object-fit:contain;background:#fff}
+.china-map-dialog figcaption{display:flex;flex-wrap:wrap;align-items:center;gap:6px 14px;margin-top:12px;color:var(--dim);font-size:12px}
+.live-stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:5px;margin:0 0 14px}
+.live-stats div{min-width:0;background:var(--surface);border-radius:9px;padding:7px 4px;text-align:center}
+.live-stats b{display:block;font-size:clamp(13px,1.5vw,19px);font-weight:800;color:var(--sky);font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.live-stats span{font-size:10px;color:var(--dim)}
+.wall-footer{text-align:center;color:var(--faint);font-size:12px;padding-block:16px}
+@media(max-width:1120px){
+  .wall-grid{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-areas:"map map" "leaders events"}
+}
+@media(max-width:650px){
+  .wall-header,.wallboard .wrap,.wall-footer{padding-inline:12px}
+  .wall-header{padding-block:13px}
+  .wall-actions{gap:8px}
+  .big-stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .stat{padding:12px}
+  .wall-grid{grid-template-columns:minmax(0,1fr);grid-template-areas:"map" "events" "leaders"}
+  .wallboard .panel{padding:12px}
+  .map-legend{gap:6px}
+}
 </style>
 </head>
-<body>
-<header>
-  <div class="title">
-    <span class="mark"><svg viewBox="0 0 24 24" fill="none"><defs><linearGradient id="nbGs" x1="4.5" y1="2.5" x2="19.5" y2="21.5" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#22d3ee"/><stop offset=".5" stop-color="#6366f1"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs><path fill="url(#nbGs)" d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path fill="#fff" opacity=".12" d="M12 2l8 3v7c0 6-8 10-8 10z"/><path fill="#fff" d="M12.55 6.5 7.05 13.1h4.9l-.5 4.4 5.55-6.6h-5z"/></svg></span>
-    <span class="t">牛B WAF 实时安全大屏</span><small>SECURITY OPERATIONS CENTER</small>
-  </div>
-  <div id="clock"></div>
+<body class="wallboard">
+<header class="wall-header">
+  <h1 class="title">
+    <span class="logo-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none"><defs><linearGradient id="nbGs" x1="4.5" y1="2.5" x2="19.5" y2="21.5" gradientUnits="userSpaceOnUse"><stop offset="0" stop-color="#16899e"/><stop offset=".5" stop-color="#5364da"/><stop offset="1" stop-color="#805cca"/></linearGradient></defs><path fill="url(#nbGs)" d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path fill="#fff" opacity=".12" d="M12 2l8 3v7c0 6-8 10-8 10z"/><path fill="#fff" d="M12.55 6.5 7.05 13.1h4.9l-.5 4.4 5.55-6.6h-5z"/></svg></span>
+    <span>牛B WAF 实时安全大屏</span>
+  </h1>
+  <div class="wall-actions"><time id="clock"></time><a class="btn ghost sm" href="./">返回控制台</a></div>
 </header>
 <div class="wrap">
   <div class="big-stats">
-    <div class="stat"><div class="n" id="s-reqs">0</div><div class="l">今日请求总量</div></div>
-    <div class="stat"><div class="n red" id="s-blocks">0</div><div class="l">今日拦截攻击</div></div>
-    <div class="stat"><div class="n green" id="s-sites">0</div><div class="l">防护站点</div></div>
-    <div class="stat"><div class="n" id="s-total">0</div><div class="l">累计拦截</div></div>
+    <div class="stat"><div class="l">今日请求总量</div><div class="n" id="s-reqs">0</div></div>
+    <div class="stat"><div class="l">今日拦截攻击</div><div class="n red" id="s-blocks">0</div></div>
+    <div class="stat"><div class="l">防护站点</div><div class="n green" id="s-sites">0</div></div>
+    <div class="stat"><div class="l">累计拦截</div><div class="n" id="s-total">0</div></div>
   </div>
-  <div class="grid">
-    <div>
-      <div class="panel" style="margin-bottom:16px"><h3>攻击源 IP Top10</h3><div id="c-ips" class="chart"></div></div>
-      <div class="panel"><h3>攻击来源国家/地区</h3><div id="c-geo" class="chart" style="height:180px"></div></div>
+  <div class="wall-grid">
+    <div class="wall-leaders">
+      <div class="panel"><h3>攻击源 IP Top10</h3><div id="c-ips" class="chart"></div></div>
+      <div class="panel"><h3>攻击来源国家/地区</h3><div id="c-geo" class="chart chart-geo"></div></div>
     </div>
-    <div class="panel"><h3><span class="dot"></span>全球攻击轨迹</h3>
-      <div id="map-box"><canvas id="c-map"></canvas>
-        <div class="map-stats">
-          <div><b id="m-qps">0</b><span>实时 QPS</span></div>
-          <div><b id="m-qp">0</b><span>60s 峰值</span></div>
-          <div><b id="m-blocked">0</b><span>24H 拦截</span></div>
-          <div><b id="m-srcs">0</b><span>攻击源地域</span></div>
-          <div><b id="m-events">0</b><span>实时事件</span></div>
-        </div>
+    <div class="panel wall-map">
+      <div class="wall-map-heading">
+        <h3><span class="live-dot"></span>全球攻击轨迹</h3>
+        <button id="open-china-map" type="button" class="btn ghost sm" aria-haspopup="dialog" aria-controls="china-map-dialog">中国全图</button>
       </div>
-      <h3>流量趋势（近 24 小时）</h3><div id="c-trend" class="chart" style="height:170px"></div>
+      <div class="live-stats">
+        <div><b id="m-qps">0</b><span>实时 QPS</span></div>
+        <div><b id="m-qp">0</b><span>60s 峰值</span></div>
+        <div><b id="m-blocked">0</b><span>24H 拦截</span></div>
+        <div><b id="m-srcs">0</b><span>攻击源地域</span></div>
+        <div><b id="m-events">0</b><span>实时事件</span></div>
+      </div>
+      <div id="map-box">
+        <div id="c-vector"></div><canvas id="c-map"></canvas>
+        <div class="map-legend"><span><i class="source"></i>攻击来源</span><span><i class="target"></i>受保护站点</span><span><i class="path"></i>攻击轨迹</span></div>
+        <div class="map-source">Natural Earth · 110m</div>
+      </div>
     </div>
-    <div class="panel"><h3><span class="dot"></span>实时攻击事件</h3><div id="feed"></div></div>
+    <div class="panel wall-events"><h3><span class="live-dot"></span>实时攻击事件</h3><div id="feed"><p id="feed-empty" class="empty">暂无攻击事件</p></div></div>
   </div>
 </div>
-<footer>牛B WAF · Coraza 智能语义分析引擎 + OWASP CRS 规则集 · 数据每 10 秒刷新</footer>
+<footer class="wall-footer">牛B WAF · Coraza 智能语义分析引擎 + OWASP CRS 规则集 · 数据每 10 秒刷新</footer>
+<dialog id="china-map-dialog" class="china-map-dialog" aria-labelledby="china-map-title">
+  <div class="wall-map-heading">
+    <h2 id="china-map-title">中国全图</h2>
+    <form method="dialog"><button class="btn ghost sm" autofocus>关闭</button></form>
+  </div>
+  <figure>
+    <img src="china-standard-gs2023-2762.jpg" alt="中国全图，包含台湾岛、海南岛、钓鱼岛及其附属岛屿和南海诸岛" width="2000" height="2357" loading="lazy" decoding="async">
+    <figcaption>
+      <span>自然资源部监制 · GS(2023)2762号</span>
+      <a href="china-standard-gs2023-2762.jpg" target="_blank" rel="noopener">打开大图</a>
+      <a href="https://xinwen.bjd.com.cn/content/s64ec150ee4b03b71707d45b2.html" target="_blank" rel="noopener">图件来源</a>
+    </figcaption>
+  </figure>
+</dialog>
 <script src="echarts.min.js"></script>
+<script src="topojson-client.min.js"></script>
+<script src="world-110m.js"></script>
 <script>
 const $ = s => document.querySelector(s);
+$('#open-china-map').addEventListener('click', () => $('#china-map-dialog').showModal());
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const axis = {axisLine:{lineStyle:{color:'rgba(148,163,184,.18)'}},axisTick:{show:false},axisLabel:{color:'#7d8db0',fontSize:11},splitLine:{lineStyle:{color:'rgba(148,163,184,.07)'}}};
-const tip = {backgroundColor:'rgba(14,21,38,.96)',borderColor:'rgba(148,163,184,.2)',textStyle:{color:'#e6edf7',fontSize:12},extraCssText:'box-shadow:0 8px 24px rgba(2,6,16,.5);border-radius:10px;'};
-const area = rgb => new echarts.graphic.LinearGradient(0,0,0,1,[{offset:0,color:`rgba(${rgb},.3)`},{offset:1,color:`rgba(${rgb},0)`}]);
-const trendC = echarts.init($('#c-trend'));
+const axis = {axisLine:{lineStyle:{color:'#d7e3f0'}},axisTick:{show:false},axisLabel:{color:'#5d718d',fontSize:11},splitLine:{lineStyle:{color:'#e8eff7'}}};
+const tip = {backgroundColor:'#fff',borderColor:'rgba(148,163,184,.2)',textStyle:{color:'#172a46',fontSize:12},extraCssText:'box-shadow:0 8px 24px rgba(40,70,110,.14);border-radius:10px;'};
+const emptyTitle = data => ({show: !data.length,text:'暂无数据',left:'center',top:'center',textStyle:{color:'#5d718d',fontSize:13,fontWeight:400}});
 const ipsC = echarts.init($('#c-ips'));
 const geoC = echarts.init($('#c-geo'));
 
-/* ---- 攻击轨迹点阵地图（陆地栅格由 Natural Earth 110m 生成，仅含海陆轮廓，无第三方版权数据） ---- */
-const MAP_W=120,MAP_H=48,MAP_LAT0=84,MAP_STEP=3;
-const MAP_BITS="AAAAgH/wHwAAAAAAAAAAAAAA8Mf/PwALAAAYAAAAAACY9OP/HwAAAATAAQAAAAAYfQP+HwAAQID/LwgAwAPA0x/8BwAwAOz///8B/v////////8BDBAAAAAAwP///z04YAD3//////9/4P//HwwwAMD7//////86AMH/H1wAAETz/////wcCAAD/f/wAAAT5/////wEDAAD+//0BAPr//////w8BAAD4/z8AAPj//////w8AAAD4/z8AAPi/3v///wsAAAD4/x8AALof7v///wkAAAD4/wcAAA7O3///bwAAAAD4/wcAAA7p3///XwQAAADw/wMAAHwA////DwMAAADg/wEAAP4Z////nwAAAACADwEAAP9/7///HwAAAAAADwAAgP//H///DwAAAAAABgIAgP///vj7AwAAAAAAThAAgP//fPB4AQAAAAAAeAAAwP//PXD4EAAAAAAAwAAAwP//D2DgAAAAAAAAgLgAgP//H2CAAAAAAAAAAPwAAP//HwAAIAAAAAAAAPwHAML/DwAQDAAAAAAAAPwHAID/BwBgBwAAAAAAAP4fAID/AwBAFgEAAAAAAP5/AAD/AQBAAA4AAAAAAP7/AAD/AQAAAxwAAAAAAPz/AAD/AQAAAAAAAAAAAPh/AAD/EwAAgAkA////////////////////AAAAAOB/AAD/CAAA8B8AAAAAAOA/AAD+DAAA/D8AAAAAAPAPAAB+AAAA/H8AAAAAAPAPAAB+AAAA/H8AAAAAAPAHAAA8AAAA+H8AAAAAAPADAAAEAAAACDwAAAAAAPgBAAAAAAAAADhAAAAAAHgAAAAAAAAAAABAAAAAADAAAAAAAAAAAAAgAAAAADgAAAAAAAAAAAAQAAAAABgAAAAAAAAAAAAAAAAAABgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+/* ---- 离线矢量世界地图 + 实时攻击轨迹（Natural Earth 110m，公共领域数据） ---- */
 const mapCv=$('#c-map'),mapCtx=mapCv.getContext('2d');
 const HOME={lon:104,lat:34};
-// 纵向按陆地行范围裁剪投影，让陆地铺满画布；跳过整行填充的纬线伪影
-let mapRow0=0,mapRowSpan=MAP_H;
-const mx=lon=>(lon+180)/360;
-const my=lat=>((MAP_LAT0-Math.max(-60,Math.min(MAP_LAT0,lat)))/MAP_STEP-mapRow0+0.5)/mapRowSpan;
-let dotLayer=null,boxW=0,boxH=0;
-function buildDots(){
+let boxW=0,boxH=0;
+const worldTopology=window.WORLD_TOPO;
+const countries=worldTopology.objects.countries;
+const worldGeo=topojson.feature(worldTopology,countries);
+const china=worldGeo.features.find(f=>f.id==='156');
+const chinaGeometries=countries.geometries.filter(g=>g.id==='156'||g.id==='158');
+if(china&&chinaGeometries.length===2){
+  // 将台湾岛及中国其他岛屿作为同一地图区域，统一底色和悬停状态。
+  china.geometry=topojson.merge(worldTopology,chinaGeometries);
+  china.properties.name='中国';
+  worldGeo.features=worldGeo.features.filter(f=>f.id!=='158');
+}
+worldGeo.features=worldGeo.features.filter(f=>f.properties.name!=='Antarctica');
+// 避免 ECharts 将跨日界线的短边画成横贯地图的直线。
+for(const feature of worldGeo.features.filter(f=>['Russia','Fiji'].includes(f.properties.name))){
+  const polygons=feature.geometry.type==='Polygon'?[feature.geometry.coordinates]:feature.geometry.coordinates;
+  for(const polygon of polygons)for(const ring of polygon)for(const point of ring)if(point[0]<0)point[0]+=360;
+}
+echarts.registerMap('niubwaf-world',worldGeo);
+const mapC=echarts.init($('#c-vector'),null,{renderer:'canvas'});
+function mapLayoutSize(){
+  return Math.min(mapCv.clientWidth - 16, mapCv.clientHeight * 2);
+}
+mapC.setOption({
+  backgroundColor:'transparent',animation:false,tooltip:tip,
+  geo:{
+    map:'niubwaf-world',roam:false,silent:false,
+    layoutCenter:['50%','49%'],layoutSize:mapLayoutSize(),aspectScale:1,
+    itemStyle:{areaColor:'#c9e1f1',borderColor:'#93b6cf',borderWidth:.55,shadowColor:'rgba(46,109,149,.08)',shadowBlur:9},
+    regions:[{name:'中国',itemStyle:{areaColor:'#add6e6',borderColor:'#78a8c0'}}],
+    emphasis:{label:{show:false},itemStyle:{areaColor:'#9ccbe0',borderColor:'#528eac',borderWidth:.8,shadowColor:'rgba(22,137,158,.14)',shadowBlur:12}},
+    select:{disabled:true},tooltip:{show:true,formatter:p=>esc(p.name)}
+  }
+});
+const project=(lon,lat)=>mapC.convertToPixel('geo',[lon,lat]);
+function buildMap(){
   const dpr=devicePixelRatio||1;
   boxW=mapCv.clientWidth;boxH=mapCv.clientHeight;
   if(!boxW||!boxH)return;
   mapCv.width=boxW*dpr;mapCv.height=boxH*dpr;mapCtx.setTransform(dpr,0,0,dpr,0,0);
-  const raw=atob(MAP_BITS),bits=new Uint8Array(raw.length);
-  for(let i=0;i<raw.length;i++)bits[i]=raw.charCodeAt(i);
-  const on=(c,r)=>!!(bits[(r*MAP_W+c)>>3]&(1<<((r*MAP_W+c)&7)));
-  const skip=new Set();
-  let r0=MAP_H,r1=-1;
-  for(let r=0;r<MAP_H;r++){
-    let cnt=0;for(let c=0;c<MAP_W;c++)if(on(c,r))cnt++;
-    if(cnt>=MAP_W-2){skip.add(r);continue;}
-    if(!cnt)continue;
-    if(r<r0)r0=r;
-    if(r>r1)r1=r;
-  }
-  if(r1<0){r0=0;r1=MAP_H-1;}
-  mapRow0=r0;mapRowSpan=r1-r0+1;
-  dotLayer=document.createElement('canvas');dotLayer.width=boxW*dpr;dotLayer.height=boxH*dpr;
-  const dc=dotLayer.getContext('2d');dc.setTransform(dpr,0,0,dpr,0,0);
-  const bg=dc.createRadialGradient(boxW/2,boxH*0.45,10,boxW/2,boxH*0.45,boxW*0.62);
-  bg.addColorStop(0,'rgba(59,130,246,.09)');bg.addColorStop(1,'rgba(59,130,246,0)');
-  dc.fillStyle=bg;dc.fillRect(0,0,boxW,boxH);
-  const r=Math.max(1.1,Math.min(boxW/MAP_W,boxH/mapRowSpan)*0.34);
-  for(let row=mapRow0;row<mapRow0+mapRowSpan;row++){
-    if(skip.has(row))continue;
-    const t=(row-mapRow0)/mapRowSpan;
-    const alpha=(0.30+0.34*Math.sin(Math.PI*(0.12+0.88*t))).toFixed(3);
-    dc.fillStyle=`rgba(${Math.round(92-34*t)},${Math.round(146+36*t)},238,${alpha})`;
-    for(let c=0;c<MAP_W;c++){
-      if(!on(c,row))continue;
-      dc.beginPath();
-      dc.arc((c+0.5)/MAP_W*boxW,(row-mapRow0+0.5)/mapRowSpan*boxH,r,0,Math.PI*2);
-      dc.fill();
-    }
-  }
+  mapC.resize();mapC.setOption({geo:{layoutSize:mapLayoutSize()}});
 }
 let arcs=[],evCount=0,seeded=false,ripples=[];
 function addArc(lon,lat,label,n,live){
   if(!lon&&!lat)return;
-  const x=mx(lon),y=my(lat);
-  const dup=arcs.find(a=>Math.abs(a.x-x)<0.012&&Math.abs(a.y-y)<0.012);
+  const dup=arcs.find(a=>a.label===(label||'')&&Math.abs(a.lon-lon)<1.4&&Math.abs(a.lat-lat)<0.5);
   if(dup){dup.n+=(n||1);dup.born=performance.now();dup.live=false;if(label)dup.label=label;return;}
-  arcs.push({x,y,label:label||'',n:n||1,born:performance.now(),seed:Math.random()*1000,live:!!live,lastT:0});
+  arcs.push({lon,lat,label:label||'',n:n||1,born:performance.now(),seed:Math.random()*1000,live:!!live,lastT:0});
   if(arcs.length>48)arcs.shift();
 }
+function placeMapLabels(hx,hy){
+  mapCtx.font='600 10.5px sans-serif';
+  const placed=[{x:hx-32,y:hy-33,w:78,h:66}],out=[];
+  for(const a of arcs.slice(-10)){
+    if(!a.label)continue;
+    const name=a.label.length>8?a.label.slice(0,8)+'…':a.label;
+    const txt=name+(a.n>1?' ×'+a.n:''),w=mapCtx.measureText(txt).width+8,h=18;
+    const p=project(a.lon,a.lat),sx=p[0],sy=p[1],candidates=[];
+    for(const d of [10,54,98,142,186]){
+      for(const dy of [-100,-63,-26,9,46,83,120]){
+        candidates.push([sx+d,sy+dy],[sx-w-d-4,sy+dy]);
+        if(d===10)candidates.push([sx-w/2,sy+dy]);
+      }
+    }
+    let best=null,bestScore=Infinity;
+    for(const c of candidates){
+      const r={x:Math.max(4,Math.min(boxW-w-4,c[0])),y:Math.max(4,Math.min(boxH-84,c[1])),w,h};
+      let hits=0;
+      for(const p of placed)if(r.x<p.x+p.w+5&&r.x+r.w+5>p.x&&r.y<p.y+p.h+5&&r.y+r.h+5>p.y)hits++;
+      const tx=Math.max(r.x,Math.min(sx,r.x+w)),ty=Math.max(r.y,Math.min(sy,r.y+h));
+      const score=hits*100000+Math.hypot(tx-sx,ty-sy)+Math.hypot(r.x-c[0],r.y-c[1])*1.5;
+      if(score<bestScore){bestScore=score;best=r;}
+    }
+    placed.push(best);
+    out.push({...best,sx,sy,txt});
+  }
+  return out;
+}
 function frame(now){
-  if(dotLayer&&boxW){
+  if(boxW){
     mapCtx.clearRect(0,0,boxW,boxH);
-    mapCtx.drawImage(dotLayer,0,0,boxW,boxH);
     arcs=arcs.filter(a=>!a.live||now-a.born<14000);
     ripples=ripples.filter(r=>now-r.born<1500);
-    const hx=mx(HOME.lon)*boxW,hy=my(HOME.lat)*boxH;
+    const hp=project(HOME.lon,HOME.lat),hx=hp[0],hy=hp[1];
     for(const a of arcs){
-      const sx=a.x*boxW,sy=a.y*boxH,dx=hx,dy=hy;
+      const ap=project(a.lon,a.lat),sx=ap[0],sy=ap[1],dx=hx,dy=hy;
       const dist=Math.hypot(dx-sx,dy-sy)||1;
-      const cxp=(sx+dx)/2-(dy-sy)*0.22,cyp=(sy+dy)/2+(dx-sx)*0.22-dist*0.08;
+      const cxp=(sx+dx)/2-(dy-sy)*0.22,cyp=Math.max(Math.min(sy,dy),(sy+dy)/2+(dx-sx)*0.22-dist*0.08);
       // 轨迹线：琥珀(源)→玫红(本站)渐变
       const alpha=Math.min(0.6,0.18+a.n*0.04);
       const grad=mapCtx.createLinearGradient(sx,sy,dx,dy);
-      grad.addColorStop(0,`rgba(251,191,36,${(alpha*0.65).toFixed(3)})`);
-      grad.addColorStop(1,`rgba(251,113,133,${alpha.toFixed(3)})`);
+      grad.addColorStop(0,`rgba(188,119,30,${(alpha*0.65).toFixed(3)})`);
+      grad.addColorStop(1,`rgba(209,76,107,${alpha.toFixed(3)})`);
       mapCtx.beginPath();mapCtx.moveTo(sx,sy);mapCtx.quadraticCurveTo(cxp,cyp,dx,dy);
       mapCtx.strokeStyle=grad;
       mapCtx.lineWidth=Math.min(2.6,0.8+Math.log2(1+a.n)*0.5);mapCtx.stroke();
@@ -187,69 +252,64 @@ function frame(now){
         const it=1-tt;
         const px=it*it*sx+2*it*tt*cxp+tt*tt*dx,py=it*it*sy+2*it*tt*cyp+tt*tt*dy;
         mapCtx.beginPath();mapCtx.arc(px,py,k===0?2.4:1.8*(1-k/10),0,Math.PI*2);
-        mapCtx.fillStyle=`rgba(254,205,211,${((1-k/9)*0.85).toFixed(3)})`;
-        if(k===0){mapCtx.shadowColor='#fb7185';mapCtx.shadowBlur=12;}
+        mapCtx.fillStyle=`rgba(209,76,107,${((1-k/9)*0.85).toFixed(3)})`;
+        if(k===0){mapCtx.shadowColor='#d14c6b';mapCtx.shadowBlur=12;}
         mapCtx.fill();mapCtx.shadowBlur=0;
       }
       // 源点：光晕 + 扩散环 + 核心
       const sr=(now%1800)/1800;
       mapCtx.beginPath();mapCtx.arc(sx,sy,2+sr*9,0,Math.PI*2);
-      mapCtx.strokeStyle=`rgba(251,191,36,${(0.45*(1-sr)).toFixed(3)})`;mapCtx.lineWidth=1;mapCtx.stroke();
-      mapCtx.beginPath();mapCtx.arc(sx,sy,4.5,0,Math.PI*2);mapCtx.fillStyle='rgba(251,191,36,.16)';mapCtx.fill();
-      mapCtx.beginPath();mapCtx.arc(sx,sy,2,0,Math.PI*2);mapCtx.fillStyle='#fbbf24';mapCtx.fill();
+      mapCtx.strokeStyle=`rgba(188,119,30,${(0.45*(1-sr)).toFixed(3)})`;mapCtx.lineWidth=1;mapCtx.stroke();
+      mapCtx.beginPath();mapCtx.arc(sx,sy,4.5,0,Math.PI*2);mapCtx.fillStyle='rgba(188,119,30,.16)';mapCtx.fill();
+      mapCtx.beginPath();mapCtx.arc(sx,sy,2,0,Math.PI*2);mapCtx.fillStyle='#bc771e';mapCtx.fill();
+    }
+    const labels=placeMapLabels(hx,hy);
+    for(const l of labels){
+      const tx=Math.max(l.x,Math.min(l.sx,l.x+l.w)),ty=Math.max(l.y,Math.min(l.sy,l.y+l.h));
+      if(Math.hypot(tx-l.sx,ty-l.sy)>18){
+        mapCtx.beginPath();mapCtx.moveTo(l.sx,l.sy);mapCtx.lineTo(tx,ty);
+        mapCtx.strokeStyle='rgba(188,119,30,.28)';mapCtx.lineWidth=0.8;mapCtx.stroke();
+      }
+      mapCtx.fillStyle='rgba(255,255,255,.92)';
+      mapCtx.beginPath();mapCtx.roundRect(l.x,l.y,l.w,l.h,4);mapCtx.fill();
+      mapCtx.fillStyle='#865411';mapCtx.fillText(l.txt,l.x+4,l.y+13);
     }
     // 拦截到达涟漪
     for(const rp of ripples){
       const p=(now-rp.born)/1500;
       mapCtx.beginPath();mapCtx.arc(hx,hy,7+p*32,0,Math.PI*2);
-      mapCtx.strokeStyle=`rgba(251,113,133,${(0.5*(1-p)).toFixed(3)})`;mapCtx.lineWidth=1.4;mapCtx.stroke();
+      mapCtx.strokeStyle=`rgba(209,76,107,${(0.5*(1-p)).toFixed(3)})`;mapCtx.lineWidth=1.4;mapCtx.stroke();
     }
     // 本站：双层脉冲 + 高亮核心 + 标签
     const pr=(now%2400)/2400;
     for(const off of [0,0.5]){
       const p=(pr+off)%1;
       mapCtx.beginPath();mapCtx.arc(hx,hy,6+p*26,0,Math.PI*2);
-      mapCtx.strokeStyle=`rgba(34,211,238,${(0.5*(1-p)).toFixed(3)})`;mapCtx.lineWidth=1.6;mapCtx.stroke();
+      mapCtx.strokeStyle=`rgba(22,137,158,${(0.5*(1-p)).toFixed(3)})`;mapCtx.lineWidth=1.6;mapCtx.stroke();
     }
-    mapCtx.beginPath();mapCtx.arc(hx,hy,9,0,Math.PI*2);mapCtx.fillStyle='rgba(34,211,238,.18)';mapCtx.fill();
+    mapCtx.beginPath();mapCtx.arc(hx,hy,9,0,Math.PI*2);mapCtx.fillStyle='rgba(22,137,158,.18)';mapCtx.fill();
     mapCtx.beginPath();mapCtx.arc(hx,hy,5,0,Math.PI*2);
-    mapCtx.fillStyle='#22d3ee';mapCtx.shadowColor='#22d3ee';mapCtx.shadowBlur=16;mapCtx.fill();mapCtx.shadowBlur=0;
+    mapCtx.fillStyle='#16899e';mapCtx.shadowColor='#16899e';mapCtx.shadowBlur=16;mapCtx.fill();mapCtx.shadowBlur=0;
     mapCtx.font='600 11px sans-serif';
-    mapCtx.fillStyle='rgba(7,11,22,.72)';
+    mapCtx.fillStyle='rgba(255,255,255,.92)';
     mapCtx.beginPath();mapCtx.roundRect(hx+8,hy-20,36,17,4);mapCtx.fill();
-    mapCtx.fillStyle='rgba(103,232,249,.95)';mapCtx.fillText('本站',hx+12,hy-8);
-    // 攻击源标签（带底板，防地图点阵干扰阅读；相邻标签自动下移避让）
-    mapCtx.font='600 10.5px sans-serif';
-    const placed=[];
-    arcs.slice(-8).forEach(a=>{
-      if(!a.label)return;
-      const txt=a.label+(a.n>1?' ×'+a.n:'');
-      const lx=a.x*boxW+8;
-      let ly=a.y*boxH-10;
-      const w=mapCtx.measureText(txt).width;
-      for(const p of placed){
-        if(Math.abs(p.ly-ly)<16&&Math.abs(p.lx-lx)<Math.max(p.w,w)+18)ly=p.ly+20;
-      }
-      placed.push({lx,ly,w});
-      mapCtx.fillStyle='rgba(7,11,22,.72)';
-      mapCtx.beginPath();mapCtx.roundRect(lx-4,ly-12,w+8,16,4);mapCtx.fill();
-      mapCtx.fillStyle='rgba(251,191,36,.95)';
-      mapCtx.fillText(txt,lx,ly);
-    });
+    mapCtx.fillStyle='#096c83';mapCtx.fillText('本站',hx+12,hy-8);
   }
   requestAnimationFrame(frame);
 }
-buildDots();
+buildMap();
 requestAnimationFrame(frame);
-window.addEventListener('resize', () => { [trendC, ipsC, geoC].forEach(c => c.resize()); buildDots(); });
+window.addEventListener('resize', () => { [ipsC, geoC].forEach(c => c.resize()); buildMap(); });
 
-setInterval(() => $('#clock').textContent = new Date().toLocaleString('zh-CN', {hour12: false}), 1000);
+function updateClock() { $('#clock').textContent = new Date().toLocaleString('zh-CN', {hour12: false}); }
+updateClock();
+setInterval(updateClock, 1000);
 
 async function j(p) { const r = await fetch(p); if (!r.ok) throw new Error(r.status); return r.json(); }
 
 async function refresh() {
   try {
-    const [st, trend, ips, geo, an] = await Promise.all([j('/api/stats'), j('/api/trend?hours=24'), j('/api/top/ips'), j('/api/top/countries'), j('/api/analytics?hours=24')]);
+    const [st, ips, geo, an] = await Promise.all([j('/api/stats'), j('/api/top/ips'), j('/api/top/countries'), j('/api/analytics?hours=24')]);
     $('#s-reqs').textContent = st.today_reqs.toLocaleString();
     $('#s-blocks').textContent = st.today_blocks.toLocaleString();
     $('#s-sites').textContent = st.sites_enabled;
@@ -257,26 +317,19 @@ async function refresh() {
     $('#m-blocked').textContent = ((an.totals && an.totals.blocked) || 0).toLocaleString();
     $('#m-srcs').textContent = an.arc_srcs || (an.arcs || []).length;
     if (!seeded) { seeded = true; (an.arcs || []).forEach(a => addArc(a.lon, a.lat, a.name || a.key, a.count, false)); }
-    trendC.setOption({
-      tooltip:{trigger:'axis',...tip}, legend:{data:['请求','拦截'],textStyle:{color:'#94a3b8'},icon:'roundRect',itemWidth:12,itemHeight:4},
-      grid:{left:55,right:20,top:30,bottom:22},
-      xAxis:{type:'category',boundaryGap:false,data:trend.map(p=>p.minute.slice(11)),...axis},
-      yAxis:{type:'value',...axis},
-      series:[
-        {name:'请求',type:'line',smooth:true,showSymbol:false,data:trend.map(p=>p.reqs),lineStyle:{width:2,color:'#38bdf8'},itemStyle:{color:'#38bdf8'},areaStyle:{color:area('56,189,248')}},
-        {name:'拦截',type:'line',smooth:true,showSymbol:false,data:trend.map(p=>p.blocks),lineStyle:{width:2,color:'#fb7185'},itemStyle:{color:'#fb7185'},areaStyle:{color:area('251,113,133')}}]
-    });
     ipsC.setOption({
+      title:emptyTitle(ips),
       tooltip:tip, grid:{left:10,right:30,top:10,bottom:10,containLabel:true},
-      xAxis:{type:'value',...axis},
-      yAxis:{type:'category',inverse:true,data:ips.map(k=>k.city?k.key+' '+k.city:k.key),...axis},
-      series:[{type:'bar',data:ips.map(k=>k.count),barMaxWidth:14,itemStyle:{borderRadius:[0,6,6,0],color:new echarts.graphic.LinearGradient(0,0,1,0,[{offset:0,color:'#fbbf2440'},{offset:1,color:'#fbbf24'}])}}]
+      xAxis:{type:'value',...axis,show:!!ips.length},
+      yAxis:{type:'category',inverse:true,data:ips.map(k=>k.city?k.key+' '+k.city:k.key),...axis,show:!!ips.length},
+      series:[{type:'bar',data:ips.map(k=>k.count),barMaxWidth:14,itemStyle:{borderRadius:[0,6,6,0],color:new echarts.graphic.LinearGradient(0,0,1,0,[{offset:0,color:'#bc771e40'},{offset:1,color:'#bc771e'}])}}]
     });
     geoC.setOption({
+      title:emptyTitle(geo),
       tooltip:{trigger:'item',...tip},
-      color:['#38bdf8','#6366f1','#a855f7','#fbbf24','#fb7185','#34d399','#22d3ee','#f472b6'],
-      series:[{type:'pie',radius:['42%','70%'],data:geo.map(k=>({name:k.key,value:k.count})),
-        label:{color:'#94a3b8',fontSize:11},itemStyle:{borderColor:'#070a12',borderWidth:2,borderRadius:5}}]
+      color:['#3b71df','#5364da','#805cca','#bc771e','#d14c6b','#168a70','#16899e','#bb5a9b'],
+      series:[{type:'pie',showEmptyCircle:false,radius:['42%','70%'],data:geo.map(k=>({name:k.key,value:k.count})),
+        label:{color:'#5d718d',fontSize:11},itemStyle:{borderColor:'#fff',borderWidth:2,borderRadius:5}}]
     });
   } catch (e) { console.warn(e); }
 }
@@ -297,6 +350,7 @@ es.onmessage = ev => {
   evCount++; $('#m-events').textContent = evCount;
   if (d.lat || d.lon) addArc(d.lon, d.lat, d.city || d.country || d.ip, 1, true);
   const feed = $('#feed');
+  $('#feed-empty')?.remove();
   feed.insertAdjacentHTML('afterbegin', `<div class="ev"><span class="t">${esc(d.ts)}</span>${tag(d.action)}<span class="ip">${esc(d.ip)}</span>${d.city ? ' · ' + esc(d.city) : (d.country ? ' · ' + esc(d.country) : '')} → ${esc(d.domain)}<span class="m">${esc(d.method)} ${esc(d.url)} · ${esc(d.msg)}</span></div>`);
   while (feed.children.length > 60) feed.lastChild.remove();
 };

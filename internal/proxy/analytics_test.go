@@ -3,6 +3,7 @@ package proxy
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -51,6 +52,43 @@ func kvFind(kvs []KV, key string) (int64, bool) {
 	return 0, false
 }
 
+func geoFind(kvs []GeoKV, key string) (GeoKV, bool) {
+	for _, kv := range kvs {
+		if kv.Key == key {
+			return kv, true
+		}
+	}
+	return GeoKV{}, false
+}
+
+type stubGeo struct{ info GeoCity }
+
+func (g stubGeo) CityInfo(string) GeoCity { return g.info }
+
+func TestAnalyticsUnresolvedAndUnlistedCountries(t *testing.T) {
+	a, _ := newTestAnalytics()
+	a.Record(ReqStat{IP: "10.0.0.8", Status: 200})
+	a.Record(ReqStat{IP: "192.0.2.8", Status: 403, Blocked: true})
+	a.geo = stubGeo{info: GeoCity{Country: "XK"}}
+	a.Record(ReqStat{IP: "203.0.113.8", Status: 200})
+
+	s := a.Snapshot(24)
+	if len(s.Countries) != 2 {
+		t.Fatalf("国家统计应包含未解析与字典外国家码: %+v", s.Countries)
+	}
+	unknown, ok := geoFind(s.Countries, "UNKNOWN")
+	if !ok || unknown.Name != "未知 / 内网" || unknown.Count != 2 || unknown.Blocked != 1 {
+		t.Fatalf("未解析流量统计错误: %+v", unknown)
+	}
+	unlisted, ok := geoFind(s.Countries, "XK")
+	if !ok || unlisted.Name != "XK" || unlisted.Count != 1 {
+		t.Fatalf("内置字典外国家码不应被丢弃: %+v", unlisted)
+	}
+	if len(s.Provinces) != 0 {
+		t.Fatalf("未解析与非中国 IP 不应进入省份榜: %+v", s.Provinces)
+	}
+}
+
 func TestAnalyticsRecordSnapshot(t *testing.T) {
 	a, _ := newTestAnalytics()
 	a.Record(ReqStat{IP: "1.2.3.4", Host: "a.com", Path: "/index", UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36", Status: 200})
@@ -85,6 +123,72 @@ func TestAnalyticsRecordSnapshot(t *testing.T) {
 	}
 }
 
+func TestAnalyticsTrafficRankings(t *testing.T) {
+	a, _ := newTestAnalytics()
+	for i := 0; i < 2; i++ {
+		a.Record(ReqStat{
+			IP: "1.2.3.4", Host: "a.com", Page: "https://a.com/login",
+			Referer: "b.com", RefererPage: "https://b.com/from", Status: 200,
+		})
+	}
+	a.Record(ReqStat{IP: "5.6.7.8", Page: "https://a.com/", Referer: "c.com", RefererPage: "https://c.com/", Status: 200})
+
+	s := a.Snapshot(24)
+	if v, _ := kvFind(s.Referer, "b.com"); v != 2 {
+		t.Fatalf("referer b.com = %d, want 2", v)
+	}
+	if v, _ := kvFind(s.RefererPage, "https://b.com/from"); v != 2 {
+		t.Fatalf("referer page = %d, want 2", v)
+	}
+	if v, _ := kvFind(s.Page, "https://a.com/login"); v != 2 {
+		t.Fatalf("visited page = %d, want 2", v)
+	}
+}
+
+func TestAnalyticsTrafficRankLimit(t *testing.T) {
+	a, _ := newTestAnalytics()
+	for i := 0; i < trafficTopN+10; i++ {
+		page := "https://a.com/" + itoa(i)
+		a.Record(ReqStat{IP: "1.2.3.4", Page: page, RefererPage: page, Status: 200})
+	}
+	s := a.Snapshot(24)
+	if len(s.Page) != trafficTopN || len(s.RefererPage) != trafficTopN {
+		t.Fatalf("traffic rank sizes = %d/%d, want %d", len(s.Page), len(s.RefererPage), trafficTopN)
+	}
+}
+
+func TestExternalReferer(t *testing.T) {
+	tests := []struct {
+		referer, self, host, page string
+	}{
+		{"https://stackblitz.com/", "a.com", "stackblitz.com", "https://stackblitz.com/"},
+		{"https://cn.bing.com/search?q=secret#result", "a.com", "cn.bing.com", "https://cn.bing.com/search"},
+		{"https://B.com:8443/a%2Fb?token=secret", "a.com", "b.com", "https://b.com:8443/a%2Fb"},
+		{"https://a.com:8443/internal", "a.com", "", ""},
+		{"javascript://a.com/alert", "b.com", "", ""},
+		{"not a url", "a.com", "", ""},
+		{"", "a.com", "", ""},
+	}
+	for _, tt := range tests {
+		host, page := externalReferer(tt.referer, tt.self)
+		if host != tt.host || page != tt.page {
+			t.Errorf("externalReferer(%q) = %q/%q, want %q/%q", tt.referer, host, page, tt.host, tt.page)
+		}
+	}
+}
+
+func TestVisitedPage(t *testing.T) {
+	if got := visitedPage(true, "a.com", "/login"); got != "https://a.com/login" {
+		t.Fatalf("secure visited page = %q", got)
+	}
+	if got := visitedPage(false, "a.com", ""); got != "http://a.com/" {
+		t.Fatalf("empty visited path = %q", got)
+	}
+	if got := visitedPage(true, "", "/"); got != "" {
+		t.Fatalf("empty visited host = %q", got)
+	}
+}
+
 func TestAnalyticsEventAggregation(t *testing.T) {
 	a, _ := newTestAnalytics()
 	a.Event(EvStat{IP: "9.9.9.9", Action: "waf", RuleID: 942100, Msg: "SQL Injection Detected", Status: 403, Country: "US", City: "Ashburn", Lat: 39.04, Lon: -77.49, URL: "/login?id=1' OR '1'='1", Domain: "a.com"})
@@ -111,8 +215,13 @@ func TestAnalyticsEventAggregation(t *testing.T) {
 	if v, _ := kvFind(s.AttackIPs, "9.9.9.9"); v != 2 {
 		t.Fatalf("attack ip = %d", v)
 	}
-	if v, _ := kvFind(s.AttackPaths, "/login?id=1' OR '1'='1"); v != 1 {
+	if v, _ := kvFind(s.AttackPaths, "/login"); v != 1 {
 		t.Fatalf("attack path = %d", v)
+	}
+	for _, path := range s.AttackPaths {
+		if strings.Contains(path.Key, "?") {
+			t.Fatalf("攻击路径统计保留了查询串: %q", path.Key)
+		}
 	}
 	if v, _ := kvFind(s.AttackHosts, "a.com"); v != 3 {
 		t.Fatalf("attack host = %d", v)
@@ -178,7 +287,7 @@ func TestAnalyticsBucketRotationPersist(t *testing.T) {
 func TestAnalyticsCurrentHourRestore(t *testing.T) {
 	st := newFakeAnaStore()
 	a := NewAnalytics(st, nil)
-	a.Record(ReqStat{IP: "1.1.1.1", Status: 200})
+	a.Record(ReqStat{IP: "1.1.1.1", Page: "https://a.com/login", RefererPage: "https://b.com/from", Status: 200})
 	a.Record(ReqStat{IP: "2.2.2.2", Status: 403, Blocked: true})
 	a.Event(EvStat{IP: "8.8.8.8", Action: "waf", RuleID: 942100, Status: 403, Country: "US", City: "Mountain View", Lat: 37.4, Lon: -122.1, URL: "/?id=1", Domain: "bench.local"})
 	a.Persist()
@@ -205,7 +314,7 @@ func TestAnalyticsCurrentHourRestore(t *testing.T) {
 		t.Fatalf("重启后 UV = %d, want 2", s.Totals.UV)
 	}
 	// 恢复后的活桶继续写入（nil map 不应 panic），再次落盘+重启数据仍不丢
-	a2.Record(ReqStat{IP: "3.3.3.3", Status: 200})
+	a2.Record(ReqStat{IP: "3.3.3.3", Page: "https://a.com/login", RefererPage: "https://b.com/from", Status: 200})
 	a2.Event(EvStat{IP: "9.9.9.9", Action: "cc", Status: 429})
 	a2.Persist()
 	if got := a2.Snapshot(24).Totals; got.Req != 3 || got.UV != 3 {
@@ -217,6 +326,13 @@ func TestAnalyticsCurrentHourRestore(t *testing.T) {
 	}
 	if len(a3.Snapshot(24).Arcs) != 1 {
 		t.Fatal("二次重启后攻击轨迹丢失")
+	}
+	s3 := a3.Snapshot(24)
+	if v, _ := kvFind(s3.Page, "https://a.com/login"); v != 2 {
+		t.Fatalf("二次重启后受访页面统计 = %d, want 2", v)
+	}
+	if v, _ := kvFind(s3.RefererPage, "https://b.com/from"); v != 2 {
+		t.Fatalf("二次重启后来源页面统计 = %d, want 2", v)
 	}
 }
 

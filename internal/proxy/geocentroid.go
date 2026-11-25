@@ -35,6 +35,7 @@ var countryNames = map[string]string{
 	"IE": "爱尔兰", "PT": "葡萄牙", "GR": "希腊", "HU": "匈牙利", "LV": "拉脱维亚", "EE": "爱沙尼亚",
 	"RS": "塞尔维亚", "IL": "以色列", "PK": "巴基斯坦", "BD": "孟加拉国", "NZ": "新西兰",
 	"HK": "中国香港", "MO": "中国澳门", "TW": "中国台湾",
+	"UNKNOWN": "未知 / 内网",
 }
 
 func countryName(code string) string {

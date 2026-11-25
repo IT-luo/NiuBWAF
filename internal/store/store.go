@@ -10,12 +10,21 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "modernc.org/sqlite"
+)
+
+const (
+	attackLogQueueSize  = 8192
+	attackLogFlushBatch = 4096
+	auditLogLimit       = 10000
+	auditPruneInterval  = 100
 )
 
 type Store struct {
@@ -27,9 +36,11 @@ type Store struct {
 	tMu     sync.Mutex
 	traffic map[trafficKey]trafficVal
 
-	logCh  chan *AttackLog
-	stopCh chan struct{}
-	doneCh chan struct{}
+	logCh             chan *AttackLog
+	droppedAttackLogs atomic.Uint64
+	auditInserts      atomic.Uint64
+	stopCh            chan struct{}
+	doneCh            chan struct{}
 }
 
 type trafficKey struct {
@@ -49,7 +60,7 @@ type Site struct {
 	Enabled      bool   `json:"enabled"`
 	WAFMode      string `json:"waf_mode"`
 	AuthUser     string `json:"auth_user"`
-	AuthPass     string `json:"auth_pass"`
+	AuthPass     string `json:"-"`
 	CCRate       int    `json:"cc_rate"`
 	CCBurst      int    `json:"cc_burst"`
 	Captcha      bool   `json:"captcha"`
@@ -57,28 +68,36 @@ type Site struct {
 	DynamicMode  string `json:"dynamic_mode"`
 	BotMode      string `json:"bot_mode"`
 	BotStrict    bool   `json:"bot_strict"`
-	CertPEM      string `json:"cert_pem"`
-	KeyPEM       string `json:"key_pem"`
+	CertPEM      string `json:"-"`
+	KeyPEM       string `json:"-"`
 	HTTPRedirect bool   `json:"http_redirect"`
 	CreatedAt    string `json:"created_at"`
 }
 
 type AttackLog struct {
-	ID       int64  `json:"id"`
-	Ts       string `json:"ts"`
-	SiteID   int64  `json:"site_id"`
-	Domain   string `json:"domain"`
-	ClientIP string `json:"client_ip"`
-	Country  string `json:"country"`
-	City     string `json:"city"`
-	Method   string `json:"method"`
-	URL      string `json:"url"`
-	Action   string `json:"action"`
-	RuleID   int    `json:"rule_id"`
-	Msg      string `json:"msg"`
-	Severity string `json:"severity"`
-	Status   int    `json:"status"`
-	ReqID    string `json:"req_id"`
+	ID            int64  `json:"id"`
+	Ts            string `json:"ts"`
+	SiteID        int64  `json:"site_id"`
+	Domain        string `json:"domain"`
+	ClientIP      string `json:"client_ip"`
+	Country       string `json:"country"`
+	City          string `json:"city"`
+	Method        string `json:"method"`
+	URL           string `json:"url"`
+	QueryRedacted bool   `json:"query_redacted,omitempty"`
+	Action        string `json:"action"`
+	RuleID        int    `json:"rule_id"`
+	Msg           string `json:"msg"`
+	Severity      string `json:"severity"`
+	Status        int    `json:"status"`
+	ReqID         string `json:"req_id"`
+}
+
+// RedactQuery removes URL query data from a log before it is displayed or exported.
+func (l *AttackLog) RedactQuery() {
+	if path, _, hasQuery := strings.Cut(l.URL, "?"); hasQuery {
+		l.URL, l.QueryRedacted = path, true
+	}
 }
 
 type IPEntry struct {
@@ -135,6 +154,7 @@ type CustomRule struct {
 	Conditions  string `json:"conditions"`
 	Action      string `json:"action"`
 	ActionParam string `json:"action_param"`
+	Shadow      bool   `json:"shadow"`
 	Note        string `json:"note"`
 	CreatedAt   string `json:"created_at"`
 }
@@ -153,7 +173,7 @@ func Open(path string) (*Store, error) {
 		DB:       db,
 		settings: map[string]string{},
 		traffic:  map[trafficKey]trafficVal{},
-		logCh:    make(chan *AttackLog, 8192),
+		logCh:    make(chan *AttackLog, attackLogQueueSize),
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
@@ -167,6 +187,7 @@ func Open(path string) (*Store, error) {
 		rows.Close()
 	}
 	if err := s.migrate(); err != nil {
+		db.Close()
 		return nil, err
 	}
 	go s.flushLoop()
@@ -198,8 +219,8 @@ func (s *Store) flush() {
 			log.Printf("统计落盘失败，丢弃 %d 条聚合: %v", len(pending), err)
 		}
 	}
-	var batch []*AttackLog
-	for len(batch) < 1000 {
+	batch := make([]*AttackLog, 0, attackLogFlushBatch)
+	for len(batch) < attackLogFlushBatch {
 		select {
 		case l := <-s.logCh:
 			batch = append(batch, l)
@@ -248,14 +269,14 @@ func (s *Store) flushLogs(batch []*AttackLog) error {
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare(`INSERT INTO attack_logs(site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id)
-		VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
+	stmt, err := tx.Prepare(`INSERT INTO attack_logs(site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id,query_redacted)
+		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
 	}
 	for _, l := range batch {
-		if _, err := stmt.Exec(l.SiteID, l.Domain, l.ClientIP, l.Country, l.Method, l.URL, l.Action, l.RuleID, l.Msg, l.Severity, l.Status, l.ReqID); err != nil {
+		if _, err := stmt.Exec(l.SiteID, l.Domain, l.ClientIP, l.Country, l.Method, l.URL, l.Action, l.RuleID, l.Msg, l.Severity, l.Status, l.ReqID, l.QueryRedacted); err != nil {
 			stmt.Close()
 			tx.Rollback()
 			return err
@@ -298,12 +319,27 @@ func (s *Store) migrate() error {
 			http_redirect INTEGER DEFAULT 0,
 			created_at TEXT DEFAULT (datetime('now','localtime'))
 		)`,
+		`CREATE TABLE IF NOT EXISTS site_api_policies (
+			site_id INTEGER PRIMARY KEY,
+			mode TEXT NOT NULL CHECK(mode IN ('off','observe','block')),
+			prefix TEXT NOT NULL,
+			document TEXT NOT NULL
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS delete_site_api_policy AFTER DELETE ON sites
+			BEGIN DELETE FROM site_api_policies WHERE site_id=OLD.id; END`,
+		`CREATE TABLE IF NOT EXISTS site_upload_policies (
+			site_id INTEGER PRIMARY KEY,
+			policies TEXT NOT NULL
+		)`,
+		`CREATE TRIGGER IF NOT EXISTS delete_site_upload_policies AFTER DELETE ON sites
+			BEGIN DELETE FROM site_upload_policies WHERE site_id=OLD.id; END`,
 		`CREATE TABLE IF NOT EXISTS attack_logs(
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ts TEXT DEFAULT (datetime('now','localtime')),
 			site_id INTEGER, domain TEXT, client_ip TEXT, country TEXT,
 			method TEXT, url TEXT, action TEXT, rule_id INTEGER,
-			msg TEXT, severity TEXT, status INTEGER, req_id TEXT
+			msg TEXT, severity TEXT, status INTEGER, req_id TEXT,
+			query_redacted INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_ts ON attack_logs(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_ip ON attack_logs(client_ip)`,
@@ -319,6 +355,13 @@ func (s *Store) migrate() error {
 			UNIQUE(kind, ip)
 		)`,
 		`CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)`,
+		`CREATE TABLE IF NOT EXISTS console_accounts(
+			username TEXT PRIMARY KEY,
+			role TEXT NOT NULL CHECK(role IN ('admin','operator','viewer')),
+			password_hash TEXT NOT NULL,
+			enabled INTEGER NOT NULL,
+			must_change INTEGER NOT NULL
+		)`,
 		`CREATE TABLE IF NOT EXISTS audit_logs(
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ts TEXT DEFAULT (datetime('now','localtime')),
@@ -358,6 +401,7 @@ func (s *Store) migrate() error {
 			conditions TEXT DEFAULT '[]',
 			action TEXT NOT NULL,
 			action_param TEXT DEFAULT '',
+			shadow INTEGER DEFAULT 0,
 			note TEXT DEFAULT '',
 			created_at TEXT DEFAULT (datetime('now','localtime'))
 		)`,
@@ -374,15 +418,45 @@ func (s *Store) migrate() error {
 	for _, col := range []string{"cert_pem TEXT DEFAULT ''", "key_pem TEXT DEFAULT ''", "http_redirect INTEGER DEFAULT 0", "dynamic_mode TEXT DEFAULT 'off'", "bot_mode TEXT DEFAULT 'off'", "bot_strict INTEGER DEFAULT 0"} {
 		s.DB.Exec("ALTER TABLE sites ADD COLUMN " + col)
 	}
-	if s.GetSetting("admin_pass") == "" {
-		s.SetSetting("admin_pass", HashPass("admin123"))
+	// 老库幂等补齐影子运行开关；已存在时 SQLite 返回 duplicate column，可安全忽略。
+	s.DB.Exec(`ALTER TABLE custom_rules ADD COLUMN shadow INTEGER DEFAULT 0`)
+	if _, err := s.DB.Exec(`ALTER TABLE attack_logs ADD COLUMN query_redacted INTEGER NOT NULL DEFAULT 0`); err != nil &&
+		!strings.Contains(err.Error(), "duplicate column name: query_redacted") {
+		return fmt.Errorf("迁移攻击日志脱敏字段: %w", err)
 	}
-	// 首次部署或仍在使用默认口令时强制改密；已改过口令的存量库不再强制
-	if s.GetSetting("must_change_pass") == "" {
-		if ok, _ := VerifyPass("admin123", s.GetSetting("admin_pass")); ok {
-			s.SetSetting("must_change_pass", "on")
+	adminHash := s.GetSetting("admin_pass")
+	legacyDefault := false
+	if adminHash != "" {
+		legacyDefault, _ = VerifyPass("admin123", adminHash)
+	}
+	if adminHash == "" || legacyDefault {
+		initialPasswordToLog := ""
+		initialPassword, fromEnv := os.LookupEnv("NIUBWAF_ADMIN_PASSWORD")
+		if fromEnv {
+			if len(initialPassword) < 8 ||
+				!strings.ContainsAny(initialPassword, "0123456789") ||
+				!strings.ContainsAny(initialPassword, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
+				return fmt.Errorf("NIUBWAF_ADMIN_PASSWORD 强度不足：密码必须至少 8 位且同时包含字母和数字")
+			}
+			if initialPassword == "admin123" {
+				return fmt.Errorf("NIUBWAF_ADMIN_PASSWORD 不能使用默认密码 admin123")
+			}
 		} else {
-			s.SetSetting("must_change_pass", "off")
+			initialPassword = RandToken()
+			initialPasswordToLog = initialPassword
+		}
+		if err := s.SetSetting("admin_pass", HashPass(initialPassword)); err != nil {
+			return fmt.Errorf("初始化管理密码: %w", err)
+		}
+		if err := s.SetSetting("must_change_pass", "on"); err != nil {
+			return fmt.Errorf("初始化强制改密设置: %w", err)
+		}
+		if initialPasswordToLog != "" {
+			log.Printf("初始管理员密码: %s（仅首次初始化显示，请立即修改）", initialPasswordToLog)
+		}
+	} else if s.GetSetting("must_change_pass") == "" {
+		if err := s.SetSetting("must_change_pass", "off"); err != nil {
+			return fmt.Errorf("迁移强制改密设置: %w", err)
 		}
 	}
 	s.migrateAuthPass()
@@ -508,14 +582,33 @@ func (s *Store) GetSetting(key string) string {
 }
 
 func (s *Store) SetSetting(key, val string) error {
-	_, err := s.DB.Exec(`INSERT INTO settings(key,value) VALUES(?,?)
-		ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, val)
-	if err == nil {
-		s.setMu.Lock()
-		s.settings[key] = val
-		s.setMu.Unlock()
+	return s.SetSettings(map[string]string{key: val})
+}
+
+func (s *Store) SetSettings(values map[string]string) error {
+	if len(values) == 0 {
+		return nil
 	}
-	return err
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for key, value := range values {
+		if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES(?,?)
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value); err != nil {
+			return err
+		}
+	}
+	s.setMu.Lock()
+	defer s.setMu.Unlock()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for key, value := range values {
+		s.settings[key] = value
+	}
+	return nil
 }
 
 func (s *Store) ListSites() ([]Site, error) {
@@ -556,10 +649,16 @@ func (s *Store) CreateSite(t *Site) error {
 	return nil
 }
 
-func (s *Store) UpdateSite(t *Site) error {
-	_, err := s.DB.Exec(`UPDATE sites SET name=?,domain=?,upstream=?,enabled=?,waf_mode=?,auth_user=?,auth_pass=?,cc_rate=?,cc_burst=?,captcha=?,resp_detect=?,dynamic_mode=?,bot_mode=?,bot_strict=?,cert_pem=?,key_pem=?,http_redirect=? WHERE id=?`,
-		t.Name, t.Domain, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst, t.Captcha, t.RespDetect, t.DynamicMode, t.BotMode, t.BotStrict, t.CertPEM, t.KeyPEM, t.HTTPRedirect, t.ID)
-	return err
+func (s *Store) UpdateSite(t *Site, replaceTLS bool) (tlsConfigured bool, err error) {
+	err = s.DB.QueryRow(`UPDATE sites SET name=?,domain=?,upstream=?,enabled=?,waf_mode=?,auth_user=?,
+		auth_pass=COALESCE(NULLIF(?, ''), auth_pass),cc_rate=?,cc_burst=?,captcha=?,resp_detect=?,
+		dynamic_mode=?,bot_mode=?,bot_strict=?,cert_pem=CASE WHEN ? THEN ? ELSE cert_pem END,
+		key_pem=CASE WHEN ? THEN ? ELSE key_pem END,http_redirect=? WHERE id=?
+		RETURNING cert_pem <> '' AND key_pem <> ''`,
+		t.Name, t.Domain, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst,
+		t.Captcha, t.RespDetect, t.DynamicMode, t.BotMode, t.BotStrict, replaceTLS, t.CertPEM, replaceTLS,
+		t.KeyPEM, t.HTTPRedirect, t.ID).Scan(&tlsConfigured)
+	return tlsConfigured, err
 }
 
 func (s *Store) DeleteSite(id int64) error {
@@ -568,9 +667,15 @@ func (s *Store) DeleteSite(id int64) error {
 }
 
 func (s *Store) LogAttack(l *AttackLog) error {
+	entry := *l
+	entry.RedactQuery()
 	select {
-	case s.logCh <- l:
+	case s.logCh <- &entry:
 	default:
+		dropped := s.droppedAttackLogs.Add(1)
+		if dropped == 1 || dropped%1000 == 0 {
+			log.Printf("攻击日志队列已满，累计丢弃 %d 条攻击日志", dropped)
+		}
 	}
 	return nil
 }
@@ -620,7 +725,7 @@ func (s *Store) QueryLogs(ip, domain, action string, limit, offset int) ([]Attac
 	where, args := logWhere(ip, domain, action)
 	var total int
 	s.DB.QueryRow(`SELECT COUNT(*) FROM attack_logs`+where, args...).Scan(&total)
-	rows, err := s.DB.Query(`SELECT id,ts,site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id
+	rows, err := s.DB.Query(`SELECT id,ts,site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id,query_redacted
 		FROM attack_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
 		return nil, 0, err
@@ -629,9 +734,10 @@ func (s *Store) QueryLogs(ip, domain, action string, limit, offset int) ([]Attac
 	out := []AttackLog{}
 	for rows.Next() {
 		var l AttackLog
-		if err := rows.Scan(&l.ID, &l.Ts, &l.SiteID, &l.Domain, &l.ClientIP, &l.Country, &l.Method, &l.URL, &l.Action, &l.RuleID, &l.Msg, &l.Severity, &l.Status, &l.ReqID); err != nil {
+		if err := rows.Scan(&l.ID, &l.Ts, &l.SiteID, &l.Domain, &l.ClientIP, &l.Country, &l.Method, &l.URL, &l.Action, &l.RuleID, &l.Msg, &l.Severity, &l.Status, &l.ReqID, &l.QueryRedacted); err != nil {
 			return nil, 0, err
 		}
+		l.RedactQuery()
 		out = append(out, l)
 	}
 	return out, total, nil
@@ -640,7 +746,7 @@ func (s *Store) QueryLogs(ip, domain, action string, limit, offset int) ([]Attac
 // EachLog 流式遍历攻击日志（不在内存累积），供 CSV 导出等大批量场景使用
 func (s *Store) EachLog(ip, domain, action string, fn func(*AttackLog) error) error {
 	where, args := logWhere(ip, domain, action)
-	rows, err := s.DB.Query(`SELECT id,ts,site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id
+	rows, err := s.DB.Query(`SELECT id,ts,site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id,query_redacted
 		FROM attack_logs`+where+` ORDER BY id DESC`, args...)
 	if err != nil {
 		return err
@@ -648,9 +754,10 @@ func (s *Store) EachLog(ip, domain, action string, fn func(*AttackLog) error) er
 	defer rows.Close()
 	for rows.Next() {
 		var l AttackLog
-		if err := rows.Scan(&l.ID, &l.Ts, &l.SiteID, &l.Domain, &l.ClientIP, &l.Country, &l.Method, &l.URL, &l.Action, &l.RuleID, &l.Msg, &l.Severity, &l.Status, &l.ReqID); err != nil {
+		if err := rows.Scan(&l.ID, &l.Ts, &l.SiteID, &l.Domain, &l.ClientIP, &l.Country, &l.Method, &l.URL, &l.Action, &l.RuleID, &l.Msg, &l.Severity, &l.Status, &l.ReqID, &l.QueryRedacted); err != nil {
 			return err
 		}
+		l.RedactQuery()
 		if err := fn(&l); err != nil {
 			return err
 		}
@@ -810,7 +917,22 @@ func (s *Store) IPAttackCount(ip string) int {
 }
 
 func (s *Store) Audit(user, action, detail string) {
-	s.DB.Exec(`INSERT INTO audit_logs(user,action,detail) VALUES(?,?,?)`, user, action, detail)
+	if _, err := s.DB.Exec(`INSERT INTO audit_logs(user,action,detail) VALUES(?,?,?)`, user, action, detail); err != nil {
+		return
+	}
+	if s.auditInserts.Add(1)%auditPruneInterval == 0 {
+		if err := s.pruneAuditLogs(); err != nil {
+			log.Printf("审计日志清理失败: %v", err)
+		}
+	}
+}
+
+// pruneAuditLogs 保留 id 最大的 auditLogLimit 条审计日志。
+func (s *Store) pruneAuditLogs() error {
+	_, err := s.DB.Exec(`DELETE FROM audit_logs WHERE id < (
+		SELECT id FROM audit_logs ORDER BY id DESC LIMIT 1 OFFSET ?
+	)`, auditLogLimit-1)
+	return err
 }
 
 func (s *Store) ListAudit(limit int) ([]AuditLog, error) {
@@ -897,10 +1019,11 @@ func (s *Store) Trend(hours int) ([]TrendPoint, error) {
 }
 
 type Stats struct {
-	TodayReqs   int64 `json:"today_reqs"`
-	TodayBlocks int64 `json:"today_blocks"`
-	TotalReqs   int64 `json:"total_reqs"`
-	TotalBlocks int64 `json:"total_blocks"`
+	TodayReqs         int64  `json:"today_reqs"`
+	TodayBlocks       int64  `json:"today_blocks"`
+	TotalReqs         int64  `json:"total_reqs"`
+	TotalBlocks       int64  `json:"total_blocks"`
+	DroppedAttackLogs uint64 `json:"dropped_attack_logs"`
 }
 
 func (s *Store) Stats() Stats {
@@ -918,6 +1041,7 @@ func (s *Store) Stats() Stats {
 		}
 	}
 	s.tMu.Unlock()
+	st.DroppedAttackLogs = s.droppedAttackLogs.Load()
 	return st
 }
 
@@ -999,7 +1123,7 @@ func (s *Store) DeleteExclusion(id int64) error {
 }
 
 func (s *Store) ListRules() ([]CustomRule, error) {
-	rows, err := s.DB.Query(`SELECT id,site_id,name,enabled,priority,logic,conditions,action,action_param,note,created_at
+	rows, err := s.DB.Query(`SELECT id,site_id,name,enabled,priority,logic,conditions,action,action_param,shadow,note,created_at
 		FROM custom_rules ORDER BY priority, id`)
 	if err != nil {
 		return nil, err
@@ -1008,7 +1132,7 @@ func (s *Store) ListRules() ([]CustomRule, error) {
 	out := []CustomRule{}
 	for rows.Next() {
 		var r CustomRule
-		if err := rows.Scan(&r.ID, &r.SiteID, &r.Name, &r.Enabled, &r.Priority, &r.Logic, &r.Conditions, &r.Action, &r.ActionParam, &r.Note, &r.CreatedAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.SiteID, &r.Name, &r.Enabled, &r.Priority, &r.Logic, &r.Conditions, &r.Action, &r.ActionParam, &r.Shadow, &r.Note, &r.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -1017,9 +1141,9 @@ func (s *Store) ListRules() ([]CustomRule, error) {
 }
 
 func (s *Store) CreateRule(r *CustomRule) error {
-	res, err := s.DB.Exec(`INSERT INTO custom_rules(site_id,name,enabled,priority,logic,conditions,action,action_param,note)
-		VALUES(?,?,?,?,?,?,?,?,?)`,
-		r.SiteID, r.Name, r.Enabled, r.Priority, r.Logic, r.Conditions, r.Action, r.ActionParam, r.Note)
+	res, err := s.DB.Exec(`INSERT INTO custom_rules(site_id,name,enabled,priority,logic,conditions,action,action_param,shadow,note)
+		VALUES(?,?,?,?,?,?,?,?,?,?)`,
+		r.SiteID, r.Name, r.Enabled, r.Priority, r.Logic, r.Conditions, r.Action, r.ActionParam, r.Shadow, r.Note)
 	if err != nil {
 		return err
 	}
@@ -1028,8 +1152,8 @@ func (s *Store) CreateRule(r *CustomRule) error {
 }
 
 func (s *Store) UpdateRule(r *CustomRule) error {
-	_, err := s.DB.Exec(`UPDATE custom_rules SET site_id=?,name=?,enabled=?,priority=?,logic=?,conditions=?,action=?,action_param=?,note=? WHERE id=?`,
-		r.SiteID, r.Name, r.Enabled, r.Priority, r.Logic, r.Conditions, r.Action, r.ActionParam, r.Note, r.ID)
+	_, err := s.DB.Exec(`UPDATE custom_rules SET site_id=?,name=?,enabled=?,priority=?,logic=?,conditions=?,action=?,action_param=?,shadow=?,note=? WHERE id=?`,
+		r.SiteID, r.Name, r.Enabled, r.Priority, r.Logic, r.Conditions, r.Action, r.ActionParam, r.Shadow, r.Note, r.ID)
 	return err
 }
 

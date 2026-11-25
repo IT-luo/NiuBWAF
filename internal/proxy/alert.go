@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -59,7 +61,59 @@ func (p *Proxy) dispatchAlert(msg string, count, window, threshold int) {
 	}
 }
 
+// Notify 实现巡检通知接口。只要一个通道接收成功就视为已送达；部分通道失败
+// 不返回错误，避免 monitor 重试时向已成功的通道重复推送。
+func (p *Proxy) Notify(ctx context.Context, event, message string, fields map[string]any) (delivered bool, err error) {
+	if p.Store.GetSetting("alert_enabled") != "on" {
+		return false, nil
+	}
+
+	webhook := make(map[string]any, len(fields)+3)
+	for key, value := range fields {
+		webhook[key] = value
+	}
+	// 保留通知自身的语义，调用方 fields 不能覆盖这些固定字段。
+	webhook["event"] = event
+	webhook["message"] = message
+	webhook["ts"] = nowStr()
+	text := map[string]any{"msgtype": "text", "text": map[string]string{"content": message}}
+
+	channels := []struct {
+		name    string
+		url     string
+		payload any
+	}{
+		{name: "webhook", url: strings.TrimSpace(p.Store.GetSetting("alert_webhook")), payload: webhook},
+		{name: "dingtalk", url: strings.TrimSpace(p.Store.GetSetting("alert_dingtalk")), payload: text},
+		{name: "wecom", url: strings.TrimSpace(p.Store.GetSetting("alert_wecom")), payload: text},
+	}
+	configured := 0
+	var failures []error
+	for _, channel := range channels {
+		if channel.url == "" {
+			continue
+		}
+		configured++
+		if err := p.postJSONContext(ctx, channel.url, channel.payload); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", channel.name, err))
+			continue
+		}
+		delivered = true
+	}
+	if configured == 0 {
+		return false, nil
+	}
+	if delivered {
+		return true, nil
+	}
+	return false, errors.Join(failures...)
+}
+
 func (p *Proxy) postJSON(rawURL string, payload any) error {
+	return p.postJSONContext(context.Background(), rawURL, payload)
+}
+
+func (p *Proxy) postJSONContext(ctx context.Context, rawURL string, payload any) error {
 	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
 		return fmt.Errorf("告警地址必须以 http(s):// 开头")
 	}
@@ -67,9 +121,18 @@ func (p *Proxy) postJSON(rawURL string, payload any) error {
 	if err != nil {
 		return err
 	}
-	resp, err := alertClient.Post(rawURL, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return errors.New("告警地址无效")
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := alertClient.Do(req)
+	if err != nil {
+		// http.Client errors can include the full URL and its access token.
+		if errors.Is(err, context.DeadlineExceeded) {
+			return errors.New("告警请求超时")
+		}
+		return errors.New("告警请求失败，请检查连接和证书")
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {

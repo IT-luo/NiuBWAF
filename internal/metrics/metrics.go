@@ -159,23 +159,31 @@ type UpstreamSample struct {
 
 // Registry 指标注册表。
 type Registry struct {
-	requests  counterVec
-	attacks   counterVec
-	respBytes uint64
-	duration  histogram
-	upstreams gaugeVec
-	repBanned int64
-	start     time.Time
+	requests         counterVec
+	attacks          counterVec
+	rateLimited      counterVec
+	overloadRejected counterVec
+	upstreamWait     histogram
+	upstreamWaiting  atomic.Int64
+	upstreamTimeouts atomic.Uint64
+	respBytes        uint64
+	duration         histogram
+	upstreams        gaugeVec
+	repBanned        int64
+	start            time.Time
 }
 
 // New 创建空注册表。
 func New() *Registry {
 	return &Registry{
-		requests:  counterVec{help: "按站点与结果统计的代理请求总数", names: []string{"site", "result"}, series: map[string]*sample{}},
-		attacks:   counterVec{help: "按处置动作统计的攻击命中总数", names: []string{"action"}, series: map[string]*sample{}},
-		duration:  histogram{help: "代理请求处理时延（秒）", buckets: durationBuckets, counts: make([]uint64, len(durationBuckets))},
-		upstreams: gaugeVec{help: "上游健康状态（1=健康 0=故障）", names: []string{"site", "url"}, series: map[string]*int64{}, labels: map[string]string{}},
-		start:     time.Now(),
+		requests:         counterVec{help: "按站点与结果统计的代理请求总数", names: []string{"site", "result"}, series: map[string]*sample{}},
+		attacks:          counterVec{help: "按处置动作统计的攻击命中总数", names: []string{"action"}, series: map[string]*sample{}},
+		rateLimited:      counterVec{help: "按策略范围统计的限流请求总数", names: []string{"scope"}, series: map[string]*sample{}},
+		overloadRejected: counterVec{help: "按原因统计的上游过载拒绝总数", names: []string{"reason"}, series: map[string]*sample{}},
+		duration:         histogram{help: "代理请求处理时延（秒）", buckets: durationBuckets, counts: make([]uint64, len(durationBuckets))},
+		upstreamWait:     histogram{help: "进入上游请求名额队列后的等待时长（秒）", buckets: durationBuckets, counts: make([]uint64, len(durationBuckets))},
+		upstreams:        gaugeVec{help: "上游健康状态（1=健康 0=故障）", names: []string{"site", "url"}, series: map[string]*int64{}, labels: map[string]string{}},
+		start:            time.Now(),
 	}
 }
 
@@ -184,6 +192,19 @@ func (r *Registry) IncRequest(site, result string) { r.requests.inc(site, result
 
 // IncAttack 记录一次攻击命中。
 func (r *Registry) IncAttack(action string) { r.attacks.inc(action) }
+
+func (r *Registry) IncRateLimited(scope string) { r.rateLimited.inc(scope) }
+
+func (r *Registry) IncOverloadRejected(reason string) { r.overloadRejected.inc(reason) }
+
+func (r *Registry) IncUpstreamTimeout() { r.upstreamTimeouts.Add(1) }
+
+func (r *Registry) StartUpstreamWait() { r.upstreamWaiting.Add(1) }
+
+func (r *Registry) FinishUpstreamWait(elapsed time.Duration) {
+	r.upstreamWaiting.Add(-1)
+	r.upstreamWait.observe(elapsed.Seconds())
+}
 
 // ObserveDuration 记录请求时延（秒）。
 func (r *Registry) ObserveDuration(sec float64) { r.duration.observe(sec) }
@@ -216,6 +237,11 @@ func (r *Registry) Render() string {
 	var b strings.Builder
 	r.requests.render(&b, "niubwaf_requests_total")
 	r.attacks.render(&b, "niubwaf_attacks_total")
+	r.rateLimited.render(&b, "niubwaf_rate_limited_total")
+	r.overloadRejected.render(&b, "niubwaf_overload_rejections_total")
+	r.upstreamWait.render(&b, "niubwaf_upstream_queue_duration_seconds")
+	fmt.Fprintf(&b, "# HELP niubwaf_upstream_queue_requests 正在等待上游请求名额的请求数\n# TYPE niubwaf_upstream_queue_requests gauge\nniubwaf_upstream_queue_requests %d\n", r.upstreamWaiting.Load())
+	fmt.Fprintf(&b, "# HELP niubwaf_upstream_timeouts_total 上游转发尝试超时总数\n# TYPE niubwaf_upstream_timeouts_total counter\nniubwaf_upstream_timeouts_total %d\n", r.upstreamTimeouts.Load())
 	fmt.Fprintf(&b, "# HELP niubwaf_response_bytes_total 转发响应字节累计\n# TYPE niubwaf_response_bytes_total counter\nniubwaf_response_bytes_total %d\n", atomic.LoadUint64(&r.respBytes))
 	r.duration.render(&b, "niubwaf_request_duration_seconds")
 	r.upstreams.render(&b, "niubwaf_upstream_up")

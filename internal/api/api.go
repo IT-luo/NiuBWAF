@@ -2,11 +2,16 @@ package api
 
 import (
 	"bufio"
+	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -21,28 +26,40 @@ import (
 
 	"niubwaf/internal/engine"
 	"niubwaf/internal/metrics"
+	"niubwaf/internal/monitor"
 	"niubwaf/internal/proxy"
 	"niubwaf/internal/store"
 )
 
+type Inspector interface {
+	Run(context.Context)
+	Snapshot() monitor.Snapshot
+	RecordBackupResult(string, error) error
+}
+
 type API struct {
-	Store    *store.Store
-	Proxy    *proxy.Proxy
-	AdminTLS bool   // 管理台是否运行于 TLS，决定会话 Cookie 的 Secure 标志
-	DataDir  string // 数据目录，用于数据库热备份
-	mu       sync.Mutex
-	sessions map[string]time.Time
-	fails    map[string]*loginFail
+	Store      *store.Store
+	Proxy      *proxy.Proxy
+	Inspector  Inspector
+	AdminTLS   bool   // 管理台是否运行于 TLS，决定会话 Cookie 的 Secure 标志
+	DataDir    string // 数据目录，用于数据库热备份
+	accountMu  sync.RWMutex
+	mu         sync.Mutex
+	sessions   map[string]time.Time
+	identities map[string]consoleIdentity
+	csrfTokens map[string]string // session token -> CSRF token
+	fails      map[string]*loginFail
 }
 
 type loginFail struct {
 	count       int
 	lockedUntil time.Time
 	last        time.Time
+	inFlight    int
 }
 
 func New(st *store.Store, p *proxy.Proxy) *API {
-	return &API{Store: st, Proxy: p, sessions: map[string]time.Time{}, fails: map[string]*loginFail{}}
+	return &API{Store: st, Proxy: p, sessions: map[string]time.Time{}, csrfTokens: map[string]string{}, fails: map[string]*loginFail{}}
 }
 
 func writeJSON(w http.ResponseWriter, v any) {
@@ -55,22 +72,77 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, map[string]string{"error": msg})
 }
 
+const (
+	loginBodyLimit int64 = 64 << 10
+	jsonBodyLimit  int64 = 2 << 20
+)
+
+// decodeJSON 统一限制所有管理 API 的 JSON 请求体，并拒绝可由表单触发的 text/plain。
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any, limit int64) bool {
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil || !strings.EqualFold(contentType, "application/json") {
+		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type 必须为 application/json")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, limit)
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(dst); err != nil {
+		writeJSONDecodeErr(w, err)
+		return false
+	}
+	// 除了防止拼接多个 JSON 值，也确保单个值后的超长正文会被 MaxBytesReader 发现。
+	var extra json.RawMessage
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			writeErr(w, http.StatusBadRequest, "请求体只能包含一个 JSON 值")
+		} else {
+			writeJSONDecodeErr(w, err)
+		}
+		return false
+	}
+	return true
+}
+
+func writeJSONDecodeErr(w http.ResponseWriter, err error) {
+	var maxErr *http.MaxBytesError
+	if errors.As(err, &maxErr) {
+		writeErr(w, http.StatusRequestEntityTooLarge, "请求体过大")
+		return
+	}
+	writeErr(w, http.StatusBadRequest, "请求格式错误")
+}
+
 func (a *API) authed(r *http.Request) bool {
+	_, ok := a.authenticatedConsole(r)
+	return ok
+}
+
+func (a *API) authenticatedConsole(r *http.Request) (consoleIdentity, bool) {
 	ck, err := r.Cookie("niub_admin")
 	if err != nil {
-		return false
+		return consoleIdentity{}, false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	exp, ok := a.sessions[ck.Value]
 	if !ok {
-		return false
+		return consoleIdentity{}, false
 	}
 	if time.Now().Before(exp) {
-		return true
+		identity, ok := a.identities[ck.Value]
+		if !ok {
+			identity = consoleIdentity{Username: rootAccount, Role: roleAdmin}
+		}
+		return identity, true
 	}
-	delete(a.sessions, ck.Value) // 惰性清理：访问即删除已过期会话
-	return false
+	a.deleteSessionLocked(ck.Value)
+	return consoleIdentity{}, false
+}
+
+func (a *API) deleteSessionLocked(token string) {
+	delete(a.sessions, token)
+	delete(a.csrfTokens, token)
+	delete(a.identities, token)
 }
 
 // purgeExpiredSessionsLocked 清扫全部过期会话，防止 sessions map 随登录次数无界增长。
@@ -79,7 +151,12 @@ func (a *API) purgeExpiredSessionsLocked() {
 	now := time.Now()
 	for k, exp := range a.sessions {
 		if !now.Before(exp) {
-			delete(a.sessions, k)
+			a.deleteSessionLocked(k)
+		}
+	}
+	for k := range a.csrfTokens {
+		if _, ok := a.sessions[k]; !ok {
+			delete(a.csrfTokens, k)
 		}
 	}
 }
@@ -108,31 +185,106 @@ func (a *API) loginLocked(key string) bool {
 	return rec != nil && time.Now().Before(rec.lockedUntil)
 }
 
-// loginFailed 累计失败并按每满 5 次翻倍锁定（1→2→4…封顶 60 分钟）
-func (a *API) loginFailed(key string) {
+// beginLogin 原子占用一次口令校验名额，避免并发请求都在失败计数前越过锁定检查。
+// 返回的记录指针同时是作为代际标识：成功登录清除记录后，旧的并发尝试不能再污染新状态。
+func (a *API) beginLogin(key string) (*loginFail, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	now := time.Now()
+	if a.fails == nil {
+		a.fails = map[string]*loginFail{}
+	}
 	rec := a.fails[key]
 	if rec == nil {
 		rec = &loginFail{}
 		a.fails[key] = rec
 	}
-	rec.count++
-	rec.last = time.Now()
+	if now.Before(rec.lockedUntil) {
+		return nil, false
+	}
+	if !rec.lockedUntil.IsZero() {
+		// 锁定期满后只放行一个在途尝试；失败则按原有递增策略再次锁定。
+		rec.lockedUntil = time.Time{}
+	}
 	if rec.count >= loginMaxFails {
-		mins := 1 << (rec.count/loginMaxFails - 1)
+		if rec.inFlight >= 1 {
+			return nil, false
+		}
+	} else if rec.count+rec.inFlight >= loginMaxFails {
+		return nil, false
+	}
+	rec.inFlight++
+	return rec, true
+}
+
+// recordLoginFailureLocked 累计真实失败，按每满 5 次翻倍锁定（1→2→4…封顶 60 分钟）。
+// 返回本次失败是否造成了新的锁定状态。调用方必须持有 a.mu。
+func (a *API) recordLoginFailureLocked(rec *loginFail) bool {
+	now := time.Now()
+	wasLocked := now.Before(rec.lockedUntil)
+	rec.count++
+	rec.last = now
+	if rec.count >= loginMaxFails {
+		shift := rec.count/loginMaxFails - 1
+		if shift > 6 {
+			shift = 6
+		}
+		mins := 1 << shift
 		if mins > 60 {
 			mins = 60
 		}
-		rec.lockedUntil = time.Now().Add(time.Duration(mins) * time.Minute)
+		rec.lockedUntil = now.Add(time.Duration(mins) * time.Minute)
 	}
+	return !wasLocked && now.Before(rec.lockedUntil)
+}
+
+func (a *API) loginAttemptFailed(key string, attempt *loginFail) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	rec := a.fails[key]
+	if rec != attempt {
+		return false
+	}
+	if rec.inFlight > 0 {
+		rec.inFlight--
+	}
+	locked := a.recordLoginFailureLocked(rec)
+	a.pruneLoginFailsLocked()
+	return locked
+}
+
+// loginFailed 保留给维护与测试入口；HTTP 登录路径使用带在途占位的 loginAttemptFailed。
+func (a *API) loginFailed(key string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.fails == nil {
+		a.fails = map[string]*loginFail{}
+	}
+	rec := a.fails[key]
+	if rec == nil {
+		rec = &loginFail{}
+		a.fails[key] = rec
+	}
+	a.recordLoginFailureLocked(rec)
+	a.pruneLoginFailsLocked()
+}
+
+func (a *API) pruneLoginFailsLocked() {
 	if len(a.fails) > 10000 {
 		cutoff := time.Now().Add(-24 * time.Hour)
 		for k, v := range a.fails {
-			if v.last.Before(cutoff) {
+			if v.last.Before(cutoff) && v.inFlight == 0 {
 				delete(a.fails, k)
 			}
 		}
+	}
+}
+
+func (a *API) loginAttemptSucceeded(key string, attempt *loginFail) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.fails[key] == attempt {
+		delete(a.fails, key)
 	}
 }
 
@@ -140,6 +292,139 @@ func (a *API) loginSucceeded(key string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	delete(a.fails, key)
+}
+
+func (a *API) issueConsoleSession(identity consoleIdentity) (string, string) {
+	session, csrf := store.RandToken(), store.RandToken()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.sessions == nil {
+		a.sessions = map[string]time.Time{}
+	}
+	if a.csrfTokens == nil {
+		a.csrfTokens = map[string]string{}
+	}
+	if a.identities == nil {
+		a.identities = map[string]consoleIdentity{}
+	}
+	a.sessions[session] = time.Now().Add(12 * time.Hour)
+	a.csrfTokens[session] = csrf
+	a.identities[session] = identity
+	a.purgeExpiredSessionsLocked()
+	return session, csrf
+}
+
+func (a *API) revokeConsoleSessions(username string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for token := range a.sessions {
+		identity, ok := a.identities[token]
+		if identity.Username == username || (!ok && username == rootAccount) {
+			a.deleteSessionLocked(token)
+		}
+	}
+}
+
+func (a *API) serveCSRF(w http.ResponseWriter, r *http.Request) {
+	ck, err := r.Cookie("niub_admin")
+	if err != nil {
+		writeErr(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	a.mu.Lock()
+	exp, ok := a.sessions[ck.Value]
+	if !ok || !time.Now().Before(exp) {
+		a.deleteSessionLocked(ck.Value)
+		a.mu.Unlock()
+		writeErr(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	token := a.csrfTokens[ck.Value]
+	if token == "" {
+		// 兼容升级前已存在的会话以及测试中直接注入的会话。
+		token = store.RandToken()
+		if a.csrfTokens == nil {
+			a.csrfTokens = map[string]string{}
+		}
+		a.csrfTokens[ck.Value] = token
+	}
+	a.mu.Unlock()
+	writeJSON(w, map[string]string{"token": token})
+}
+
+func (a *API) validCSRF(r *http.Request) bool {
+	ck, err := r.Cookie("niub_admin")
+	if err != nil {
+		return false
+	}
+	a.mu.Lock()
+	expected := a.csrfTokens[ck.Value]
+	a.mu.Unlock()
+	matches := subtle.ConstantTimeCompare([]byte(r.Header.Get("X-NiuB-CSRF")), []byte(expected)) == 1
+	return expected != "" && matches
+}
+
+func normalizedOriginPort(u *url.URL) (string, bool) {
+	if port := u.Port(); port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", false
+		}
+		return strconv.Itoa(n), true
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443", true
+	}
+	if strings.EqualFold(u.Scheme, "http") {
+		return "80", true
+	}
+	return "", false
+}
+
+// validOrigin 校验浏览器 Origin 的 scheme/host/port；SameSite 不能替代同源校验。
+func (a *API) validOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	o, err := url.Parse(origin)
+	if err != nil || o.Host == "" || o.User != nil || o.Path != "" || o.RawQuery != "" || o.Fragment != "" ||
+		(!strings.EqualFold(o.Scheme, "http") && !strings.EqualFold(o.Scheme, "https")) {
+		return false
+	}
+	scheme := "http"
+	if r.TLS != nil || a.AdminTLS {
+		scheme = "https"
+	}
+	if !strings.EqualFold(o.Scheme, scheme) {
+		return false
+	}
+	current := &url.URL{Scheme: scheme, Host: r.Host}
+	if current.Hostname() == "" || !strings.EqualFold(o.Hostname(), current.Hostname()) {
+		return false
+	}
+	originPort, ok := normalizedOriginPort(o)
+	if !ok {
+		return false
+	}
+	currentPort, ok := normalizedOriginPort(current)
+	return ok && originPort == currentPort
+}
+
+func (a *API) checkCSRF(w http.ResponseWriter, r *http.Request) bool {
+	if !a.validOrigin(r) {
+		writeErr(w, http.StatusForbidden, "Origin 必须与管理端同源")
+		return false
+	}
+	if !a.validCSRF(r) {
+		writeErr(w, http.StatusForbidden, "CSRF token 无效")
+		return false
+	}
+	return true
+}
+
+func safeAPIMethod(method string) bool {
+	return method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
 }
 
 func (a *API) sessionCookie(value string, maxAge int) *http.Cookie {
@@ -165,42 +450,70 @@ func (a *API) Handler(console http.Handler) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /api/login", func(w http.ResponseWriter, r *http.Request) {
-		var body struct{ Password string }
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeErr(w, 400, "请求格式错误")
+		// 登录不需要 CSRF token，但仍拒绝跨源浏览器表单/脚本提交。
+		if !a.validOrigin(r) {
+			writeErr(w, http.StatusForbidden, "Origin 必须与管理端同源")
+			return
+		}
+		var body struct{ Username, Password string }
+		if !decodeJSON(w, r, &body, loginBodyLimit) {
 			return
 		}
 		key := remoteKey(r)
-		if a.loginLocked(key) {
-			a.Store.Audit("admin", "登录锁定", "尝试过于频繁 from "+key)
-			writeErr(w, 429, "登录尝试过于频繁，请稍后再试")
+		attempt, allowed := a.beginLogin(key)
+		if !allowed {
+			// 锁定/在途限流不是新的真实失败，不能为每个 429 永久写一条审计。
+			writeErr(w, http.StatusTooManyRequests, "登录尝试过于频繁，请稍后再试")
 			return
 		}
-		ok, needsRehash := store.VerifyPass(body.Password, a.Store.GetSetting("admin_pass"))
+		name := strings.ToLower(strings.TrimSpace(body.Username))
+		if name == "" {
+			name = rootAccount
+		}
+		a.accountMu.RLock()
+		defer a.accountMu.RUnlock()
+		account, accountErr := a.lookupConsoleAccount(name)
+		hash := account.PasswordHash
+		if accountErr != nil || !account.Enabled {
+			hash = a.Store.GetSetting("admin_pass")
+		}
+		ok, needsRehash := store.VerifyPass(body.Password, hash)
+		ok = ok && accountErr == nil && account.Enabled
 		if !ok {
-			a.loginFailed(key)
-			a.Store.Audit("admin", "登录失败", "密码错误 from "+key)
-			writeErr(w, 401, "密码错误")
+			newlyLocked := a.loginAttemptFailed(key, attempt)
+			if !accountName.MatchString(name) {
+				name = "invalid-account"
+			}
+			if newlyLocked {
+				a.Store.Audit(name, "登录锁定", "密码错误达到锁定阈值 from "+key)
+			} else {
+				a.Store.Audit(name, "登录失败", "密码错误 from "+key)
+			}
+			writeErr(w, http.StatusUnauthorized, "密码错误")
 			return
 		}
-		if needsRehash {
+		if needsRehash && name == rootAccount {
 			a.Store.SetSetting("admin_pass", store.HashPass(body.Password))
 		}
-		a.loginSucceeded(key)
-		token := store.RandToken()
-		a.mu.Lock()
-		a.sessions[token] = time.Now().Add(12 * time.Hour)
-		a.purgeExpiredSessionsLocked() // 每次登录顺带清扫过期会话，map 规模有界
-		a.mu.Unlock()
+		a.loginAttemptSucceeded(key, attempt)
+		identity := consoleIdentity{Username: account.Username, Role: account.Role, MustChange: account.MustChange}
+		token, _ := a.issueConsoleSession(identity)
 		http.SetCookie(w, a.sessionCookie(token, 43200))
-		a.Store.Audit("admin", "登录成功", key)
-		writeJSON(w, map[string]any{"ok": "true", "must_change": a.Store.GetSetting("must_change_pass") == "on"})
+		a.Store.Audit(name, "登录成功", key)
+		writeJSON(w, map[string]any{"ok": "true", "must_change": identity.MustChange, "username": name, "role": identity.Role})
 	})
 
 	mux.HandleFunc("POST /api/logout", func(w http.ResponseWriter, r *http.Request) {
+		if !a.authed(r) {
+			writeErr(w, http.StatusUnauthorized, "未登录")
+			return
+		}
+		if !a.checkCSRF(w, r) {
+			return
+		}
 		if ck, err := r.Cookie("niub_admin"); err == nil {
 			a.mu.Lock()
-			delete(a.sessions, ck.Value)
+			a.deleteSessionLocked(ck.Value)
 			a.mu.Unlock()
 		}
 		http.SetCookie(w, a.sessionCookie("", -1))
@@ -208,21 +521,32 @@ func (a *API) Handler(console http.Handler) http.Handler {
 	})
 
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
-		if !a.authed(r) {
-			writeErr(w, 401, "未登录")
+		identity, ok := a.authenticatedConsole(r)
+		if !ok {
+			writeErr(w, http.StatusUnauthorized, "未登录")
 			return
 		}
-		// 仍在使用默认口令时，除改密/登出外一律拒绝，强制先修改默认管理密码
-		if a.Store.GetSetting("must_change_pass") == "on" && r.URL.Path != "/api/password" && r.URL.Path != "/api/logout" {
+		if !safeAPIMethod(r.Method) && !a.checkCSRF(w, r) {
+			return
+		}
+		if identity.Username == rootAccount {
+			identity.MustChange = a.Store.GetSetting("must_change_pass") == "on"
+		}
+		if identity.MustChange && r.URL.Path != "/api/csrf" && r.URL.Path != "/api/password" && r.URL.Path != "/api/me" {
 			w.Header().Set("Content-Type", "application/json; charset=utf-8")
 			w.WriteHeader(403)
 			writeJSON(w, map[string]string{"error": "请先修改默认管理密码", "must_change": "true"})
 			return
 		}
-		a.route(w, r)
+		if !permitConsoleRequest(identity.Role, r.Method, r.URL.Path) {
+			writeErr(w, http.StatusForbidden, "当前账号没有此操作权限")
+			return
+		}
+		a.route(w, withConsoleUser(r, identity))
 	})
 
 	mux.HandleFunc("/metrics", a.metricsHandler)
+	mux.HandleFunc("GET /audit/events", a.auditFeed)
 
 	mux.Handle("/", console)
 	return securityHeaders(mux, a.AdminTLS)
@@ -255,6 +579,14 @@ func (a *API) metricsHandler(w http.ResponseWriter, r *http.Request) {
 func (a *API) route(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path
 	switch {
+	case path == "/api/me" && r.Method == "GET":
+		writeJSON(w, consoleUser(r))
+	case path == "/api/accounts" && (r.Method == "GET" || r.Method == "POST"):
+		a.listOrCreateAccount(w, r)
+	case strings.HasPrefix(path, "/api/accounts/") && (r.Method == "PUT" || r.Method == "DELETE"):
+		a.updateConsoleAccount(w, r, strings.TrimPrefix(path, "/api/accounts/"))
+	case path == "/api/csrf" && r.Method == "GET":
+		a.serveCSRF(w, r)
 	case path == "/api/stats" && r.Method == "GET":
 		a.stats(w, r)
 	case path == "/api/trend" && r.Method == "GET":
@@ -284,20 +616,40 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		for i := range sites {
-			sites[i].AuthPass = ""
+		response := make([]consoleSite, 0, len(sites))
+		for _, site := range sites {
+			response = append(response, consoleSite{Site: site, TLSConfigured: site.CertPEM != "" && site.KeyPEM != ""})
 		}
-		writeJSON(w, sites)
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, response)
 	case path == "/api/upstreams" && r.Method == "GET":
 		writeJSON(w, a.Proxy.UpstreamHealth())
+	case path == "/api/config/export" && r.Method == "POST":
+		a.exportConfig(w, r)
+	case path == "/api/config/import/preview" && r.Method == "POST":
+		a.previewConfigImport(w, r)
+	case path == "/api/config/import/apply" && r.Method == "POST":
+		a.applyConfigImport(w, r)
+	case path == "/api/inspections" && r.Method == "GET":
+		a.inspections(w)
+	case path == "/api/inspections/run" && r.Method == "POST":
+		a.runInspections(w, r)
 	case path == "/api/backup" && r.Method == "POST":
 		a.backup(w, r)
 	case path == "/api/backups" && r.Method == "GET":
 		a.listBackups(w, r)
 	case path == "/api/sites" && r.Method == "POST":
 		a.saveSite(w, r, 0)
+	case strings.HasPrefix(path, "/api/sites/") && strings.HasSuffix(path, "/api-policy"):
+		a.siteAPIPolicy(w, r)
+	case strings.HasPrefix(path, "/api/sites/") && strings.HasSuffix(path, "/upload-policy"):
+		a.siteUploadPolicy(w, r)
 	case strings.HasPrefix(path, "/api/sites/") && r.Method == "PUT":
-		id, _ := strconv.ParseInt(strings.TrimPrefix(path, "/api/sites/"), 10, 64)
+		id, err := strconv.ParseInt(strings.TrimPrefix(path, "/api/sites/"), 10, 64)
+		if err != nil || id <= 0 {
+			writeErr(w, http.StatusBadRequest, "站点 ID 无效")
+			return
+		}
 		a.saveSite(w, r, id)
 	case strings.HasPrefix(path, "/api/sites/") && r.Method == "DELETE":
 		id, _ := strconv.ParseInt(strings.TrimPrefix(path, "/api/sites/"), 10, 64)
@@ -305,7 +657,7 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		a.Store.Audit("admin", "删除站点", fmt.Sprintf("id=%d", id))
+		a.audit(r, "删除站点", fmt.Sprintf("id=%d", id))
 		a.Proxy.Reload()
 		writeJSON(w, map[string]string{"ok": "true"})
 	case path == "/api/logs" && r.Method == "GET":
@@ -325,7 +677,10 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, list)
 	case path == "/api/ips" && r.Method == "POST":
 		var e store.IPEntry
-		if err := json.NewDecoder(r.Body).Decode(&e); err != nil || e.IP == "" || (e.Kind != "black" && e.Kind != "white") {
+		if !decodeJSON(w, r, &e, jsonBodyLimit) {
+			return
+		}
+		if e.IP == "" || (e.Kind != "black" && e.Kind != "white") {
 			writeErr(w, 400, "参数错误：需要 kind(black/white) 与 ip")
 			return
 		}
@@ -333,13 +688,13 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		a.Store.Audit("admin", "添加IP名单", e.Kind+" "+e.IP)
+		a.audit(r, "添加IP名单", e.Kind+" "+e.IP)
 		a.Proxy.Reload()
 		writeJSON(w, map[string]string{"ok": "true"})
 	case strings.HasPrefix(path, "/api/ips/") && r.Method == "DELETE":
 		id, _ := strconv.ParseInt(strings.TrimPrefix(path, "/api/ips/"), 10, 64)
 		a.Store.DeleteIP(id)
-		a.Store.Audit("admin", "删除IP名单", fmt.Sprintf("id=%d", id))
+		a.audit(r, "删除IP名单", fmt.Sprintf("id=%d", id))
 		a.Proxy.Reload()
 		writeJSON(w, map[string]string{"ok": "true"})
 	case path == "/api/exclusions" && r.Method == "GET":
@@ -357,7 +712,7 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		a.Store.Audit("admin", "删除规则豁免", fmt.Sprintf("id=%d", id))
+		a.audit(r, "删除规则豁免", fmt.Sprintf("id=%d", id))
 		a.Proxy.Reload()
 		writeJSON(w, map[string]string{"ok": "true"})
 	case path == "/api/rules" && r.Method == "GET":
@@ -367,6 +722,10 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, list)
+	case path == "/api/rules/shadow" && r.Method == "GET":
+		a.listShadowRules(w, r)
+	case path == "/api/rules/replay" && r.Method == "POST":
+		a.replayRule(w, r)
 	case path == "/api/rules" && r.Method == "POST":
 		a.saveRule(w, r, 0)
 	case strings.HasPrefix(path, "/api/rules/") && r.Method == "PUT":
@@ -378,12 +737,12 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, 500, err.Error())
 			return
 		}
-		a.Store.Audit("admin", "删除自定义规则", fmt.Sprintf("id=%d", id))
+		a.audit(r, "删除自定义规则", fmt.Sprintf("id=%d", id))
 		a.Proxy.Reload()
 		writeJSON(w, map[string]string{"ok": "true"})
 	case path == "/api/alert/test" && r.Method == "POST":
 		res := a.Proxy.AlertTest()
-		a.Store.Audit("admin", "测试告警通知", strings.Join(keysOf(res), ","))
+		a.audit(r, "测试告警通知", strings.Join(keysOf(res), ","))
 		writeJSON(w, res)
 	case path == "/api/reputation" && r.Method == "GET":
 		list, err := a.Store.ListReputation(200)
@@ -398,7 +757,7 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, a.Proxy.IntelStatus())
 	case path == "/api/intel/refresh" && r.Method == "POST":
 		a.Proxy.IntelRefresh()
-		a.Store.Audit("admin", "刷新IP情报", "IDC/Tor 数据源")
+		a.audit(r, "刷新IP情报", "IDC/Tor 数据源")
 		writeJSON(w, map[string]string{"ok": "true"})
 	case path == "/api/intel/test" && r.Method == "POST":
 		a.intelTest(w, r)
@@ -416,12 +775,14 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.Proxy.RefreshBans()
-		a.Store.Audit("admin", "信誉解封", ip+" 赦免至 "+pardon)
+		a.audit(r, "信誉解封", ip+" 赦免至 "+pardon)
 		writeJSON(w, map[string]string{"ok": "true"})
 	case path == "/api/settings" && r.Method == "GET":
 		a.getSettings(w)
 	case path == "/api/settings" && r.Method == "PUT":
 		a.putSettings(w, r)
+	case path == "/api/block-page/preview" && (r.Method == "GET" || r.Method == "POST"):
+		a.previewBlockPage(w, r)
 	case path == "/api/password" && r.Method == "PUT":
 		a.changePass(w, r)
 	case path == "/api/audit" && r.Method == "GET":
@@ -431,11 +792,31 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, list)
+	case path == "/api/audit/feed" && (r.Method == "GET" || r.Method == "PUT"):
+		a.auditFeedSettings(w, r)
 	case path == "/api/events" && r.Method == "GET":
 		a.events(w, r)
 	default:
 		writeErr(w, 404, "接口不存在")
 	}
+}
+
+func (a *API) inspections(w http.ResponseWriter) {
+	if a.Inspector == nil {
+		writeErr(w, http.StatusServiceUnavailable, "巡检模块尚未初始化")
+		return
+	}
+	writeJSON(w, a.Inspector.Snapshot())
+}
+
+func (a *API) runInspections(w http.ResponseWriter, r *http.Request) {
+	if a.Inspector == nil {
+		writeErr(w, http.StatusServiceUnavailable, "巡检模块尚未初始化")
+		return
+	}
+	a.Inspector.Run(r.Context())
+	a.audit(r, "手动运行巡检", "")
+	writeJSON(w, a.Inspector.Snapshot())
 }
 
 func (a *API) stats(w http.ResponseWriter, r *http.Request) {
@@ -452,6 +833,7 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 		"total_reqs": st.TotalReqs, "total_blocks": st.TotalBlocks,
 		"sites": len(sites), "sites_enabled": enabled,
 		"geoip_available": a.Proxy.Geo.Available(),
+		"crs_version":     engine.CRSVersion,
 	})
 }
 
@@ -488,12 +870,26 @@ func (a *API) top(w http.ResponseWriter, r *http.Request, kind string) {
 	writeJSON(w, list)
 }
 
+type consoleSite struct {
+	store.Site
+	TLSConfigured bool `json:"tls_configured"`
+}
+
 func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
-	var s store.Site
-	if err := json.NewDecoder(r.Body).Decode(&s); err != nil {
-		writeErr(w, 400, "请求格式错误")
+	var input struct {
+		store.Site
+		AuthPass string `json:"auth_pass"`
+		CertPEM  string `json:"cert_pem"`
+		KeyPEM   string `json:"key_pem"`
+		ClearTLS bool   `json:"clear_tls"`
+	}
+	if !decodeJSON(w, r, &input, jsonBodyLimit) {
 		return
 	}
+	s := input.Site
+	s.AuthPass = input.AuthPass
+	s.CertPEM = strings.TrimSpace(input.CertPEM)
+	s.KeyPEM = strings.TrimSpace(input.KeyPEM)
 	if s.Name == "" || s.Domain == "" || s.Upstream == "" {
 		writeErr(w, 400, "名称、域名、上游地址不能为空")
 		return
@@ -516,6 +912,10 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 		return
 	}
 	s.Upstream = strings.Join(ups, ",")
+	if input.ClearTLS && (s.CertPEM != "" || s.KeyPEM != "") {
+		writeErr(w, 400, "不能同时上传和移除证书")
+		return
+	}
 	if (s.CertPEM == "") != (s.KeyPEM == "") {
 		writeErr(w, 400, "证书与私钥必须同时配置")
 		return
@@ -540,39 +940,38 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 		s.BotMode = "off"
 	}
 	s.Domain = strings.ToLower(strings.TrimSpace(s.Domain))
-	// Basic-Auth 口令哈希落盘：更新时留空表示保留原口令（控制台不回显哈希）
-	if id != 0 && s.AuthPass == "" {
-		if cur, e := a.Store.GetSite(id); e == nil {
-			s.AuthPass = cur.AuthPass
-		}
-	}
 	if s.AuthPass != "" && !strings.HasPrefix(s.AuthPass, "pbkdf2_sha256$") {
 		s.AuthPass = store.HashPass(s.AuthPass)
 	}
+	tlsConfigured := s.CertPEM != ""
+	action := "新增站点"
 	var err error
 	if id == 0 {
 		err = a.Store.CreateSite(&s)
-		a.Store.Audit("admin", "新增站点", s.Domain+" -> "+s.Upstream)
 	} else {
 		s.ID = id
-		err = a.Store.UpdateSite(&s)
-		a.Store.Audit("admin", "修改站点", s.Domain)
+		action = "修改站点"
+		tlsConfigured, err = a.Store.UpdateSite(&s, input.ClearTLS || tlsConfigured)
+		if errors.Is(err, sql.ErrNoRows) {
+			writeErr(w, http.StatusNotFound, "站点不存在")
+			return
+		}
 	}
 	if err != nil {
 		writeErr(w, 500, "保存失败（域名可能已存在）: "+err.Error())
 		return
 	}
+	a.audit(r, action, s.Domain)
 	a.Proxy.Reload()
-	s.AuthPass = ""
-	writeJSON(w, s)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, consoleSite{Site: s, TLSConfigured: tlsConfigured})
 }
 
 var paramRe = regexp.MustCompile(`^[A-Za-z0-9_.\-\[\]]+$`)
 
 func (a *API) addExclusion(w http.ResponseWriter, r *http.Request) {
 	var e store.Exclusion
-	if err := json.NewDecoder(r.Body).Decode(&e); err != nil {
-		writeErr(w, 400, "请求格式错误")
+	if !decodeJSON(w, r, &e, jsonBodyLimit) {
 		return
 	}
 	e.URLPrefix = strings.TrimSpace(e.URLPrefix)
@@ -598,15 +997,14 @@ func (a *API) addExclusion(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	a.Store.Audit("admin", "添加规则豁免", fmt.Sprintf("rule=%d site=%d prefix=%q param=%q", e.RuleID, e.SiteID, e.URLPrefix, e.Param))
+	a.audit(r, "添加规则豁免", fmt.Sprintf("rule=%d site=%d prefix=%q param=%q", e.RuleID, e.SiteID, e.URLPrefix, e.Param))
 	a.Proxy.Reload()
 	writeJSON(w, e)
 }
 
 func (a *API) saveRule(w http.ResponseWriter, r *http.Request, id int64) {
 	var cr store.CustomRule
-	if err := json.NewDecoder(r.Body).Decode(&cr); err != nil {
-		writeErr(w, 400, "请求格式错误")
+	if !decodeJSON(w, r, &cr, jsonBodyLimit) {
 		return
 	}
 	cr.Name = strings.TrimSpace(cr.Name)
@@ -625,9 +1023,9 @@ func (a *API) saveRule(w http.ResponseWriter, r *http.Request, id int64) {
 		return
 	}
 	switch cr.Action {
-	case "allow", "block", "captcha", "log", "redirect":
+	case "allow", "block", "captcha", "log", "redirect", engine.RuleActionRateLimit:
 	default:
-		writeErr(w, 400, "action 必须是 allow/block/captcha/log/redirect")
+		writeErr(w, 400, "action 必须是 allow/block/captcha/log/redirect/rate_limit")
 		return
 	}
 	if cr.Logic != "and" && cr.Logic != "or" {
@@ -647,11 +1045,11 @@ func (a *API) saveRule(w http.ResponseWriter, r *http.Request, id int64) {
 	var err error
 	if id == 0 {
 		err = a.Store.CreateRule(&cr)
-		a.Store.Audit("admin", "新增自定义规则", fmt.Sprintf("%s action=%s site=%d", cr.Name, cr.Action, cr.SiteID))
+		a.audit(r, "新增自定义规则", fmt.Sprintf("%s action=%s site=%d", cr.Name, cr.Action, cr.SiteID))
 	} else {
 		cr.ID = id
 		err = a.Store.UpdateRule(&cr)
-		a.Store.Audit("admin", "修改自定义规则", fmt.Sprintf("id=%d %s", id, cr.Name))
+		a.audit(r, "修改自定义规则", fmt.Sprintf("id=%d %s", id, cr.Name))
 	}
 	if err != nil {
 		writeErr(w, 500, "保存失败: "+err.Error())
@@ -693,7 +1091,7 @@ func (a *API) clearLogs(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, err.Error())
 		return
 	}
-	a.Store.Audit("admin", "清空攻击日志", fmt.Sprintf("%d 条", n))
+	a.audit(r, "清空攻击日志", fmt.Sprintf("%d 条", n))
 	writeJSON(w, map[string]any{"ok": "true", "deleted": n})
 }
 
@@ -736,7 +1134,7 @@ func (a *API) exportCSV(w http.ResponseWriter, r *http.Request) {
 		log.Printf("导出攻击日志CSV失败: %v", err)
 		return
 	}
-	a.Store.Audit("admin", "导出攻击日志CSV", fmt.Sprintf("%d 条", rows))
+	a.audit(r, "导出攻击日志CSV", fmt.Sprintf("%d 条", rows))
 }
 
 func (a *API) reputationLookup(w http.ResponseWriter, r *http.Request) {
@@ -747,23 +1145,23 @@ func (a *API) reputationLookup(w http.ResponseWriter, r *http.Request) {
 	}
 	intel := a.Proxy.IntelLookup(ip)
 	writeJSON(w, map[string]any{
-		"ip":           ip,
-		"whitelisted":  a.Proxy.IsWhitelisted(ip),
-		"blacklisted":  a.Proxy.IsBlacklisted(ip),
-		"banned":       a.Proxy.IsRepBanned(ip),
-		"attack_count": a.Store.IPAttackCount(ip),
-		"reputation":   a.Store.GetReputation(ip),
-		"geo_country":  intel.Country,
-		"region":       intel.Region,
-		"city":         intel.City,
-		"latitude":     intel.Latitude,
-		"longitude":    intel.Longitude,
-		"asn":          intel.ASN,
-		"asn_org":      intel.ASNOrg,
-		"idc":          intel.IDC,
-		"tor":          intel.Tor,
-		"threat_tags":  intel.ThreatTags,
-		"threat_score": intel.ThreatScore,
+		"ip":              ip,
+		"whitelisted":     a.Proxy.IsWhitelisted(ip),
+		"blacklisted":     a.Proxy.IsBlacklisted(ip),
+		"banned":          a.Proxy.IsRepBanned(ip),
+		"attack_count":    a.Store.IPAttackCount(ip),
+		"reputation":      a.Store.GetReputation(ip),
+		"geo_country":     intel.Country,
+		"region":          intel.Region,
+		"city":            intel.City,
+		"latitude":        intel.Latitude,
+		"longitude":       intel.Longitude,
+		"asn":             intel.ASN,
+		"asn_org":         intel.ASNOrg,
+		"idc":             intel.IDC,
+		"tor":             intel.Tor,
+		"threat_tags":     intel.ThreatTags,
+		"threat_score":    intel.ThreatScore,
 		"threat_provider": intel.ThreatProvider,
 	})
 }
@@ -788,12 +1186,18 @@ func (a *API) intelTest(w http.ResponseWriter, r *http.Request) {
 func (a *API) getSettings(w http.ResponseWriter) {
 	keys := []string{"block_page", "geoip_mode", "geoip_countries", "log_retention_days", "semantic_mode",
 		"reputation_enabled", "rep_window", "rep_threshold", "rep_ban_ttl", "rep_max_ttl", "trusted_proxies",
-		"alert_enabled", "alert_webhook", "alert_dingtalk", "alert_wecom", "alert_threshold", "alert_window", "alert_cooldown",
-		"acme_enabled", "acme_domains", "acme_email", "acme_staging", "metrics_token",
-		"intel_provider", "intel_api_key", "intel_api_url", "body_inspect_kb", "body_scan_kb", "allowed_content_types"}
+		"alert_enabled", "alert_threshold", "alert_window", "alert_cooldown",
+		"acme_enabled", "acme_domains", "acme_email", "acme_staging",
+		"intel_provider", "body_inspect_kb", "body_scan_kb", "allowed_content_types",
+		"bot_verify_crawlers", "bot_path_limit",
+		"inspect_interval_sec", "inspect_cert_warn_days", "inspect_upstream_failures", "inspect_disk_free_percent",
+		"inspect_disk_free_mb", "inspect_backup_max_age_hours", "inspect_geoip_max_age_days", "inspect_ip2region_max_age_days", "inspect_cooldown_sec"}
 	out := map[string]string{}
 	for _, k := range keys {
 		out[k] = a.Store.GetSetting(k)
+	}
+	for _, k := range []string{"metrics_token", "intel_api_key", "intel_api_url", "alert_webhook", "alert_dingtalk", "alert_wecom"} {
+		out[k+"_configured"] = strconv.FormatBool(a.Store.GetSetting(k) != "")
 	}
 	if out["geoip_mode"] == "" {
 		out["geoip_mode"] = "off"
@@ -806,33 +1210,46 @@ func (a *API) getSettings(w http.ResponseWriter) {
 	}
 	for k, def := range map[string]string{"reputation_enabled": "on", "rep_window": "24", "rep_threshold": "30", "rep_ban_ttl": "60", "rep_max_ttl": "1440",
 		"alert_enabled": "off", "alert_threshold": "50", "alert_window": "60", "alert_cooldown": "300",
-		"acme_enabled": "off", "acme_staging": "on", "intel_provider": "off", "body_inspect_kb": "2048", "body_scan_kb": "16"} {
+		"acme_enabled": "off", "acme_staging": "on", "intel_provider": "off", "body_inspect_kb": "2048", "body_scan_kb": "16",
+		"inspect_interval_sec": "60", "inspect_cert_warn_days": "14", "inspect_upstream_failures": "3",
+		"inspect_disk_free_percent": "10", "inspect_disk_free_mb": "1024", "inspect_backup_max_age_hours": "26",
+		"inspect_geoip_max_age_days": "30", "inspect_ip2region_max_age_days": "90", "inspect_cooldown_sec": "21600"} {
 		if out[k] == "" {
 			out[k] = def
 		}
 	}
 	out["geoip_available"] = fmt.Sprintf("%v", a.Proxy.Geo.Available())
+	out["bot_crawler_sources"] = strings.Join(a.Proxy.VerifiedCrawlerSources(), ", ")
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, out)
 }
 
 func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	var body map[string]string
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, 400, "请求格式错误")
+	if !decodeJSON(w, r, &body, jsonBodyLimit) {
 		return
 	}
 	allowed := map[string]bool{"block_page": true, "geoip_mode": true, "geoip_countries": true, "log_retention_days": true, "semantic_mode": true,
 		"reputation_enabled": true, "rep_window": true, "rep_threshold": true, "rep_ban_ttl": true, "rep_max_ttl": true, "trusted_proxies": true,
 		"alert_enabled": true, "alert_webhook": true, "alert_dingtalk": true, "alert_wecom": true, "alert_threshold": true, "alert_window": true, "alert_cooldown": true,
 		"acme_enabled": true, "acme_domains": true, "acme_email": true, "acme_staging": true, "metrics_token": true,
-		"intel_provider": true, "intel_api_key": true, "intel_api_url": true, "body_inspect_kb": true, "body_scan_kb": true, "allowed_content_types": true}
+		"intel_provider": true, "intel_api_key": true, "intel_api_url": true, "body_inspect_kb": true, "body_scan_kb": true, "allowed_content_types": true,
+		"bot_verify_crawlers": true, "bot_path_limit": true,
+		"inspect_interval_sec": true, "inspect_cert_warn_days": true, "inspect_upstream_failures": true, "inspect_disk_free_percent": true,
+		"inspect_disk_free_mb": true, "inspect_backup_max_age_hours": true, "inspect_geoip_max_age_days": true, "inspect_ip2region_max_age_days": true, "inspect_cooldown_sec": true}
 	numRange := map[string][2]int{"rep_window": {1, 168}, "rep_threshold": {1, 100000}, "rep_ban_ttl": {1, 10080}, "rep_max_ttl": {1, 43200},
-		"alert_threshold": {1, 1000000}, "alert_window": {10, 3600}, "alert_cooldown": {10, 86400}, "body_inspect_kb": {64, 102400}, "body_scan_kb": {16, 1024}}
+		"alert_threshold": {1, 1000000}, "alert_window": {10, 3600}, "alert_cooldown": {10, 86400}, "body_inspect_kb": {64, 102400}, "body_scan_kb": {16, 1024},
+		"inspect_interval_sec": {30, 3600}, "inspect_cert_warn_days": {1, 90}, "inspect_upstream_failures": {1, 20},
+		"inspect_disk_free_percent": {1, 90}, "inspect_disk_free_mb": {0, 1048576}, "inspect_backup_max_age_hours": {7, 8760},
+		"inspect_geoip_max_age_days": {1, 3650}, "inspect_ip2region_max_age_days": {1, 3650}, "inspect_cooldown_sec": {300, 604800},
+		"bot_path_limit": {0, 128}}
 	repChanged := false
 	trustedChanged := false
 	acmeChanged := false
 	ctChanged := false
 	scanChanged := false
+	botChanged := false
+	updates := make(map[string]string, len(body))
 	for k, v := range body {
 		if !allowed[k] {
 			continue
@@ -852,6 +1269,16 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		if k == "alert_enabled" && v != "on" && v != "off" {
 			writeErr(w, 400, "alert_enabled 必须是 on/off")
 			return
+		}
+		if k == "bot_verify_crawlers" {
+			if v != "on" && v != "off" {
+				writeErr(w, 400, "bot_verify_crawlers 必须是 on/off")
+				return
+			}
+			botChanged = true
+		}
+		if k == "bot_path_limit" {
+			botChanged = true
 		}
 		if (k == "acme_enabled" || k == "acme_staging") && v != "on" && v != "off" {
 			writeErr(w, 400, k+" 必须是 on/off")
@@ -950,9 +1377,13 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		if k == "body_scan_kb" {
 			scanChanged = true
 		}
-		a.Store.SetSetting(k, v)
+		updates[k] = v
 	}
-	a.Store.Audit("admin", "修改设置", strings.Join(keysOf(body), ","))
+	if err := a.Store.SetSettings(updates); err != nil {
+		writeErr(w, http.StatusInternalServerError, "保存设置失败")
+		return
+	}
+	a.audit(r, "修改设置", strings.Join(keysOf(updates), ","))
 	if scanChanged {
 		// 送检上限是热路径参数，同步生效（不重建引擎）
 		kb, _ := strconv.Atoi(a.Store.GetSetting("body_scan_kb"))
@@ -973,6 +1404,9 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if acmeChanged {
 		go a.Proxy.Reload()
+	}
+	if botChanged {
+		a.Proxy.Reload()
 	}
 	writeJSON(w, map[string]string{"ok": "true"})
 }
@@ -1003,11 +1437,22 @@ func keysOf(m map[string]string) []string {
 
 func (a *API) changePass(w http.ResponseWriter, r *http.Request) {
 	var body struct{ Old, New string }
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeErr(w, 400, "请求格式错误")
+	if !decodeJSON(w, r, &body, jsonBodyLimit) {
 		return
 	}
-	if ok, _ := store.VerifyPass(body.Old, a.Store.GetSetting("admin_pass")); !ok {
+	a.accountMu.Lock()
+	defer a.accountMu.Unlock()
+	identity, valid := a.authenticatedConsole(r)
+	if !valid {
+		writeErr(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	account, err := a.lookupConsoleAccount(identity.Username)
+	if err != nil || !account.Enabled {
+		writeErr(w, http.StatusForbidden, "无法修改此账号密码")
+		return
+	}
+	if ok, _ := store.VerifyPass(body.Old, account.PasswordHash); !ok {
 		writeErr(w, 403, "原密码错误")
 		return
 	}
@@ -1015,17 +1460,33 @@ func (a *API) changePass(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "新密码至少 8 位")
 		return
 	}
-	if body.New == "admin123" || body.New == body.Old {
-		writeErr(w, 400, "新密码不能为默认口令或与原密码相同")
+	if body.New == body.Old {
+		writeErr(w, 400, "新密码不能与原密码相同")
 		return
 	}
-	if !strings.ContainsAny(body.New, "0123456789") || !strings.ContainsAny(body.New, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") {
-		writeErr(w, 400, "新密码需同时包含字母和数字")
+	if body.New == "admin123" {
+		writeErr(w, 400, "不能使用已废弃的默认密码")
 		return
 	}
-	a.Store.SetSetting("admin_pass", store.HashPass(body.New))
-	a.Store.SetSetting("must_change_pass", "off")
-	a.Store.Audit("admin", "修改管理密码", "")
+	if !validConsolePassword(body.New) {
+		writeErr(w, 400, "新密码须为 8–256 字节并同时包含字母和数字")
+		return
+	}
+	account.PasswordHash, account.MustChange = store.HashPass(body.New), false
+	if account.Username == rootAccount {
+		err = a.Store.ChangeRootConsolePassword(account.PasswordHash)
+	} else {
+		err = a.Store.UpdateConsoleAccount(account)
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "更新密码失败")
+		return
+	}
+	a.revokeConsoleSessions(identity.Username)
+	identity.MustChange = false
+	token, _ := a.issueConsoleSession(identity)
+	http.SetCookie(w, a.sessionCookie(token, 43200))
+	a.audit(r, "修改控制台密码", "")
 	writeJSON(w, map[string]any{"ok": "true", "must_change": false})
 }
 
@@ -1034,12 +1495,19 @@ func (a *API) backupDir() string {
 }
 
 // RunBackup 生成带时间戳的一致性热备份，并清理超出保留份数的旧备份
-func (a *API) RunBackup() (string, error) {
+func (a *API) RunBackup() (name string, err error) {
+	defer func() {
+		if a.Inspector != nil {
+			if recordErr := a.Inspector.RecordBackupResult(name, err); recordErr != nil {
+				log.Printf("记录数据库备份巡检结果失败: %v", recordErr)
+			}
+		}
+	}()
 	dir := a.backupDir()
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return "", err
 	}
-	name := "niubwaf-" + time.Now().Format("20060102-150405") + ".db"
+	name = "niubwaf-" + time.Now().Format("20060102-150405") + ".db"
 	if err := a.Store.Backup(filepath.Join(dir, name)); err != nil {
 		return "", err
 	}
@@ -1075,7 +1543,7 @@ func (a *API) backup(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 500, "备份失败: "+err.Error())
 		return
 	}
-	a.Store.Audit("admin", "数据库备份", name)
+	a.audit(r, "数据库备份", name)
 	writeJSON(w, map[string]string{"ok": "true", "name": name})
 }
 

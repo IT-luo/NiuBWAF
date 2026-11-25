@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http/httptest"
 	"regexp"
 	"strconv"
@@ -33,28 +34,29 @@ func decodeDynScript(t *testing.T, script string) string {
 func TestDynTokenRoundTrip(t *testing.T) {
 	p := dynTestProxy()
 	tok := p.issueDynToken("1.2.3.4", 7)
-	if !p.validDynToken(tok, "1.2.3.4", 7) {
-		t.Fatal("自签发令牌应通过校验")
-	}
-	if p.validDynToken(tok, "9.9.9.9", 7) {
+	if p.consumeDynTokenValue(tok, "9.9.9.9", 7) {
 		t.Fatal("跨 IP 令牌必须拒绝")
 	}
-	if p.validDynToken(tok, "1.2.3.4", 8) {
+	if p.consumeDynTokenValue(tok, "1.2.3.4", 8) {
 		t.Fatal("跨站点令牌必须拒绝")
 	}
-	if p.validDynToken(tok+"0", "1.2.3.4", 7) {
+	if p.consumeDynTokenValue(tok+"0", "1.2.3.4", 7) {
 		t.Fatal("篡改签名必须拒绝")
 	}
-	if p.validDynToken("garbage", "1.2.3.4", 7) {
+	if p.consumeDynTokenValue("garbage", "1.2.3.4", 7) {
 		t.Fatal("畸形令牌必须拒绝")
+	}
+	if !p.consumeDynTokenValue(tok, "1.2.3.4", 7) {
+		t.Fatal("自签发令牌应通过校验")
 	}
 }
 
 func TestDynTokenExpiry(t *testing.T) {
 	p := dynTestProxy()
 	expired := time.Now().Add(-time.Minute).Unix()
-	tok := strconv.FormatInt(expired, 10) + "." + p.dynSign("1.2.3.4", 7, expired)
-	if p.validDynToken(tok, "1.2.3.4", 7) {
+	nonce := strings.Repeat("a", 48)
+	tok := strconv.FormatInt(expired, 10) + "." + nonce + "." + p.dynSign("1.2.3.4", 7, expired, nonce)
+	if p.consumeDynTokenValue(tok, "1.2.3.4", 7) {
 		t.Fatal("过期令牌必须拒绝")
 	}
 }
@@ -63,7 +65,7 @@ func TestDynTokenSecretIsolation(t *testing.T) {
 	p := dynTestProxy()
 	other := &Proxy{dynSecret: []byte("different-secret")}
 	tok := p.issueDynToken("1.2.3.4", 7)
-	if other.validDynToken(tok, "1.2.3.4", 7) {
+	if other.consumeDynTokenValue(tok, "1.2.3.4", 7) {
 		t.Fatal("不同密钥签发的令牌不可互认")
 	}
 }
@@ -85,32 +87,32 @@ func TestDynTokenFromHeader(t *testing.T) {
 	p := dynTestProxy()
 	tok := p.issueDynToken("1.2.3.4", 7)
 	r := httptest.NewRequest("POST", "/submit", nil)
-	r.Header.Set("X-NiuB-Dyn-Token", tok)
-	if !p.hasValidDynToken(r, nil, "1.2.3.4", 7) {
-		t.Fatal("请求头令牌应通过")
-	}
 	r.Header.Set("X-NiuB-Dyn-Token", "bad")
-	if p.hasValidDynToken(r, nil, "1.2.3.4", 7) {
+	if p.consumeDynToken(r, nil, "1.2.3.4", 7) {
 		t.Fatal("非法请求头令牌应拒绝")
+	}
+	r.Header.Set("X-NiuB-Dyn-Token", tok)
+	if !p.consumeDynToken(r, nil, "1.2.3.4", 7) {
+		t.Fatal("请求头令牌应通过")
 	}
 }
 
 func TestDynTokenFromBody(t *testing.T) {
 	p := dynTestProxy()
-	tok := p.issueDynToken("1.2.3.4", 7)
 	cases := map[string]string{
-		"urlencoded": "a=1&niub_dyn_token=" + tok + "&b=2",
-		"json":       `{"niub_dyn_token":"` + tok + `","x":1}`,
-		"multipart":  "--B\r\nContent-Disposition: form-data; name=\"niub_dyn_token\"\r\n\r\n" + tok + "\r\n--B--\r\n",
+		"urlencoded": "a=1&niub_dyn_token=%s&b=2",
+		"json":       `{"niub_dyn_token":"%s","x":1}`,
+		"multipart":  "--B\r\nContent-Disposition: form-data; name=\"niub_dyn_token\"\r\n\r\n%s\r\n--B--\r\n",
 	}
-	for name, body := range cases {
+	for name, format := range cases {
+		body := fmt.Sprintf(format, p.issueDynToken("1.2.3.4", 7))
 		r := httptest.NewRequest("POST", "/submit", strings.NewReader(body))
-		if !p.hasValidDynToken(r, []byte(body), "1.2.3.4", 7) {
+		if !p.consumeDynToken(r, []byte(body), "1.2.3.4", 7) {
 			t.Fatalf("%s 承载的令牌应通过", name)
 		}
 	}
 	r := httptest.NewRequest("POST", "/submit", nil)
-	if p.hasValidDynToken(r, []byte("a=1&b=2"), "1.2.3.4", 7) {
+	if p.consumeDynToken(r, []byte("a=1&b=2"), "1.2.3.4", 7) {
 		t.Fatal("无令牌请求体应拒绝")
 	}
 }
@@ -129,7 +131,7 @@ func TestDynScriptObfuscation(t *testing.T) {
 		t.Fatal("脚本应使用字符码还原 + eval")
 	}
 	core := decodeDynScript(t, script)
-	for _, want := range []string{tok, "niub_dyn_token", "X-NiuB-Dyn-Token", "XMLHttpRequest", "fetch", "MutationObserver"} {
+	for _, want := range []string{tok, "niub_dyn_token", "X-NiuB-Dyn-Token", "XMLHttpRequest", "fetch", "MutationObserver", "getResponseHeader", "headers.get"} {
 		if !strings.Contains(core, want) {
 			t.Fatalf("还原后的脚本缺少 %q", want)
 		}
@@ -155,7 +157,7 @@ func TestInjectDynamic(t *testing.T) {
 	if m == nil {
 		t.Fatal("脚本中未找到令牌变量")
 	}
-	if !p.validDynToken(m[1], "1.2.3.4", 7) {
+	if !p.consumeDynTokenValue(m[1], "1.2.3.4", 7) {
 		t.Fatal("植入的令牌应能通过校验")
 	}
 }

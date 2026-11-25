@@ -191,3 +191,7 @@ func truncUTF8(s string, n int) string {
 	}
 	return s[:n]
 }
+
+func bodyPrefixString(body []byte, limit int) string {
+	return truncUTF8(string(body[:min(len(body), limit+1)]), limit)
+}

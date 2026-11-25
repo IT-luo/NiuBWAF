@@ -3,9 +3,11 @@ package proxy
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 // ip2region xdb 纯 Go 读取器：全文件内存缓存 + 向量索引二分，零依赖
@@ -17,21 +19,32 @@ const (
 )
 
 type xdbSearcher struct {
-	buff   []byte
-	v3     bool
-	lenPtr int // 段索引内 dataLen 字段偏移（v2=12, v3=8）
-	ptrOff int // 段索引内 dataPtr 字段偏移（v2=8, v3=10）
+	buff    []byte
+	v3      bool
+	lenPtr  int // 段索引内 dataLen 字段偏移（v2=12, v3=8）
+	ptrOff  int // 段索引内 dataPtr 字段偏移（v2=8, v3=10）
+	path    string
+	modTime time.Time
 }
 
 func loadXDB(path string) (*xdbSearcher, error) {
-	b, err := os.ReadFile(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	b, err := io.ReadAll(file)
 	if err != nil {
 		return nil, err
 	}
 	if len(b) < xdbHeaderLen+xdbVecIdxLen+xdbSegLen {
 		return nil, fmt.Errorf("xdb 文件过短: %d 字节", len(b))
 	}
-	x := &xdbSearcher{buff: b}
+	x := &xdbSearcher{buff: b, path: path, modTime: info.ModTime()}
 	switch v := binary.LittleEndian.Uint16(b[0:2]); v {
 	case 2:
 		x.lenPtr, x.ptrOff = 12, 8
@@ -104,7 +117,7 @@ func (x *xdbSearcher) lookup(ip string) (xdbRegion, bool) {
 		if int(dptr)+dlen > len(x.buff) {
 			return xdbRegion{}, false
 		}
-		return parseXDBRegion(string(x.buff[dptr : int(dptr)+dlen]), x.v3), true
+		return parseXDBRegion(string(x.buff[dptr:int(dptr)+dlen]), x.v3), true
 	}
 	return xdbRegion{}, false
 }

@@ -329,11 +329,22 @@ func keywordWithin(toks []token, i, span int, kws ...string) bool {
 	return false
 }
 
-var xssProbes = []struct {
+// 每个探测表达式至少需要相应的一项标记。缺少标记时可跳过整个表达式组。
+// TestSemanticProbeMarkers 验证该前提，防止后续规则变更产生漏检。
+const (
+	xssProbeMarkerChars  = "<.(=["
+	xssProbeMarkerWord   = "script"
+	lfiProbeMarkerChars  = "./\\"
+	codeProbeMarkerChars = "<(@#."
+)
+
+type semanticProbe struct {
 	re   *regexp.Regexp
 	pts  int
 	name string
-}{
+}
+
+var xssProbes = []semanticProbe{
 	{regexp.MustCompile(`<\s*script`), 6, "script 标签"},
 	{regexp.MustCompile(`<[^>]+\son[a-z]{2,}\s*=`), 5, "事件处理器属性"},
 	{regexp.MustCompile(`(href|src|action|formaction|data|poster|background)\s*=\s*["']?\s*(javascript|vbscript)\s*:`), 5, "伪协议注入"},
@@ -351,26 +362,15 @@ var xssProbes = []struct {
 }
 
 func xssScore(low string) (int, string) {
-	score, best := 0, 0
-	reason := ""
-	for _, p := range xssProbes {
-		if p.re.MatchString(low) {
-			score += p.pts
-			if p.pts > best {
-				best, reason = p.pts, p.name
-			}
-		}
+	if !strings.ContainsAny(low, xssProbeMarkerChars) && !strings.Contains(low, xssProbeMarkerWord) {
+		return 0, ""
 	}
-	return score, reason
+	return scoreProbes(low, xssProbes)
 }
 
 // lfiProbes 服务端文件包含/读取与 SSRF 探测（弥补 CRS 930120 对真实遥测流量的高误报，
 // 只匹配高置信度敏感目标，误报远低于 CRS 的文件名列表）
-var lfiProbes = []struct {
-	re   *regexp.Regexp
-	pts  int
-	name string
-}{
+var lfiProbes = []semanticProbe{
 	{regexp.MustCompile(`\b(?:file|php|phar|zip|glob|expect|dict|gopher|ldap|sftp)://`), 6, "危险协议伪 URL"},
 	{regexp.MustCompile(`\bdata://[^,]*;?\s*base64`), 6, "data:// base64 载荷"},
 	{regexp.MustCompile(`(?:^|[/\\])etc[/\\](?:passwd|shadow|group|hosts|issue|motd|profile|crontab|sudoers)\b`), 6, "敏感 *nix 系统文件"},
@@ -379,26 +379,15 @@ var lfiProbes = []struct {
 }
 
 func lfiScore(low string) (int, string) {
-	score, best := 0, 0
-	reason := ""
-	for _, p := range lfiProbes {
-		if p.re.MatchString(low) {
-			score += p.pts
-			if p.pts > best {
-				best, reason = p.pts, p.name
-			}
-		}
+	if !strings.ContainsAny(low, lfiProbeMarkerChars) {
+		return 0, ""
 	}
-	return score, reason
+	return scoreProbes(low, lfiProbes)
 }
 
 // codeInjProbes Webshell/代码注入特征（PHP/JSP 源码、危险执行函数），
 // 覆盖 base64 还原后暴露的 <?php 载荷等 CRS 结构化规则易漏报的场景
-var codeInjProbes = []struct {
-	re   *regexp.Regexp
-	pts  int
-	name string
-}{
+var codeInjProbes = []semanticProbe{
 	{regexp.MustCompile(`<\?php\b`), 6, "PHP 源码标签"},
 	{regexp.MustCompile(`\bphpinfo\s*\(`), 6, "phpinfo 探测"},
 	{regexp.MustCompile(`\b(?:shell_exec|passthru|proc_open|popen)\s*\(`), 6, "命令执行函数"},
@@ -409,9 +398,16 @@ var codeInjProbes = []struct {
 }
 
 func codeInjScore(low string) (int, string) {
+	if !strings.ContainsAny(low, codeProbeMarkerChars) {
+		return 0, ""
+	}
+	return scoreProbes(low, codeInjProbes)
+}
+
+func scoreProbes(low string, probes []semanticProbe) (int, string) {
 	score, best := 0, 0
 	reason := ""
-	for _, p := range codeInjProbes {
+	for _, p := range probes {
 		if p.re.MatchString(low) {
 			score += p.pts
 			if p.pts > best {
@@ -448,7 +444,7 @@ func (e *Engine) Semantic(excl []Exclusion, uri string, body []byte) *SemanticHi
 		}
 	}
 	if len(body) > 0 {
-		bs := truncUTF8(string(body), 64<<10)
+		bs := bodyPrefixString(body, 64<<10)
 		fields = append(fields, semField{"body", bs})
 		trimmed := strings.TrimLeft(bs, " \t\r\n")
 		if strings.Contains(bs, "=") && !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") && !strings.HasPrefix(trimmed, "<") {

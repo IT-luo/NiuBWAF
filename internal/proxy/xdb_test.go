@@ -121,6 +121,26 @@ func TestCityInfoRealXDB(t *testing.T) {
 		t.Fatalf("真实国内 IP 应解析出省市与运营商: %+v", ci)
 	}
 	t.Logf("112.97.81.30 → %+v", ci)
+
+	a := NewAnalytics(newFakeAnaStore(), g)
+	a.Record(ReqStat{IP: "112.97.81.30", Status: 200})
+	a.Record(ReqStat{IP: "112.97.81.30", Status: 403, Blocked: true})
+	s := a.Snapshot(24)
+	country, ok := geoFind(s.Countries, "CN")
+	if !ok || country.Count != 2 || country.Blocked != 1 {
+		t.Fatalf("真实国内 IP 国家聚合错误: %+v", s.Countries)
+	}
+	province, ok := geoFind(s.Provinces, "广东省")
+	if !ok || province.Count != 2 || province.Blocked != 1 {
+		t.Fatalf("真实国内 IP 省份聚合错误: %+v", s.Provinces)
+	}
+	if g.Available() {
+		a.Record(ReqStat{IP: "8.8.8.8", Status: 200})
+		us, ok := geoFind(a.Snapshot(24).Countries, "US")
+		if !ok || us.Count != 1 {
+			t.Fatalf("真实海外 IP 国家聚合错误: %+v", a.Snapshot(24).Countries)
+		}
+	}
 }
 
 func TestLoadXDBRejectsBadFile(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/oschwald/maxminddb-golang"
 )
@@ -24,13 +25,22 @@ type GeoASN struct {
 	Org    string `json:"org"`
 }
 
+// GeoDataStatus 是一个已成功加载数据源的只读元信息快照。
+type GeoDataStatus struct {
+	Kind      string    `json:"kind"`
+	Path      string    `json:"path"`
+	BuildTime time.Time `json:"build_time,omitempty"`
+	ModTime   time.Time `json:"mod_time,omitempty"`
+}
+
 // GeoIP 加载 ip2region.xdb（中国省市+运营商，优先）与国家/城市/ASN 三个 mmdb 库，缺失时优雅降级
 type GeoIP struct {
-	mu      sync.RWMutex
-	xdb     *xdbSearcher
-	country *maxminddb.Reader
-	city    *maxminddb.Reader
-	asn     *maxminddb.Reader
+	mu         sync.RWMutex
+	xdb        *xdbSearcher
+	country    *maxminddb.Reader
+	city       *maxminddb.Reader
+	asn        *maxminddb.Reader
+	dataStatus []GeoDataStatus
 }
 
 func NewGeoIP(dataDir string) *GeoIP {
@@ -41,10 +51,46 @@ func NewGeoIP(dataDir string) *GeoIP {
 	} else if x, err := loadXDB(filepath.Join(dataDir, "ip2region_v4.xdb")); err == nil {
 		g.xdb = x
 	}
-	g.country, _ = openMMDB(filepath.Join(dataDir, "geoip.mmdb"))
-	g.city, _ = openMMDB(filepath.Join(dataDir, "geoip_city.mmdb"))
-	g.asn, _ = openMMDB(filepath.Join(dataDir, "geoip_asn.mmdb"))
+	countryPath := filepath.Join(dataDir, "geoip.mmdb")
+	cityPath := filepath.Join(dataDir, "geoip_city.mmdb")
+	asnPath := filepath.Join(dataDir, "geoip_asn.mmdb")
+	g.country, _ = openMMDB(countryPath)
+	g.city, _ = openMMDB(cityPath)
+	g.asn, _ = openMMDB(asnPath)
+
+	// 元信息只在成功加载时读取并缓存；DataStatus 不再访问文件系统。
+	g.dataStatus = make([]GeoDataStatus, 0, 4)
+	for _, source := range []struct {
+		path   string
+		reader *maxminddb.Reader
+	}{{countryPath, g.country}, {cityPath, g.city}, {asnPath, g.asn}} {
+		if source.reader == nil {
+			continue
+		}
+		status := GeoDataStatus{Kind: "mmdb", Path: source.path}
+		if epoch := source.reader.Metadata.BuildEpoch; epoch != 0 {
+			status.BuildTime = time.Unix(int64(epoch), 0)
+		}
+		if info, err := os.Stat(source.path); err == nil {
+			status.ModTime = info.ModTime()
+		}
+		g.dataStatus = append(g.dataStatus, status)
+	}
+	if g.xdb != nil {
+		g.dataStatus = append(g.dataStatus, GeoDataStatus{
+			Kind: "xdb", Path: g.xdb.path, ModTime: g.xdb.modTime,
+		})
+	}
 	return g
+}
+
+// DataStatus 返回当前实际加载的数据源；返回切片与内部快照相互独立。
+func (g *GeoIP) DataStatus() []GeoDataStatus {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := make([]GeoDataStatus, len(g.dataStatus))
+	copy(out, g.dataStatus)
+	return out
 }
 
 func openMMDB(path string) (*maxminddb.Reader, error) {

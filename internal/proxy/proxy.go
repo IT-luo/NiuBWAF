@@ -3,9 +3,12 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -13,13 +16,16 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"niubwaf/internal/apispec"
 	"niubwaf/internal/engine"
 	"niubwaf/internal/metrics"
 	"niubwaf/internal/store"
@@ -28,16 +34,26 @@ import (
 )
 
 type upstreamTarget struct {
-	u         *url.URL
-	downUntil int64 // unix 秒，原子读写；0=健康
+	u            *url.URL
+	dialAddress  string
+	slots        chan struct{}
+	downUntil    int64 // Unix 秒，0 表示健康
+	nextErrorLog int64 // Unix 秒，限制同一上游故障的重复日志
 }
 
 type cachedSite struct {
 	store.Site
-	targets []*upstreamTarget
-	rr      uint64
-	excl    []engine.Exclusion
-	rules   []engine.CompiledRule
+	targets        []*upstreamTarget
+	rr             uint64
+	excl           []engine.Exclusion
+	rules          []engine.CompiledRule
+	rateRules      []engine.CompiledRule
+	shadowRules    []cachedShadowRule
+	apiPolicy      *apispec.Policy
+	apiDigest      [sha256.Size]byte
+	uploadPolicies map[uploadRoute]store.UploadPolicy
+	verifyCrawlers bool
+	botPathLimit   int
 }
 
 // pick 轮询选择健康上游；全部故障时仍返回一个尝试转发
@@ -94,19 +110,25 @@ func (h *Hub) Broadcast(v any) {
 }
 
 type Proxy struct {
-	Store   *store.Store
-	Engine  *engine.Engine
-	Geo     *GeoIP
-	IDC     *IDCMatcher
-	Tor     *TorList
-	Limiter *Limiter
-	Cap     *Captcha
-	Hub     *Hub
-	Ana     *Analytics
-	threat  *ThreatIntel
+	Store             *store.Store
+	Engine            *engine.Engine
+	Geo               *GeoIP
+	IDC               *IDCMatcher
+	Tor               *TorList
+	Limiter           *Limiter
+	Cap               *Captcha
+	Hub               *Hub
+	Ana               *Analytics
+	threat            *ThreatIntel
+	crawlers          *crawlerVerifier
+	botPaths          botPathTracker
+	upstreamLimit     int
+	upstreamTransport *http.Transport
+	uploadBudget      uploadBudget
 	// HTTPSAddr 用于 HTTP→HTTPS 跳转时构造目标地址，如 ":8443"
 	HTTPSAddr string
 
+	reloadMu    sync.Mutex
 	mu          sync.RWMutex
 	sites       map[string]*cachedSite
 	blackNet    []*net.IPNet
@@ -123,6 +145,8 @@ type Proxy struct {
 	acmeSig     string
 
 	dynSecret []byte
+	dynMu     sync.Mutex
+	dynPools  map[int64]*dynNoncePool
 
 	lastRepLogID atomic.Int64 // 上次信誉聚合时的最大攻击日志 ID，用于空闲跳过
 	repIdle      atomic.Int32 // 连续空闲周期计数
@@ -132,11 +156,19 @@ type Proxy struct {
 }
 
 func New(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *IDCMatcher, tor *TorList, secret string) *Proxy {
+	return NewWithUpstreamLimit(st, eng, geo, idc, tor, secret, DefaultUpstreamConnections)
+}
+
+func NewWithUpstreamLimit(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *IDCMatcher, tor *TorList, secret string, limit int) *Proxy {
+	if limit <= 0 {
+		limit = DefaultUpstreamConnections
+	}
 	p := &Proxy{
 		Store: st, Engine: eng, Geo: geo, IDC: idc, Tor: tor,
 		Limiter: NewLimiter(), Cap: NewCaptcha(secret), Hub: NewHub(),
 		Ana:       NewAnalytics(st, geo),
-		dynSecret: []byte(secret), threat: NewThreatIntel(st),
+		dynSecret: []byte(secret), threat: NewThreatIntel(st), crawlers: newCrawlerVerifier(),
+		upstreamLimit: limit, upstreamTransport: newUpstreamTransport(limit),
 	}
 	p.Reload()
 	go func() {
@@ -210,6 +242,9 @@ func (p *Proxy) UpstreamHealth() []UpstreamStatus {
 }
 
 func (p *Proxy) Reload() {
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+
 	if err := p.Engine.SetContentTypes(engine.ParseContentTypes(p.Store.GetSetting("allowed_content_types"))); err != nil {
 		log.Printf("应用允许内容类型失败: %v", err)
 	}
@@ -217,6 +252,16 @@ func (p *Proxy) Reload() {
 	sites, err := p.Store.ListSites()
 	if err != nil {
 		log.Printf("加载站点失败: %v", err)
+		return
+	}
+	policies, err := p.Store.EnabledAPIPolicies()
+	if err != nil {
+		log.Printf("加载 API 契约失败: %v", err)
+		return
+	}
+	uploadPolicies, err := p.Store.UploadPoliciesBySite()
+	if err != nil {
+		log.Printf("加载上传策略失败: %v", err)
 		return
 	}
 	m := map[string]*cachedSite{}
@@ -233,33 +278,63 @@ func (p *Proxy) Reload() {
 	}
 	crs, _ := p.Store.ListRules()
 	var globalRules []engine.CompiledRule
+	var globalShadowRules []cachedShadowRule
 	perSiteRules := map[int64][]engine.CompiledRule{}
+	perSiteShadowRules := map[int64][]cachedShadowRule{}
 	for _, r := range crs {
 		if !r.Enabled {
 			continue
 		}
 		cr, err := engine.CompileRule(engine.RuleDef{
 			ID: r.ID, SiteID: r.SiteID, Name: r.Name, Priority: r.Priority,
-			Logic: r.Logic, Conditions: r.Conditions, Action: r.Action, ActionParam: r.ActionParam,
+			Logic: r.Logic, Conditions: r.Conditions, Action: r.Action, ActionParam: r.ActionParam, Shadow: r.Shadow,
 		})
 		if err != nil {
 			log.Printf("自定义规则 %d(%s) 编译失败，已跳过: %v", r.ID, r.Name, err)
 			continue
 		}
-		if r.SiteID == 0 {
+		if r.Shadow {
+			sr := cachedShadowRule{rule: cr, definition: shadowRuleDefinition(r)}
+			if r.SiteID == 0 {
+				globalShadowRules = append(globalShadowRules, sr)
+			} else {
+				perSiteShadowRules[r.SiteID] = append(perSiteShadowRules[r.SiteID], sr)
+			}
+		} else if r.SiteID == 0 {
 			globalRules = append(globalRules, cr)
 		} else {
 			perSiteRules[r.SiteID] = append(perSiteRules[r.SiteID], cr)
 		}
 	}
 	p.mu.RLock()
-	oldHealth := map[string]int64{}
+	type targetKey struct {
+		siteID int64
+		url    string
+	}
+	oldTargets := map[targetKey]*upstreamTarget{}
+	originSlots := map[string]chan struct{}{}
+	oldShadow := map[shadowRuleKey]cachedShadowRule{}
+	oldPolicies := map[int64]*cachedSite{}
 	for _, os := range p.sites {
+		if os.apiPolicy != nil {
+			oldPolicies[os.ID] = os
+		}
 		for _, t := range os.targets {
-			oldHealth[t.u.String()] = atomic.LoadInt64(&t.downUntil)
+			oldTargets[targetKey{os.ID, t.u.String()}] = t
+			originSlots[upstreamOrigin(t.u)] = t.slots
+		}
+		for _, sr := range os.shadowRules {
+			oldShadow[shadowRuleKey{siteID: os.ID, ruleID: sr.rule.ID}] = sr
 		}
 	}
 	p.mu.RUnlock()
+	limit := p.upstreamLimit
+	if limit <= 0 {
+		limit = DefaultUpstreamConnections
+	}
+	verifyCrawlers := p.Store.GetSetting("bot_verify_crawlers") == "on"
+	botPathLimit, _ := strconv.Atoi(p.Store.GetSetting("bot_path_limit"))
+	botPathLimit = max(0, min(128, botPathLimit))
 	for _, s := range sites {
 		var targets []*upstreamTarget
 		for _, raw := range strings.Split(s.Upstream, ",") {
@@ -272,20 +347,80 @@ func (p *Proxy) Reload() {
 				log.Printf("站点 %s 上游地址无效: %s", s.Domain, raw)
 				continue
 			}
-			targets = append(targets, &upstreamTarget{u: u, downUntil: oldHealth[u.String()]})
+			target := oldTargets[targetKey{s.ID, u.String()}]
+			if target == nil {
+				address := upstreamAddress(u)
+				origin := u.Scheme + "://" + address
+				slots := originSlots[origin]
+				if slots == nil {
+					slots = make(chan struct{}, limit)
+					originSlots[origin] = slots
+				}
+				target = &upstreamTarget{u: u, dialAddress: address, slots: slots}
+			}
+			targets = append(targets, target)
 		}
 		if len(targets) == 0 {
 			log.Printf("站点 %s 无有效上游地址: %s", s.Domain, s.Upstream)
 			continue
 		}
-		cs := &cachedSite{Site: s, targets: targets}
-		cs.excl = append(append([]engine.Exclusion{}, globalExcl...), perSite[s.ID]...)
-		cs.rules = append(append([]engine.CompiledRule{}, globalRules...), perSiteRules[s.ID]...)
-		sort.SliceStable(cs.rules, func(i, j int) bool {
-			if cs.rules[i].Priority != cs.rules[j].Priority {
-				return cs.rules[i].Priority < cs.rules[j].Priority
+		cs := &cachedSite{Site: s, targets: targets, verifyCrawlers: verifyCrawlers, botPathLimit: botPathLimit}
+		if policies := uploadPolicies[s.ID]; len(policies) > 0 {
+			cs.uploadPolicies = make(map[uploadRoute]store.UploadPolicy, len(policies))
+			for _, policy := range policies {
+				cs.uploadPolicies[uploadRoute{method: policy.Method, path: policy.Path}] = policy
 			}
-			return cs.rules[i].ID < cs.rules[j].ID
+		}
+		if cs.verifyCrawlers && cs.Enabled && cs.BotMode != "" && cs.BotMode != "off" && p.crawlers != nil {
+			p.crawlers.refreshIfDue()
+		}
+		if config, ok := policies[s.ID]; ok {
+			digest := sha256.Sum256([]byte(config.Document))
+			old := oldPolicies[s.ID]
+			if old != nil && old.apiDigest == digest && old.apiPolicy.Mode == config.Mode && old.apiPolicy.Prefix == config.Prefix {
+				cs.apiPolicy, cs.apiDigest = old.apiPolicy, digest
+			} else {
+				policy, err := apispec.Compile(context.Background(), config.Mode, config.Prefix, config.Document)
+				if err != nil {
+					log.Printf("站点 %s API 契约编译失败: %v", s.Domain, err)
+					if old != nil {
+						cs.apiPolicy, cs.apiDigest = old.apiPolicy, old.apiDigest
+					}
+				} else {
+					cs.apiPolicy, cs.apiDigest = policy, digest
+				}
+			}
+		}
+		cs.excl = append(append([]engine.Exclusion{}, globalExcl...), perSite[s.ID]...)
+		rules := append(append([]engine.CompiledRule{}, globalRules...), perSiteRules[s.ID]...)
+		sort.SliceStable(rules, func(i, j int) bool {
+			if rules[i].Priority != rules[j].Priority {
+				return rules[i].Priority < rules[j].Priority
+			}
+			return rules[i].ID < rules[j].ID
+		})
+		for _, rule := range rules {
+			if rule.Action == engine.RuleActionRateLimit {
+				cs.rateRules = append(cs.rateRules, rule)
+			} else {
+				cs.rules = append(cs.rules, rule)
+			}
+		}
+		shadowRules := append(append([]cachedShadowRule{}, globalShadowRules...), perSiteShadowRules[s.ID]...)
+		for _, sr := range shadowRules {
+			key := shadowRuleKey{siteID: s.ID, ruleID: sr.rule.ID}
+			if old, ok := oldShadow[key]; ok && old.definition == sr.definition {
+				sr.stats = old.stats
+			} else {
+				sr.stats = &shadowRuleStats{since: time.Now()}
+			}
+			cs.shadowRules = append(cs.shadowRules, sr)
+		}
+		sort.SliceStable(cs.shadowRules, func(i, j int) bool {
+			if cs.shadowRules[i].rule.Priority != cs.shadowRules[j].rule.Priority {
+				return cs.shadowRules[i].rule.Priority < cs.shadowRules[j].rule.Priority
+			}
+			return cs.shadowRules[i].rule.ID < cs.shadowRules[j].rule.ID
 		})
 		m[strings.ToLower(s.Domain)] = cs
 	}
@@ -332,6 +467,7 @@ func (p *Proxy) Reload() {
 	p.trustedNet = engine.ParseTrustedProxies(p.Store.GetSetting("trusted_proxies"))
 	p.certs = certs
 	p.dynBlack = p.Store.ActiveBans(now)
+	p.pruneDynPools(m)
 	p.mu.Unlock()
 	p.refreshACME()
 }
@@ -402,6 +538,10 @@ func stripPort(host string) string {
 }
 
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodConnect {
+		http.Error(w, "CONNECT is not supported", http.StatusMethodNotAllowed)
+		return
+	}
 	p.mu.RLock()
 	trusted := p.trustedNet
 	p.mu.RUnlock()
@@ -420,9 +560,10 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			metrics.Default.IncRequest(metricSite, result)
 		}
 		if sw != nil {
+			refHost, refPage := externalReferer(r.Referer(), metricSite)
 			p.Ana.Record(ReqStat{
-				IP: ip, Host: metricSite, Path: truncStr(r.URL.Path, pathMaxLen),
-				UA: r.Header.Get("User-Agent"), Referer: refererHost(r.Referer(), metricSite),
+				IP: ip, Host: metricSite, Path: truncStr(r.URL.Path, pathMaxLen), Page: visitedPage(r.TLS != nil, metricSite, r.URL.EscapedPath()),
+				UA: r.Header.Get("User-Agent"), Referer: refHost, RefererPage: refPage,
 				Status: sw.code, Blocked: metricBlocked,
 			})
 		}
@@ -434,7 +575,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	host := strings.ToLower(stripPort(r.Host))
-	metricSite = host
+	metricSite = "unknown"
 	p.mu.RLock()
 	site := p.sites[host]
 	black := p.matchIP(ip, p.blackNet, p.blackIP)
@@ -450,6 +591,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}))
 		return
 	}
+	metricSite = host
 	sw = &statusWriter{ResponseWriter: w}
 	w = sw
 
@@ -493,11 +635,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if len(site.rules) > 0 {
+	var rateRule *engine.CompiledRule
+	if len(site.rules) > 0 || len(site.shadowRules) > 0 || len(site.rateRules) > 0 {
 		in := &engine.RuleInput{
 			ClientIP: ip, Method: r.Method, Path: r.URL.Path, URL: r.URL.RequestURI(),
 			Header: r.Header, Query: r.URL.Query(), Country: p.Geo.Country(ip),
 		}
+		// 全部影子规则独立评估完成后，才进入原有真实规则动作链。
+		evaluateShadowRules(site.shadowRules, in)
 		if hit := engine.MatchRule(site.rules, in); hit != nil {
 			rid := customRuleIDBase + int(hit.ID)
 			switch hit.Action {
@@ -519,106 +664,193 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			case "captcha":
-				if !p.Cap.ValidCookie(r, ip, site.ID) {
+				purpose := "rule-" + strconv.FormatInt(hit.ID, 10)
+				if !p.Cap.ValidCookie(r, ip, site.ID, purpose) {
 					p.Store.AddTraffic(site.ID, true, 0)
 					p.logAttack(site, ip, r, "custom", "命中自定义规则，触发人机验证："+hit.Name, rid, http.StatusTooManyRequests, reqID)
-					p.Cap.Issue(w, ip, site.ID, r.URL.RequestURI())
+					p.Cap.Issue(w, ip, host, site.ID, purpose, r.URL.RequestURI())
 					return
 				}
 			case "log":
 				p.logAttack(site, ip, r, "custom", "命中自定义规则（观察）："+hit.Name, rid, http.StatusOK, reqID)
 			}
 		}
+		rateRule = engine.MatchRule(site.rateRules, in)
 	}
 
 	// 反爬 Bot 防护：内置爬虫 UA 特征库，命中恶意/自动化客户端按站点动作处置。
 	// 置于自定义规则之后（放行规则可豁免特定 UA）、CC 与扫体之前（低成本前置过滤）。
-	// 善意爬虫（搜索引擎等）默认放行，仅严格模式处置；已通过人机验证的 cookie 豁免。
-	if site.BotMode != "" && site.BotMode != "off" && !p.Cap.ValidCookie(r, ip, site.ID) {
+	// 善意爬虫（搜索引擎等）默认放行，仅严格模式处置。
+	if site.BotMode != "" && site.BotMode != "off" {
 		kind, sig := classifyBotUA(r.Header.Get("User-Agent"))
-		if kind == "bad" || (kind == "good" && site.BotStrict) {
+		verified := false
+		if site.verifyCrawlers && kind == "good" {
+			match, available := p.crawlers.verified(sig, ip)
+			verified = available && match
+			if available && !match {
+				kind, sig = "bad", sig+" 来源未通过验证"
+			}
+		}
+		identified := kind == "bad" || (kind == "good" && site.BotStrict)
+		pathLimited, first := false, false
+		if !identified && !verified && site.botPathLimit > 0 {
+			pathLimited, first = p.botPaths.limitNewPath(site.ID, ip, r.URL.Path, site.botPathLimit, time.Now().Unix())
+			if pathLimited {
+				sig = "短时间访问不同路径过多"
+			}
+		}
+		if identified || pathLimited {
+			reason := "Bot 防护：" + sig
 			switch site.BotMode {
 			case "block":
-				block(http.StatusForbidden, "bot", "Bot 防护：识别为自动化爬虫/攻击工具（"+sig+"）", botRuleID)
+				status := http.StatusForbidden
+				if pathLimited {
+					status = http.StatusTooManyRequests
+					w.Header().Set("Retry-After", strconv.Itoa(botPathWindowSeconds))
+				}
+				block(status, "bot", reason, botRuleID)
 				return
 			case "captcha":
-				p.Store.AddTraffic(site.ID, true, 0)
-				p.logAttack(site, ip, r, "bot", "Bot 防护：识别为自动化客户端，触发人机验证（"+sig+"）", botRuleID, http.StatusTooManyRequests, reqID)
-				p.Cap.Issue(w, ip, site.ID, r.URL.RequestURI())
-				return
+				if !p.Cap.ValidCookie(r, ip, site.ID, captchaBot) {
+					metricBlocked = true
+					p.Store.AddTraffic(site.ID, true, 0)
+					p.logAttack(site, ip, r, "bot", reason+"，触发人机验证", botRuleID, http.StatusTooManyRequests, reqID)
+					p.Cap.Issue(w, ip, host, site.ID, captchaBot, r.URL.RequestURI())
+					return
+				}
 			case "log":
-				p.logAttack(site, ip, r, "bot", "Bot 防护（观察）：识别为自动化爬虫（"+sig+"）", botRuleID, http.StatusOK, reqID)
+				if identified || first {
+					p.logAttack(site, ip, r, "bot", "Bot 防护观察："+sig, botRuleID, http.StatusOK, reqID)
+				}
 			}
 		}
 	}
 
-	if site.CCRate > 0 && !p.Cap.ValidCookie(r, ip, site.ID) {
-		if !p.Limiter.Allow(fmt.Sprintf("%s|%d", ip, site.ID), site.CCRate, site.CCBurst) {
-			if site.Captcha {
+	if site.CCRate > 0 || rateRule != nil {
+		rate, burst := site.CCRate, site.CCBurst
+		key := ip + "|" + strconv.FormatInt(site.ID, 10)
+		scope, reason, ruleID := "site", "访问频率超出限制（CC 防护）", 0
+		if rateRule != nil {
+			rate, burst = rateRule.Rate, rateRule.Burst
+			key += "|" + strconv.FormatInt(rateRule.ID, 10)
+			scope, reason, ruleID = "rule", "接口访问频率超出限制："+rateRule.Name, customRuleIDBase+int(rateRule.ID)
+		}
+		if !p.Limiter.Allow(key, rate, burst) {
+			metrics.Default.IncRateLimited(scope)
+			w.Header().Set("Retry-After", "1")
+			if site.Captcha && !p.Cap.ValidCookie(r, ip, site.ID, captchaRate) {
+				metricBlocked = true
 				p.Store.AddTraffic(site.ID, true, 0)
-				p.logAttack(site, ip, r, "cc", "访问频率超限，触发人机验证", 0, http.StatusTooManyRequests, reqID)
-				p.Cap.Issue(w, ip, site.ID, r.URL.RequestURI())
+				p.logAttack(site, ip, r, "cc", reason+"，触发人机验证", ruleID, http.StatusTooManyRequests, reqID)
+				p.Cap.Issue(w, ip, host, site.ID, captchaRate, r.URL.RequestURI())
 				return
 			}
-			block(http.StatusTooManyRequests, "cc", "访问频率超出限制（CC 防护）", 0)
+			block(http.StatusTooManyRequests, "cc", reason, ruleID)
 			return
 		}
 	}
 
-	if site.AuthUser != "" {
-		u, pw, ok := r.BasicAuth()
-		userOK := subtle.ConstantTimeCompare([]byte(u), []byte(site.AuthUser)) == 1
-		passOK, _ := store.VerifyPass(pw, site.AuthPass)
-		if !ok || !userOK || !passOK {
-			w.Header().Set("WWW-Authenticate", `Basic realm="NiuB WAF Authentication"`)
-			http.Error(w, "401 Unauthorized - 牛B WAF 身份认证", http.StatusUnauthorized)
-			p.Store.AddTraffic(site.ID, false, 0)
+	if !p.requireSiteAuth(w, r, site) {
+		return
+	}
+	for _, encoding := range r.Header.Values("Content-Encoding") {
+		if !strings.EqualFold(strings.TrimSpace(encoding), "identity") {
+			block(http.StatusUnsupportedMediaType, "waf", "防护站点仅接受未压缩的请求体", 0)
 			return
 		}
 	}
-
+	defaultLimit := min(p.bodyInspectLimit(), int64(p.Engine.ScanLimit()))
+	limit := defaultLimit
+	route := uploadRoute{method: r.Method, path: r.URL.EscapedPath()}
+	uploadPolicy, matchedUpload := site.uploadPolicies[route]
+	if matchedUpload {
+		limit = int64(uploadPolicy.MaxBodyMiB) << 20
+	}
+	if r.ContentLength > limit {
+		block(http.StatusRequestEntityTooLarge, "waf", "请求体超过完整检测上限", 0)
+		return
+	}
 	var body []byte
-	if r.Body != nil {
-		limit := p.bodyInspectLimit()
-		// 多读 1 字节用于探测是否超限，避免对超大请求体整体缓冲（每请求占用大内存）
-		peek, _ := engine.ReadBodyLimited(r.Body, limit+1)
-		if int64(len(peek)) > limit {
-			// 超限：拼回原流原样透传（不截断、不缓冲整体），仅对前缀做检测。
-			// 不设 GetBody → 该请求不参与上游故障重试（避免为重试缓冲超大体）。
-			body = peek[:limit]
-			r.Body = io.NopCloser(io.MultiReader(bytes.NewReader(peek), r.Body))
-		} else {
-			r.Body.Close()
-			body = peek
-			r.Body = io.NopCloser(bytes.NewReader(body))
-			r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
-			// 缓冲后统一为 Content-Length 形式：避免 chunked 请求被 CRS 误判，
-			// 也防止 ReverseProxy 因 ContentLength 未更新而丢失请求体
-			r.ContentLength = int64(len(body))
-			r.TransferEncoding = nil
-			r.Header.Del("Transfer-Encoding")
-			if len(body) > 0 || r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
-				r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	if r.Body != nil && r.Body != http.NoBody {
+		largeUpload := matchedUpload && (r.ContentLength < 0 || r.ContentLength > defaultLimit)
+		if largeUpload {
+			reserve := limit
+			if r.ContentLength >= 0 {
+				reserve = r.ContentLength
 			}
+			key := uploadRouteKey{siteID: site.ID, route: route}
+			if !p.uploadBudget.acquire(key, uploadPolicy, reserve) {
+				metrics.Default.IncOverloadRejected("upload_capacity")
+				w.Header().Set("Retry-After", "1")
+				WriteBlock(w, http.StatusServiceUnavailable, RenderBlockPage(p.Store.GetSetting("block_page"), map[string]string{
+					"REQ_ID": reqID, "REASON": "大文件上传繁忙，请稍后重试",
+					"CLIENT_IP": ip, "DOMAIN": host, "TIME": nowStr(),
+				}))
+				p.Store.AddTraffic(site.ID, false, 0)
+				return
+			}
+			defer p.uploadBudget.release(key, reserve)
+			// 已知长度时按实际长度限制读取，分块上传按策略上限预留。
+			limit = reserve
 		}
-	}
-
-	// 二进制体（镜像层/文件上传等）无文本攻击面：跳过 CRS 扫体与语义 body 扫描，
-	// 仅做头/URI 检测，避免大二进制流承担 ~4.5µs/字节的正则成本
-	binaryCT := isBinaryContentType(r.Header.Get("Content-Type"))
-	detectBody := body
-	if binaryCT {
-		detectBody = nil
+		var err error
+		boundedBody := http.MaxBytesReader(sw.ResponseWriter, r.Body, limit)
+		if largeUpload {
+			body, err = readUploadBody(boundedBody, r.ContentLength)
+		} else {
+			body, err = io.ReadAll(boundedBody)
+		}
+		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				block(http.StatusRequestEntityTooLarge, "waf", "请求体超过完整检测上限", 0)
+			} else {
+				block(http.StatusBadRequest, "waf", "请求体读取失败", 0)
+			}
+			return
+		}
+		r.Body.Close()
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
+		r.ContentLength = int64(len(body))
+		r.TransferEncoding = nil
+		r.Trailer = nil
+		r.Header.Del("Transfer-Encoding")
+		r.Header.Del("Trailer")
+		// 请求体已接收；回源时避免上游再发一次 100 Continue。
+		r.Header.Del("Expect")
+		r.Header.Set("Content-Length", strconv.Itoa(len(body)))
 	}
 
 	// Go 将 Host 提升至 r.Host，需补回供 CRS 协议检查（920280 等）使用
 	hdr := r.Header.Clone()
 	hdr.Set("Host", r.Host)
-	res := p.Engine.Detect(site.WAFMode, site.excl, &engine.RequestInfo{
+	requestInfo := &engine.RequestInfo{
 		ClientIP: ip, ServerIP: "127.0.0.1",
 		Method: r.Method, URL: r.URL.RequestURI(), Proto: r.Proto,
-		Headers: hdr, Body: detectBody,
-	})
+		Headers: hdr, Body: body,
+	}
+	detect := func(info *engine.RequestInfo) engine.Result {
+		if matchedUpload {
+			return p.Engine.DetectUpload(site.WAFMode, site.excl, info, int(limit))
+		}
+		return p.Engine.Detect(site.WAFMode, site.excl, info)
+	}
+	res := detect(requestInfo)
+	if !res.Blocked && len(body) > 0 {
+		if reviewCT := bodyReviewContentType(r.Header.Get("Content-Type"), body); reviewCT != "" {
+			// Coraza 对未识别的 Content-Type 不运行正文处理器。保留上述原始头/URI检测，
+			// 再用实际正文适配的处理器复核，避免伪造 binary 类型令 ARGS/REQUEST_BODY 为空。
+			reviewHeaders := hdr.Clone()
+			reviewHeaders.Set("Content-Type", reviewCT)
+			reviewInfo := *requestInfo
+			reviewInfo.Headers = reviewHeaders
+			review := detect(&reviewInfo)
+			if review.Blocked || (review.LogOnly && !res.LogOnly) {
+				res = review
+			}
+		}
+	}
 	if res.Blocked {
 		block(res.Status, "waf", res.Msg, res.RuleID)
 		return
@@ -627,16 +859,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		p.logAttack(site, ip, r, "waf", res.Msg+"（语义复核未确认，放行）", res.RuleID, http.StatusOK, reqID)
 	}
 
+	if diagnostic := site.apiPolicy.Check(r, body); diagnostic != "" {
+		if site.apiPolicy.Mode == "block" {
+			block(http.StatusBadRequest, "api_schema", diagnostic, 0)
+			return
+		}
+		p.logAttack(site, ip, r, "api_schema", "API 契约观察："+diagnostic, 0, http.StatusOK, reqID)
+	}
+
 	semMode := p.Store.GetSetting("semantic_mode")
 	if semMode == "" {
 		semMode = "observe"
 	}
 	if semMode != "off" {
-		semBody := body
-		if binaryCT {
-			semBody = nil
-		}
-		if hit := p.Engine.Semantic(site.excl, r.URL.RequestURI(), semBody); hit != nil {
+		if hit := p.Engine.Semantic(site.excl, r.URL.RequestURI(), body); hit != nil {
 			if semMode == "block" {
 				block(http.StatusForbidden, "semantic", hit.Msg, hit.RuleID)
 				return
@@ -645,35 +881,149 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 动态防护：写操作需携带由植入 JS 签发的动态令牌（已通过人机验证的 cookie 可豁免）
-	if site.DynamicMode != "" && site.DynamicMode != "off" && isStateChanging(r.Method) && !p.Cap.ValidCookie(r, ip, site.ID) {
-		if !p.hasValidDynToken(r, body, ip, site.ID) {
+	// 动态防护要求写操作携带由植入 JS 签发的动态令牌。
+	nextDynToken := ""
+	if site.DynamicMode != "" && site.DynamicMode != "off" && isStateChanging(r.Method) {
+		if !p.consumeDynToken(r, body, ip, site.ID) {
 			if site.DynamicMode == "block" {
 				block(http.StatusForbidden, "dynamic", "动态防护：缺少有效动态令牌，疑似自动化或重放请求", dynRuleID)
 				return
 			}
 			p.logAttack(site, ip, r, "dynamic", "动态防护（观察）：写操作缺少有效动态令牌", dynRuleID, http.StatusOK, reqID)
+		} else {
+			nextDynToken = p.issueDynToken(ip, site.ID)
 		}
 	}
 
-	p.forward(w, r, site, ip, reqID, true)
+	p.forwardWithDynToken(w, r, site, ip, reqID, true, nextDynToken)
 }
 
-// upstreamTransport 共享上游连接池：限制拨号/TLS/响应头等待，防止慢上游耗尽连接。
+const (
+	DefaultUpstreamConnections = 256
+	upstreamSlotWait           = time.Second
+	upstreamDialTimeout        = 5 * time.Second
+	upstreamErrorLogInterval   = 5 * time.Second
+	proxyResponseBufferSize    = 32 << 10
+)
+
+var (
+	upstreamDialer      = net.Dialer{Timeout: upstreamDialTimeout, KeepAlive: 30 * time.Second}
+	upstreamDialSlots   = make(chan struct{}, 64)
+	errDialQueueTimeout = errors.New("等待上游拨号名额超时")
+	errUpstreamBusy     = errors.New("上游连接池已满")
+	responseBuffers     = proxyBufferPool{pool: sync.Pool{
+		New: func() any { return new([proxyResponseBufferSize]byte) },
+	}}
+)
+
+func upstreamOrigin(u *url.URL) string {
+	return u.Scheme + "://" + upstreamAddress(u)
+}
+
+func upstreamAddress(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		if u.Scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	host, zone, scoped := strings.Cut(u.Hostname(), "%")
+	host = strings.ToLower(host)
+	if scoped {
+		host += "%" + zone
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func (t *upstreamTarget) acquire(ctx context.Context) error {
+	if t.slots == nil {
+		return nil
+	}
+	select {
+	case t.slots <- struct{}{}:
+		return nil
+	default:
+	}
+	waitStart := time.Now()
+	metrics.Default.StartUpstreamWait()
+	defer func() { metrics.Default.FinishUpstreamWait(time.Since(waitStart)) }()
+	timer := time.NewTimer(upstreamSlotWait)
+	defer timer.Stop()
+	select {
+	case t.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return errUpstreamBusy
+	}
+}
+
+func (t *upstreamTarget) serve(rp *httputil.ReverseProxy, w http.ResponseWriter, r *http.Request) {
+	if t.slots != nil {
+		defer func() { <-t.slots }()
+	}
+	rp.ServeHTTP(w, r)
+}
+
+// dialUpstream 限制同时建连的数量，已建立的连接继续服务请求与长流。
+func dialUpstream(ctx context.Context, network, address string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, upstreamDialTimeout)
+	defer cancel()
+	select {
+	case upstreamDialSlots <- struct{}{}:
+		defer func() { <-upstreamDialSlots }()
+	case <-ctx.Done():
+		return nil, errDialQueueTimeout
+	}
+	conn, err := upstreamDialer.DialContext(ctx, network, address)
+	if errors.Is(err, syscall.EADDRINUSE) || errors.Is(err, syscall.EADDRNOTAVAIL) ||
+		// Windows reports WSAEADDRINUSE / WSAEADDRNOTAVAIL with Winsock error numbers.
+		(runtime.GOOS == "windows" && (errors.Is(err, syscall.Errno(10048)) || errors.Is(err, syscall.Errno(10049)))) {
+		return nil, fmt.Errorf("%w: %w", errUpstreamBusy, err)
+	}
+	return conn, err
+}
+
+type proxyBufferPool struct{ pool sync.Pool }
+
+func (p *proxyBufferPool) Get() []byte {
+	return p.pool.Get().(*[proxyResponseBufferSize]byte)[:]
+}
+
+func (p *proxyBufferPool) Put(buf []byte) {
+	p.pool.Put((*[proxyResponseBufferSize]byte)(buf))
+}
+
+func (t *upstreamTarget) recordFailure(err error) {
+	now := time.Now().Unix()
+	atomic.StoreInt64(&t.downUntil, now+10)
+	next := atomic.LoadInt64(&t.nextErrorLog)
+	if now >= next && atomic.CompareAndSwapInt64(&t.nextErrorLog, next, now+int64(upstreamErrorLogInterval/time.Second)) {
+		log.Printf("上游错误 %s: %v", t.u.Redacted(), err)
+	}
+}
+
+// 活跃连接与单上游空闲连接使用同一上限，避免高峰期反复新建和淘汰连接。
 // ResponseHeaderTimeout 仅约束响应头到达，不限制 SSE/WebSocket 的后续流式 body。
-var upstreamTransport = &http.Transport{
-	DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-	TLSHandshakeTimeout:   5 * time.Second,
-	ResponseHeaderTimeout: 30 * time.Second,
-	ExpectContinueTimeout: 1 * time.Second,
-	IdleConnTimeout:       90 * time.Second,
-	MaxIdleConns:          200,
-	MaxIdleConnsPerHost:   50,
+func newUpstreamTransport(limit int) *http.Transport {
+	return &http.Transport{
+		DialContext:           dialUpstream,
+		TLSHandshakeTimeout:   5 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          max(512, limit),
+		MaxIdleConnsPerHost:   limit,
+		MaxConnsPerHost:       limit,
+	}
 }
 
-// bodyInspectLimit 返回请求体检测上限（字节）。默认 2MB，可由设置 body_inspect_kb 调整
-// （范围 64KB–100MB）。超过该上限的请求体不整体缓冲，改为流式透传并仅检测前缀，
-// 以约束单请求内存占用、避免大上传被静默截断。
+var upstreamTransport = newUpstreamTransport(DefaultUpstreamConnections)
+
+// bodyInspectLimit 返回请求体缓冲上限，完整检查还受引擎送检上限约束。
 func (p *Proxy) bodyInspectLimit() int64 {
 	kb := 2048
 	if v := p.Store.GetSetting("body_inspect_kb"); v != "" {
@@ -685,8 +1035,6 @@ func (p *Proxy) bodyInspectLimit() int64 {
 }
 
 // bodyScanLimit 返回送检上限（字节）。默认 16KB，可由设置 body_scan_kb 调整（16KB–1MB）。
-// CRS 正则扫描成本约 4.5µs/字节，因此该上限决定单请求检测的 CPU 上界；
-// 超出部分仍原样转发给上游，只是不做内容检测。
 func (p *Proxy) bodyScanLimit() int {
 	kb := 16
 	if v := p.Store.GetSetting("body_scan_kb"); v != "" {
@@ -697,24 +1045,61 @@ func (p *Proxy) bodyScanLimit() int {
 	return kb << 10
 }
 
-// isBinaryContentType 判定二进制类 Content-Type（无文本攻击面），用于跳过请求体扫描
-func isBinaryContentType(ct string) bool {
-	base := strings.ToLower(ct)
-	if i := strings.IndexByte(base, ';'); i >= 0 {
-		base = strings.TrimSpace(base[:i])
+// bodyReviewContentType 为没有 CRS 正文处理器的类型选择仅用于检测的处理器。
+// 返回空串表示原请求已具备 JSON/XML/表单处理器，无需第二次送检。
+func bodyReviewContentType(contentType string, body []byte) string {
+	mediaType := strings.ToLower(strings.TrimSpace(contentType))
+	if i := strings.IndexByte(mediaType, ';'); i >= 0 {
+		mediaType = strings.TrimSpace(mediaType[:i])
 	}
-	switch base {
-	case "application/octet-stream", "application/zip", "application/gzip", "application/x-gzip",
-		"application/x-tar", "application/x-bzip2", "application/x-xz", "application/zstd",
-		"application/wasm", "application/x-7z-compressed", "application/x-rar-compressed",
-		"application/java-archive", "application/x-iso9660-image", "application/pdf":
+	if mediaType == "application/x-www-form-urlencoded" || mediaType == "multipart/form-data" ||
+		mediaType == "application/json" || strings.HasSuffix(mediaType, "+json") ||
+		mediaType == "application/xml" || mediaType == "text/xml" || strings.HasSuffix(mediaType, "+xml") {
+		return ""
+	}
+	if json.Valid(body) {
+		return "application/json"
+	}
+	return "application/x-www-form-urlencoded"
+}
+
+func isSafeRetryMethod(method string) bool {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace:
 		return true
 	}
-	return strings.HasPrefix(base, "image/") || strings.HasPrefix(base, "video/") ||
-		strings.HasPrefix(base, "audio/") || strings.HasPrefix(base, "font/")
+	return false
 }
 
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, site *cachedSite, ip, reqID string, countTraffic bool) {
+	if p.requireSiteAuth(w, r, site) {
+		p.forwardWithDynToken(w, r, site, ip, reqID, countTraffic, "")
+	}
+}
+
+func (p *Proxy) requireSiteAuth(w http.ResponseWriter, r *http.Request, site *cachedSite) bool {
+	if site.AuthUser == "" {
+		return true
+	}
+	if user, pass, ok := r.BasicAuth(); ok && subtle.ConstantTimeCompare([]byte(user), []byte(site.AuthUser)) == 1 {
+		if passOK, _ := store.VerifyPass(pass, site.AuthPass); passOK {
+			return true
+		}
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="NiuB WAF Authentication"`)
+	http.Error(w, "401 Unauthorized - 牛B WAF 身份认证", http.StatusUnauthorized)
+	p.Store.AddTraffic(site.ID, false, 0)
+	return false
+}
+
+func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site *cachedSite, ip, reqID string, countTraffic bool, nextDynToken string) {
+	if r.Context().Err() != nil {
+		return
+	}
+	transport := p.upstreamTransport
+	if transport == nil {
+		transport = upstreamTransport
+	}
 	needResp := site.RespDetect && site.Enabled
 	needDyn := site.DynamicMode != "" && site.DynamicMode != "off" && site.Enabled
 	var hdr http.Header
@@ -722,102 +1107,171 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, site *cachedSite
 		hdr = r.Header.Clone()
 		hdr.Set("Host", r.Host)
 	}
-	attempts := len(site.targets)
+	attempts := 1
+	if isSafeRetryMethod(r.Method) {
+		attempts = len(site.targets)
+	}
 	for i := 0; i < attempts; i++ {
 		t := site.pick()
 		if t == nil {
 			break
 		}
+		if err := t.acquire(r.Context()); err != nil {
+			if errors.Is(err, errUpstreamBusy) {
+				p.writeUpstreamBusy(w, site.ID, nextDynToken, countTraffic, "origin_queue")
+			}
+			return
+		}
 		var respBlocked bool
 		var respBytes int64
-		var failed bool
+		var upstreamErr error
 		rp := &httputil.ReverseProxy{
-			Transport: upstreamTransport,
-			Director: func(req *http.Request) {
-				req.URL.Scheme = t.u.Scheme
-				req.URL.Host = t.u.Host
-				req.Host = t.u.Host
-				req.Header.Set("X-Real-IP", ip)
-				req.Header.Set("X-NiuB-WAF-Req-ID", reqID)
+			Transport:  transport,
+			BufferPool: &responseBuffers,
+			Rewrite: func(pr *httputil.ProxyRequest) {
+				// 保留原有上游路由行为：仅替换 scheme/host，不拼接上游路径。
+				pr.Out.URL.Scheme = t.u.Scheme
+				pr.Out.URL.Host = t.dialAddress
+				if pr.Out.URL.Host == "" {
+					pr.Out.URL.Host = t.u.Host
+				}
+				pr.Out.Host = t.u.Host
+
+				// Rewrite 在逐跳头清理后执行。先清除所有客户端可伪造的转发身份，
+				// 再用 WAF 已解析的客户端与入站协议重建，避免 Connection 指定这些头后被剥离。
+				for _, h := range []string{
+					"Forwarded", "X-Forwarded", "X-Forwarded-For", "X-Forwarded-Host",
+					"X-Forwarded-Proto", "X-Forwarded-Port", "X-Forwarded-Server",
+					"X-Forwarded-Ssl", "X-Original-Forwarded-For", "X-Real-IP",
+					"X-NiuB-WAF-Req-ID",
+				} {
+					pr.Out.Header.Del(h)
+				}
+				filterProxyCookies(pr.Out.Header, "Cookie", true)
+				if site.AuthUser != "" {
+					pr.Out.Header.Del("Authorization")
+				}
+				proto := "http"
+				if pr.In.TLS != nil {
+					proto = "https"
+				}
+				pr.Out.Header.Set("X-Forwarded-For", ip)
+				pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
+				pr.Out.Header.Set("X-Forwarded-Proto", proto)
+				pr.Out.Header.Set("X-Real-IP", ip)
+				pr.Out.Header.Set("X-NiuB-WAF-Req-ID", reqID)
 			},
-			ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-				failed = true
-				atomic.StoreInt64(&t.downUntil, time.Now().Unix()+10)
-				log.Printf("上游错误 %s: %v", t.u, err)
+			ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+				// 客户端取消请求不会降低上游健康状态，也无需继续尝试。
+				if r.Context().Err() != nil {
+					return
+				}
+				upstreamErr = err
+				if !errors.Is(err, errDialQueueTimeout) && !errors.Is(err, errUpstreamBusy) {
+					var timeout net.Error
+					if errors.As(err, &timeout) && timeout.Timeout() {
+						metrics.Default.IncUpstreamTimeout()
+					}
+					t.recordFailure(err)
+				}
+				if nextDynToken != "" {
+					w.Header().Set("X-NiuB-Dyn-Token", nextDynToken)
+					w.Header().Set("Cache-Control", "no-store")
+				}
 			},
 		}
-		if hdr != nil {
-			rp.ModifyResponse = func(resp *http.Response) error {
-				ct := resp.Header.Get("Content-Type")
-				ce := resp.Header.Get("Content-Encoding")
-				// SSE(text/event-stream) 必须流式透传，缓冲会断流；编码内容/非文本同样跳过
-				if ce != "" || resp.Body == nil || strings.Contains(ct, "text/event-stream") || (!strings.Contains(ct, "text/") && !strings.Contains(ct, "json")) {
-					return nil
-				}
-				isHTML := strings.Contains(ct, "text/html")
-				if !needResp && !(needDyn && isHTML) {
-					return nil
-				}
-				limit := int64(1 << 20)
-				if needDyn && isHTML {
-					limit = 5 << 20
-				}
-				// 已知超大响应直接透传，避免缓冲占用与截断
-				if resp.ContentLength > limit {
-					return nil
-				}
-				body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-				if err != nil {
-					resp.Body.Close()
-					return err
-				}
-				if int64(len(body)) > limit {
-					// 长度未知且超限：拼接已读部分与剩余流，原样透传不截断
-					resp.Body = &multiReadCloser{io.MultiReader(bytes.NewReader(body), resp.Body), resp.Body}
-					return nil
-				}
-				resp.Body.Close()
-				respBytes = int64(len(body))
-				if needResp {
-					res := p.Engine.DetectResponse(site.WAFMode, site.excl, &engine.RequestInfo{
-						ClientIP: ip, Method: r.Method, URL: r.URL.RequestURI(), Proto: r.Proto, Headers: hdr,
-					}, resp.StatusCode, resp.Header, body)
-					if res.Blocked {
-						respBlocked = true
-						html := RenderBlockPage(p.Store.GetSetting("block_page"), map[string]string{
-							"REQ_ID": reqID, "REASON": "响应内容检测：" + res.Msg, "CLIENT_IP": ip,
-							"DOMAIN": site.Domain, "TIME": nowStr(), "RULE_ID": fmt.Sprintf("%d", res.RuleID),
-						})
-						p.logAttack(site, ip, r, "resp", res.Msg, res.RuleID, res.Status, reqID)
-						resp.StatusCode = res.Status
-						resp.Body = io.NopCloser(strings.NewReader(html))
-						resp.ContentLength = int64(len(html))
-						resp.Header.Set("Content-Type", "text/html; charset=utf-8")
-						resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(html)))
-						resp.Header.Del("Content-Encoding")
-						return nil
-					}
-				}
-				if needDyn && isHTML {
-					body = p.injectDynamic(body, ip, site.ID)
-				}
-				resp.Body = io.NopCloser(bytes.NewReader(body))
-				resp.ContentLength = int64(len(body))
-				resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+		rp.ModifyResponse = func(resp *http.Response) error {
+			filterProxyCookies(resp.Header, "Set-Cookie", false)
+			// 续发令牌只由 WAF 生成，忽略上游伪造的同名响应头。
+			resp.Header.Del("X-NiuB-Dyn-Token")
+			if nextDynToken != "" {
+				resp.Header.Set("X-NiuB-Dyn-Token", nextDynToken)
+				resp.Header.Set("Cache-Control", "no-store")
+			}
+			if hdr == nil {
 				return nil
 			}
+			ct := resp.Header.Get("Content-Type")
+			ce := resp.Header.Get("Content-Encoding")
+			// SSE(text/event-stream) 必须流式透传，缓冲会断流；编码内容/非文本同样跳过
+			if ce != "" || resp.Body == nil || strings.Contains(ct, "text/event-stream") || (!strings.Contains(ct, "text/") && !strings.Contains(ct, "json")) {
+				return nil
+			}
+			isHTML := strings.Contains(ct, "text/html")
+			if !needResp && !(needDyn && isHTML) {
+				return nil
+			}
+			limit := int64(1 << 20)
+			if needDyn && isHTML {
+				limit = 5 << 20
+			}
+			// 已知超大响应直接透传，避免缓冲占用与截断
+			if resp.ContentLength > limit {
+				return nil
+			}
+			body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+			if err != nil {
+				resp.Body.Close()
+				return err
+			}
+			if int64(len(body)) > limit {
+				// 长度未知且超限：拼接已读部分与剩余流，原样透传不截断
+				resp.Body = &multiReadCloser{io.MultiReader(bytes.NewReader(body), resp.Body), resp.Body}
+				return nil
+			}
+			resp.Body.Close()
+			respBytes = int64(len(body))
+			if needResp {
+				res := p.Engine.DetectResponse(site.WAFMode, site.excl, &engine.RequestInfo{
+					ClientIP: ip, Method: r.Method, URL: r.URL.RequestURI(), Proto: r.Proto, Headers: hdr,
+				}, resp.StatusCode, resp.Header, body)
+				if res.Blocked {
+					respBlocked = true
+					html := RenderBlockPage(p.Store.GetSetting("block_page"), map[string]string{
+						"REQ_ID": reqID, "REASON": "响应内容检测：" + res.Msg, "CLIENT_IP": ip,
+						"DOMAIN": site.Domain, "TIME": nowStr(), "RULE_ID": fmt.Sprintf("%d", res.RuleID),
+					})
+					p.logAttack(site, ip, r, "resp", res.Msg, res.RuleID, res.Status, reqID)
+					resp.StatusCode = res.Status
+					resp.Body = io.NopCloser(strings.NewReader(html))
+					resp.ContentLength = int64(len(html))
+					resp.Header.Set("Content-Type", "text/html; charset=utf-8")
+					resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(html)))
+					resp.Header.Del("Content-Encoding")
+					return nil
+				}
+			}
+			if needDyn && isHTML {
+				resp.Header.Set("Cache-Control", "no-store")
+				body = p.injectDynamic(body, ip, site.ID)
+			}
+			resp.Body = io.NopCloser(bytes.NewReader(body))
+			resp.ContentLength = int64(len(body))
+			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			return nil
 		}
 
 		if i > 0 && r.GetBody != nil {
 			r.Body, _ = r.GetBody()
 		}
 		rec := &countWriter{ResponseWriter: w}
-		rp.ServeHTTP(rec, r)
-		if !failed {
+		t.serve(rp, rec, r)
+		if r.Context().Err() != nil {
+			return
+		}
+		if upstreamErr == nil {
 			metrics.Default.AddResponseBytes(rec.n + respBytes)
 			if countTraffic {
 				p.Store.AddTraffic(site.ID, respBlocked, rec.n+respBytes)
 			}
+			return
+		}
+		if errors.Is(upstreamErr, errDialQueueTimeout) {
+			p.writeUpstreamBusy(w, site.ID, nextDynToken, countTraffic, "dial_queue")
+			return
+		}
+		if errors.Is(upstreamErr, errUpstreamBusy) {
+			p.writeUpstreamBusy(w, site.ID, nextDynToken, countTraffic, "dial_capacity")
 			return
 		}
 		// 请求体无法回卷时不再重试，避免向上游发送残缺请求
@@ -833,6 +1287,50 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, site *cachedSite
 	if countTraffic {
 		p.Store.AddTraffic(site.ID, false, 0)
 	}
+}
+
+func (p *Proxy) writeUpstreamBusy(w http.ResponseWriter, siteID int64, nextDynToken string, countTraffic bool, reason string) {
+	metrics.Default.IncOverloadRejected(reason)
+	w.Header().Set("Retry-After", "1")
+	if nextDynToken != "" {
+		w.Header().Set("X-NiuB-Dyn-Token", nextDynToken)
+		w.Header().Set("Cache-Control", "no-store")
+	}
+	http.Error(w, "上游连接池繁忙，请稍后重试", http.StatusServiceUnavailable)
+	if countTraffic {
+		p.Store.AddTraffic(siteID, false, 0)
+	}
+}
+
+func filterProxyCookies(h http.Header, header string, request bool) {
+	values := h.Values(header)
+	if len(values) == 0 {
+		return
+	}
+	h.Del(header)
+	for _, value := range values {
+		if !request {
+			name, _, _ := strings.Cut(value, "=")
+			if !isProxyCookie(strings.TrimSpace(name)) {
+				h.Add(header, value)
+			}
+			continue
+		}
+		var cookies []string
+		for _, cookie := range strings.Split(value, ";") {
+			name, _, _ := strings.Cut(cookie, "=")
+			if !isProxyCookie(strings.TrimSpace(name)) {
+				cookies = append(cookies, strings.TrimSpace(cookie))
+			}
+		}
+		if len(cookies) > 0 {
+			h.Add(header, strings.Join(cookies, "; "))
+		}
+	}
+}
+
+func isProxyCookie(name string) bool {
+	return name == "niub_admin" || name == "niub_pass" || strings.HasPrefix(name, "niub_pass_")
 }
 
 type countWriter struct {
@@ -922,10 +1420,11 @@ func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, 
 	metrics.Default.IncAttack(action)
 	geo := p.Geo.CityInfo(ip)
 	lat, lon := geoCoords(geo)
-	p.Ana.Event(EvStat{IP: ip, Action: action, Msg: msg, RuleID: ruleID, Status: status, Country: geo.Country, City: geo.City, Lat: lat, Lon: lon, URL: r.URL.RequestURI(), Domain: site.Domain})
+	logURL := r.URL.EscapedPath()
+	p.Ana.Event(EvStat{IP: ip, Action: action, Msg: msg, RuleID: ruleID, Status: status, Country: geo.Country, City: geo.City, Lat: lat, Lon: lon, URL: logURL, Domain: site.Domain})
 	l := &store.AttackLog{
 		SiteID: site.ID, Domain: site.Domain, ClientIP: ip, Country: geo.Country,
-		Method: r.Method, URL: r.URL.RequestURI(), Action: action,
+		Method: r.Method, URL: logURL, QueryRedacted: r.URL.RawQuery != "", Action: action,
 		RuleID: ruleID, Msg: msg, Severity: severityOf(action), Status: status, ReqID: reqID,
 	}
 	if err := p.Store.LogAttack(l); err != nil {

@@ -7,7 +7,7 @@ services:
     ports:
       - "8080:8080"   # 防护代理 HTTP
       - "8443:8443"   # 防护代理 HTTPS（站点证书在控制台配置，或用下方默认证书）
-      - "9443:9443"   # 管理控制台
+      - "127.0.0.1:9443:9443"   # 管理控制台（仅监听本机回环地址）
     volumes:
       - niubwaf-data:/app/data
       # 正式证书（可选）：取消注释并修改 command
@@ -17,6 +17,8 @@ services:
     #           "-admin-cert", "/app/certs/fullchain.pem", "-admin-key", "/app/certs/privkey.pem"]
     environment:
       - TZ=Asia/Shanghai
+      - NIUBWAF_TURNSTILE_SITE_KEY
+      - NIUBWAF_TURNSTILE_SECRET_KEY
 
 volumes:
   niubwaf-data:

@@ -1,7 +1,9 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -51,4 +53,77 @@ func (s *Store) countRows(t *testing.T, table string) int {
 		t.Fatalf("查询 %s 失败: %v", table, err)
 	}
 	return n
+}
+
+func TestAttackLogDropsCountedAndRateLimited(t *testing.T) {
+	logs := captureStoreLogs(t)
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`CREATE TABLE traffic(
+		minute TEXT NOT NULL, site_id INTEGER NOT NULL,
+		reqs INTEGER DEFAULT 0, blocks INTEGER DEFAULT 0, bytes INTEGER DEFAULT 0,
+		PRIMARY KEY(minute, site_id)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	s := &Store{
+		DB:      db,
+		traffic: map[trafficKey]trafficVal{},
+		logCh:   make(chan *AttackLog, 1),
+	}
+	s.logCh <- &AttackLog{ReqID: "queued"}
+	for i := 0; i < 1001; i++ {
+		if err := s.LogAttack(&AttackLog{ReqID: "dropped"}); err != nil {
+			t.Fatalf("队列满时 LogAttack 仍应非阻塞返回: %v", err)
+		}
+	}
+	if got := s.droppedAttackLogs.Load(); got != 1001 {
+		t.Fatalf("丢弃计数 = %d, want 1001", got)
+	}
+	if got := s.Stats().DroppedAttackLogs; got != 1001 {
+		t.Fatalf("Stats 丢弃计数 = %d, want 1001", got)
+	}
+	if got := strings.Count(logs.String(), "攻击日志队列已满"); got != 2 {
+		t.Fatalf("第 1 次和第 1000 次丢弃应各告警一次，实际 %d 次: %q", got, logs.String())
+	}
+	if !strings.Contains(logs.String(), "累计丢弃 1 条") || !strings.Contains(logs.String(), "累计丢弃 1000 条") {
+		t.Fatalf("告警应包含累计丢弃数: %q", logs.String())
+	}
+}
+
+func TestAuditLogRetentionAndBatchPruning(t *testing.T) {
+	s := openHardening(t)
+	if _, err := s.DB.Exec(`WITH RECURSIVE seq(n) AS (
+		SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < ?
+	)
+	INSERT INTO audit_logs(user,action,detail)
+	SELECT 'admin','seed',printf('seed-%d',n) FROM seq`, auditLogLimit); err != nil {
+		t.Fatalf("构造审计日志失败: %v", err)
+	}
+
+	// 普通插入不做全表清理；到每 100 次插入的边界才批量收缩。
+	s.Audit("admin", "test", "not-pruned")
+	if got := s.countRows(t, "audit_logs"); got != auditLogLimit+1 {
+		t.Fatalf("非清理周期不应立即删除审计日志, got %d", got)
+	}
+	s.auditInserts.Store(auditPruneInterval - 1)
+	s.Audit("admin", "test", "latest")
+	if got := s.countRows(t, "audit_logs"); got != auditLogLimit {
+		t.Fatalf("清理后审计日志应保留 %d 条, got %d", auditLogLimit, got)
+	}
+	var minID, maxID int64
+	if err := s.DB.QueryRow(`SELECT MIN(id),MAX(id) FROM audit_logs`).Scan(&minID, &maxID); err != nil {
+		t.Fatal(err)
+	}
+	if minID != 3 || maxID != int64(auditLogLimit+2) {
+		t.Fatalf("应仅保留最新记录, minID=%d maxID=%d", minID, maxID)
+	}
+	latest, err := s.ListAudit(1)
+	if err != nil || len(latest) != 1 || latest[0].Detail != "latest" {
+		t.Fatalf("最新审计记录保留错误: %+v, err=%v", latest, err)
+	}
 }
