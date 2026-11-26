@@ -49,9 +49,13 @@ CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o niu
 
 ## 界面预览
 
-| 登录页 | 管理控制台 | 实时安全大屏 |
-| --- | --- | --- |
-| ![login](docs/screenshots/login.png) | ![console](docs/screenshots/console.png) | ![screen](docs/screenshots/screen.png) |
+| 管理控制台 | 实时安全大屏 |
+| --- | --- |
+| ![管理控制台](docs/screenshots/dashboard.png) | ![实时安全大屏](docs/screenshots/live-screen.png) |
+
+| 流量分析 | 安全态势 |
+| --- | --- |
+| ![流量分析](docs/screenshots/traffic-analysis.png) | ![安全态势](docs/screenshots/security-posture.png) |
 
 ## 项目结构
 
