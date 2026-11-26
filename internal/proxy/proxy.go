@@ -75,8 +75,10 @@ func (s *cachedSite) pick() *upstreamTarget {
 }
 
 type Hub struct {
-	mu   sync.Mutex
-	subs map[chan []byte]struct{}
+	mu         sync.Mutex
+	subs       map[chan []byte]struct{}
+	relay      *hubRelayPeer
+	ratePaused bool
 }
 
 func NewHub() *Hub { return &Hub{subs: map[chan []byte]struct{}{}} }
@@ -101,13 +103,25 @@ func (h *Hub) Broadcast(v any) {
 		return
 	}
 	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ratePaused {
+		if event, ok := v.(map[string]any); ok && event["type"] == "qps" {
+			return
+		}
+	}
+	h.broadcastLocked(data)
+	if h.relay != nil {
+		h.relay.enqueue(data)
+	}
+}
+
+func (h *Hub) broadcastLocked(data []byte) {
 	for ch := range h.subs {
 		select {
 		case ch <- data:
 		default:
 		}
 	}
-	h.mu.Unlock()
 }
 
 type Proxy struct {
@@ -156,6 +170,9 @@ type Proxy struct {
 
 	alertMu   sync.Mutex
 	lastAlert time.Time
+
+	backgroundMu   sync.Mutex
+	stopBackground context.CancelFunc
 }
 
 func New(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *IDCMatcher, tor *TorList, secret string) *Proxy {
@@ -163,6 +180,14 @@ func New(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *IDCMatcher, tor *
 }
 
 func NewWithUpstreamLimit(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *IDCMatcher, tor *TorList, secret string, limit int) *Proxy {
+	p := NewWithPausedBackgroundJobs(st, eng, geo, idc, tor, secret, limit)
+	p.ResumeBackgroundJobs()
+	return p
+}
+
+// NewWithPausedBackgroundJobs initializes a worker without running global
+// reputation calculations or alerts before that worker is active.
+func NewWithPausedBackgroundJobs(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *IDCMatcher, tor *TorList, secret string, limit int) *Proxy {
 	if limit <= 0 {
 		limit = DefaultUpstreamConnections
 	}
@@ -173,6 +198,7 @@ func NewWithUpstreamLimit(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *
 		dynSecret: []byte(secret), threat: NewThreatIntel(st), crawlers: newCrawlerVerifier(),
 		upstreamLimit: limit, upstreamTransport: newUpstreamTransport(limit),
 	}
+	p.Hub.pauseRateFeed(true)
 	p.Reload()
 	go func() {
 		for range time.Tick(30 * time.Second) {
@@ -180,10 +206,34 @@ func NewWithUpstreamLimit(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *
 		}
 	}()
 	go p.healthLoop()
-	go p.reputationLoop()
-	go p.alertLoop()
 	go p.qpsLoop()
 	return p
+}
+
+// ResumeBackgroundJobs schedules the recurring operations owned by the active
+// worker. Reloads, health checks and request handling run in every worker.
+func (p *Proxy) ResumeBackgroundJobs() {
+	p.backgroundMu.Lock()
+	defer p.backgroundMu.Unlock()
+	if p.stopBackground != nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.stopBackground = cancel
+	p.Hub.pauseRateFeed(false)
+	go p.reputationLoop(ctx)
+	go p.alertLoop(ctx)
+}
+
+// PauseBackgroundJobs stops scheduling alerts and reputation calculations
+// while a retiring worker continues to serve its established connections.
+func (p *Proxy) PauseBackgroundJobs() {
+	p.backgroundMu.Lock()
+	defer p.backgroundMu.Unlock()
+	if p.stopBackground != nil {
+		p.stopBackground()
+		p.stopBackground = nil
+	}
 }
 
 const healthCheckUserAgent = "NiuBWAF-HealthCheck/1.0"

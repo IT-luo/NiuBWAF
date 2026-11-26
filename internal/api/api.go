@@ -40,11 +40,14 @@ type Inspector interface {
 }
 
 type API struct {
-	Store      *store.Store
-	Proxy      *proxy.Proxy
-	Inspector  Inspector
-	AdminTLS   bool   // 管理台是否运行于 TLS，决定会话 Cookie 的 Secure 标志
-	DataDir    string // 数据目录，用于数据库热备份
+	Store     *store.Store
+	Proxy     *proxy.Proxy
+	Inspector Inspector
+	AdminTLS  bool   // 管理台是否运行于 TLS，决定会话 Cookie 的 Secure 标志
+	DataDir   string // 数据目录，用于数据库热备份
+
+	ConsoleSessionScope string // non-empty for workers belonging to a running supervisor
+
 	accountMu  sync.RWMutex
 	mu         sync.Mutex
 	sessions   map[string]time.Time
@@ -125,6 +128,10 @@ func (a *API) authenticatedConsole(r *http.Request) (consoleIdentity, bool) {
 	if err != nil {
 		return consoleIdentity{}, false
 	}
+	if a.ConsoleSessionScope != "" {
+		session, err := a.Store.ConsoleSession(a.ConsoleSessionScope, ck.Value)
+		return consoleIdentity{Username: session.Username, Role: session.Role, MustChange: session.MustChange}, err == nil
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	exp, ok := a.sessions[ck.Value]
@@ -170,6 +177,12 @@ func (a *API) purgeExpiredSessionsLocked() {
 
 // PurgeExpiredSessions 是过期会话清扫的加锁入口，供定期维护或测试调用。
 func (a *API) PurgeExpiredSessions() {
+	if a.ConsoleSessionScope != "" {
+		if err := a.Store.PurgeConsoleSessions(); err != nil {
+			log.Printf("清理过期控制台会话失败: %v", err)
+		}
+		return
+	}
 	a.mu.Lock()
 	a.purgeExpiredSessionsLocked()
 	a.mu.Unlock()
@@ -321,6 +334,22 @@ func (a *API) issueConsoleSession(identity consoleIdentity) (string, string) {
 	return session, csrf
 }
 
+func (a *API) createConsoleSession(identity consoleIdentity, hash string) (string, error) {
+	if a.ConsoleSessionScope == "" {
+		token, _ := a.issueConsoleSession(identity)
+		return token, nil
+	}
+	token := store.RandToken()
+	session := store.ConsoleSession{
+		Username: identity.Username, Role: identity.Role, MustChange: identity.MustChange,
+		CSRF: store.RandToken(), Expires: time.Now().Add(12 * time.Hour),
+	}
+	if err := a.Store.SaveConsoleSession(a.ConsoleSessionScope, token, session, hash); err != nil {
+		return "", err
+	}
+	return token, nil
+}
+
 func (a *API) revokeConsoleSessions(username string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -336,6 +365,15 @@ func (a *API) serveCSRF(w http.ResponseWriter, r *http.Request) {
 	ck, err := r.Cookie("niub_admin")
 	if err != nil {
 		writeErr(w, http.StatusUnauthorized, "未登录")
+		return
+	}
+	if a.ConsoleSessionScope != "" {
+		session, err := a.Store.ConsoleSession(a.ConsoleSessionScope, ck.Value)
+		if err != nil {
+			writeErr(w, http.StatusUnauthorized, "未登录")
+			return
+		}
+		writeJSON(w, map[string]string{"token": session.CSRF})
 		return
 	}
 	a.mu.Lock()
@@ -363,6 +401,10 @@ func (a *API) validCSRF(r *http.Request) bool {
 	ck, err := r.Cookie("niub_admin")
 	if err != nil {
 		return false
+	}
+	if a.ConsoleSessionScope != "" {
+		session, err := a.Store.ConsoleSession(a.ConsoleSessionScope, ck.Value)
+		return err == nil && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-NiuB-CSRF")), []byte(session.CSRF)) == 1
 	}
 	a.mu.Lock()
 	expected := a.csrfTokens[ck.Value]
@@ -499,12 +541,20 @@ func (a *API) Handler(console http.Handler) http.Handler {
 			writeErr(w, http.StatusUnauthorized, "密码错误")
 			return
 		}
-		if needsRehash && name == rootAccount {
-			a.Store.SetSetting("admin_pass", store.HashPass(body.Password))
-		}
 		a.loginAttemptSucceeded(key, attempt)
+		if needsRehash && name == rootAccount {
+			hash = store.HashPass(body.Password)
+			if err := a.Store.ReplaceRootConsolePassword(account.PasswordHash, hash, false); err != nil {
+				writeErr(w, http.StatusInternalServerError, "更新登录凭据失败")
+				return
+			}
+		}
 		identity := consoleIdentity{Username: account.Username, Role: account.Role, MustChange: account.MustChange}
-		token, _ := a.issueConsoleSession(identity)
+		token, err := a.createConsoleSession(identity, hash)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "创建登录会话失败")
+			return
+		}
 		http.SetCookie(w, a.sessionCookie(token, 43200))
 		a.Store.Audit(name, "登录成功", key)
 		writeJSON(w, map[string]any{"ok": "true", "must_change": identity.MustChange, "username": name, "role": identity.Role})
@@ -519,6 +569,12 @@ func (a *API) Handler(console http.Handler) http.Handler {
 			return
 		}
 		if ck, err := r.Cookie("niub_admin"); err == nil {
+			if a.ConsoleSessionScope != "" {
+				if err := a.Store.DeleteConsoleSession(a.ConsoleSessionScope, ck.Value); err != nil {
+					writeErr(w, http.StatusInternalServerError, "撤销登录会话失败")
+					return
+				}
+			}
 			a.mu.Lock()
 			a.deleteSessionLocked(ck.Value)
 			a.mu.Unlock()
@@ -536,7 +592,7 @@ func (a *API) Handler(console http.Handler) http.Handler {
 		if !safeAPIMethod(r.Method) && !a.checkCSRF(w, r) {
 			return
 		}
-		if identity.Username == rootAccount {
+		if identity.Username == rootAccount && a.ConsoleSessionScope == "" {
 			identity.MustChange = a.Store.GetSetting("must_change_pass") == "on"
 		}
 		if identity.MustChange && r.URL.Path != "/api/csrf" && r.URL.Path != "/api/password" && r.URL.Path != "/api/me" {
@@ -1521,11 +1577,11 @@ func (a *API) changePass(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 400, "新密码须为 8–256 字节并同时包含字母和数字")
 		return
 	}
-	account.PasswordHash, account.MustChange = store.HashPass(body.New), false
+	newHash := store.HashPass(body.New)
 	if account.Username == rootAccount {
-		err = a.Store.ChangeRootConsolePassword(account.PasswordHash)
+		err = a.Store.ReplaceRootConsolePassword(account.PasswordHash, newHash, true)
 	} else {
-		err = a.Store.UpdateConsoleAccount(account)
+		err = a.Store.ReplaceConsoleAccountPassword(account.Username, account.PasswordHash, newHash)
 	}
 	if err != nil {
 		writeErr(w, http.StatusInternalServerError, "更新密码失败")
@@ -1533,7 +1589,11 @@ func (a *API) changePass(w http.ResponseWriter, r *http.Request) {
 	}
 	a.revokeConsoleSessions(identity.Username)
 	identity.MustChange = false
-	token, _ := a.issueConsoleSession(identity)
+	token, err := a.createConsoleSession(identity, newHash)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "密码已更新，请重新登录")
+		return
+	}
 	http.SetCookie(w, a.sessionCookie(token, 43200))
 	a.audit(r, "修改控制台密码", "")
 	writeJSON(w, map[string]any{"ok": "true", "must_change": false})

@@ -14,9 +14,18 @@ import (
 var alertClient = &http.Client{Timeout: 6 * time.Second}
 
 // alertLoop 周期检测攻击激增并按冷却间隔推送告警
-func (p *Proxy) alertLoop() {
-	for range time.Tick(15 * time.Second) {
-		p.checkAlert()
+func (p *Proxy) alertLoop(ctx context.Context) {
+	tick := time.NewTicker(15 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if ctx.Err() == nil {
+				p.checkAlert()
+			}
+		}
 	}
 }
 

@@ -1,5 +1,7 @@
 package store
 
+import "database/sql"
+
 type ConsoleAccount struct {
 	Username     string `json:"username"`
 	Role         string `json:"role"`
@@ -49,6 +51,50 @@ func (s *Store) DeleteConsoleAccount(username string) error {
 	return err
 }
 
-func (s *Store) ChangeRootConsolePassword(hash string) error {
-	return s.SetSettings(map[string]string{"admin_pass": hash, "must_change_pass": "off"})
+// ReplaceRootConsolePassword changes the password only if the verified hash is
+// still current. It also handles transparent legacy hash upgrades.
+func (s *Store) ReplaceRootConsolePassword(expectedHash, hash string, clearMustChange bool) error {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`UPDATE settings SET value=? WHERE key='admin_pass' AND value=?`, hash, expectedHash)
+	if err := requireConsoleRow(result, err); err != nil {
+		return err
+	}
+	if clearMustChange {
+		if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES('must_change_pass','off')
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
+			return err
+		}
+	}
+	s.setMu.Lock()
+	defer s.setMu.Unlock()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	s.settings["admin_pass"] = hash
+	s.settingsRevision++
+	if clearMustChange {
+		s.settings["must_change_pass"] = "off"
+	}
+	return nil
+}
+
+func (s *Store) ReplaceConsoleAccountPassword(username, expectedHash, hash string) error {
+	result, err := s.DB.Exec(`UPDATE console_accounts SET password_hash=?,must_change=0
+		WHERE username=? AND password_hash=? AND enabled=1`, hash, username, expectedHash)
+	return requireConsoleRow(result, err)
+}
+
+func requireConsoleRow(result sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	count, err := result.RowsAffected()
+	if err == nil && count != 1 {
+		return sql.ErrNoRows
+	}
+	return err
 }

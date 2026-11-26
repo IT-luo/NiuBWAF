@@ -416,6 +416,7 @@ func (s *Store) ApplyConfigImport(pkg *ConfigPackage, mode string, expected Conf
 		return nil, err
 	}
 	s.settings = newSettings
+	s.settingsRevision++
 	s.setMu.Unlock()
 	return plan.preview, nil
 }

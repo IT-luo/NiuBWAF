@@ -13,7 +13,7 @@
 
 ## 1. 架构与端口速览
 
-单二进制、单进程、单节点。检测引擎（Coraza+CRS）与反向代理、管理 API、控制台打包在一起；数据全部落在 `data/` 目录（SQLite + 情报缓存 + 证书 + 备份）。
+单二进制、单节点，默认单进程。Linux 启用二进制热升级时，同一二进制负责监听与工作进程。检测引擎（Coraza+CRS）与反向代理、管理 API、控制台打包在一起，数据落在 `data/` 目录（SQLite + 情报缓存 + 证书 + 备份）。
 
 | 端口 | 默认监听 | 用途 | 是否必须对外 |
 |---|---|---|---|
@@ -206,6 +206,36 @@ journalctl -u niubwaf -f            # 观察启动日志：引擎就绪 / GeoIP 
 
 ---
 
+### 5.5 Linux 二进制热升级
+
+保存站点、证书或防护规则会在服务内重新加载配置。更换程序版本时，可用以下方式保留已建立的连接和控制台登录。
+
+首次启用时，为 §5.3 的 unit 配置追加 `-hot-upgrade`，并设置重新加载命令。部署本功能前的旧进程需要一次常规重启。
+
+```ini
+[Service]
+ExecStart=/opt/niubwaf/niubwaf -proxy :8080 -tls :8443 -admin 127.0.0.1:9443 -data /opt/niubwaf/data -hot-upgrade
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=20s
+```
+
+更新 unit 后运行 `sudo systemctl daemon-reload` 和 `sudo systemctl restart niubwaf`。如果使用 drop-in 覆盖 `ExecStart`，先加一行空的 `ExecStart=`，并保留原部署的监听、证书和数据参数。后续版本的更新流程如下。
+
+```bash
+# 在同一目录暂存已校验的新二进制，再原子替换路径。
+sudo install -m 0755 -o root -g root ./niubwaf /opt/niubwaf/niubwaf.next
+sudo mv -T /opt/niubwaf/niubwaf.next /opt/niubwaf/niubwaf
+sudo systemctl reload niubwaf
+sudo journalctl -u niubwaf -n 30 --no-pager
+```
+
+- 日志出现「已接管新连接」代表切换完成。新工作进程启动失败时，当前版本继续接收流量。回滚可以原子放回兼容的旧二进制，再执行 `reload`。
+- 已建立的 HTTP/HTTPS、WebSocket 和 SSE 连接留在原工作进程，直到客户端或上游正常关闭。现有控制台登录可在该监听进程的后续工作进程中继续使用。
+- 旧进程在连接排空之前仍占用内存和连接资源。配置 systemd 的内存和文件描述符上限时，要给并行运行的多个版本留出余量。活跃连接可能持续数小时，跨版本持久状态需要兼容旧进程。
+- 监听地址、启动参数和 HTTP-01 挑战端口的首次启用属于启动配置，应安排常规重启。应用层尚未完成的人机验证和部分内存限流计数随工作进程管理。
+- `systemctl restart`、停止服务、整台主机重启和容器重建会关闭原进程。Windows 原生运行默认采用常规重启流程。
+
 ## 6. Docker 部署（备选）
 
 ```bash
@@ -218,6 +248,18 @@ docker compose up -d --build
 - 命名卷 `niubwaf-data → /app/data` 持久化状态。
 - 正式证书：取消注释 `./certs:/app/certs:ro` 与 `command:` 覆盖块，把 `-cert/-key/-admin-cert/-admin-key` 指向 `/app/certs/…`。
 - 需要 GeoIP 时把合法来源的数据文件放入运行时数据卷。当前构建将宿主机 `data/` 排除在镜像构建上下文之外。
+
+需要在 Linux 容器内热升级时，可将同一架构的已校验二进制放在宿主机目录，通过只读目录挂载给容器。首次切换到此方式需要重建一次容器。将以下项合并到已有服务，保留原端口、证书和数据卷配置。
+
+```yaml
+entrypoint: ["/host-bin/niubwaf"]
+command: ["-hot-upgrade", "-proxy", ":8080", "-tls", ":8443", "-admin", ":9443", "-data", "/app/data"]
+volumes:
+  - niubwaf-data:/app/data
+  - /opt/niubwaf-bin:/host-bin:ro
+```
+
+后续通过宿主机在 `/opt/niubwaf-bin` 内原子替换 `niubwaf` 文件，再执行 `docker kill --signal HUP niubwaf`。目录挂载可见路径的新文件。若升级还涉及基础镜像、端口映射或环境变量，需按常规容器更新流程安排切换。
 
 升级镜像：`docker compose build && docker compose up -d`（卷内数据保留，schema 自动迁移）。
 

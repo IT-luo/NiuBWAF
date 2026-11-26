@@ -7,13 +7,17 @@ import (
 	"time"
 )
 
-// eventSession verifies the session again at subscription time and gives all its
-// streams one shared revocation signal. Logout, password changes and account
-// changes all remove the session through deleteSessionLocked.
+// eventSession verifies the session at subscription time. Local sessions also
+// have a revocation channel. Shared sessions are checked against the database
+// before each event or heartbeat.
 func (a *API) eventSession(r *http.Request) (<-chan struct{}, time.Time, bool) {
 	cookie, err := r.Cookie("niub_admin")
 	if err != nil {
 		return nil, time.Time{}, false
+	}
+	if a.ConsoleSessionScope != "" {
+		session, err := a.Store.ConsoleSession(a.ConsoleSessionScope, cookie.Value)
+		return nil, session.Expires, err == nil
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -57,6 +61,9 @@ func (a *API) events(w http.ResponseWriter, r *http.Request) {
 		}
 		now := time.Now()
 		if !now.Before(expires) {
+			return false
+		}
+		if a.ConsoleSessionScope != "" && !a.authed(r) {
 			return false
 		}
 		deadline := now.Add(5 * time.Second)

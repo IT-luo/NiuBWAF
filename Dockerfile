@@ -3,7 +3,7 @@ FROM golang:1.26.11-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go data_permissions*.go ./
+COPY main.go http_services.go maintenance.go data_permissions*.go hot_upgrade*.go ./
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/niubwaf .
 

@@ -30,8 +30,9 @@ const (
 type Store struct {
 	DB *sql.DB
 
-	setMu    sync.RWMutex
-	settings map[string]string
+	setMu            sync.RWMutex
+	settingsRevision uint64
+	settings         map[string]string
 
 	tMu     sync.Mutex
 	traffic map[trafficKey]trafficVal
@@ -204,6 +205,9 @@ func (s *Store) flushLoop() {
 			s.flush()
 		case <-s.stopCh:
 			s.flush()
+			for len(s.logCh) > 0 {
+				s.flush()
+			}
 			return
 		}
 	}
@@ -363,6 +367,25 @@ func (s *Store) migrate() error {
 			enabled INTEGER NOT NULL,
 			must_change INTEGER NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS console_sessions(
+			token BLOB PRIMARY KEY, username TEXT NOT NULL, role TEXT NOT NULL,
+			csrf TEXT NOT NULL, must_change INTEGER NOT NULL, expires INTEGER NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_console_sessions_user ON console_sessions(username)`,
+		`CREATE INDEX IF NOT EXISTS idx_console_sessions_expires ON console_sessions(expires)`,
+		`CREATE TRIGGER IF NOT EXISTS revoke_console_on_account_update AFTER UPDATE ON console_accounts
+			BEGIN DELETE FROM console_sessions WHERE username=OLD.username; END`,
+		`CREATE TRIGGER IF NOT EXISTS revoke_console_on_account_delete AFTER DELETE ON console_accounts
+			BEGIN DELETE FROM console_sessions WHERE username=OLD.username; END`,
+		`CREATE TRIGGER IF NOT EXISTS revoke_root_console_on_settings_update AFTER UPDATE ON settings
+			WHEN OLD.key IN ('admin_pass','must_change_pass') AND OLD.value<>NEW.value
+			BEGIN DELETE FROM console_sessions WHERE username='admin'; END`,
+		`CREATE TRIGGER IF NOT EXISTS revoke_root_console_on_settings_delete AFTER DELETE ON settings
+			WHEN OLD.key IN ('admin_pass','must_change_pass')
+			BEGIN DELETE FROM console_sessions WHERE username='admin'; END`,
+		`CREATE TRIGGER IF NOT EXISTS revoke_root_console_on_settings_insert AFTER INSERT ON settings
+			WHEN NEW.key IN ('admin_pass','must_change_pass')
+			BEGIN DELETE FROM console_sessions WHERE username='admin'; END`,
 		`CREATE TABLE IF NOT EXISTS audit_logs(
 			id INTEGER PRIMARY KEY AUTOINCREMENT,
 			ts TEXT DEFAULT (datetime('now','localtime')),
@@ -609,6 +632,7 @@ func (s *Store) SetSettings(values map[string]string) error {
 	for key, value := range values {
 		s.settings[key] = value
 	}
+	s.settingsRevision++
 	return nil
 }
 

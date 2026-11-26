@@ -43,6 +43,13 @@ func (a *API) audit(r *http.Request, action, detail string) {
 
 func (a *API) lookupConsoleAccount(name string) (store.ConsoleAccount, error) {
 	if name == rootAccount {
+		if a.ConsoleSessionScope != "" {
+			account := store.ConsoleAccount{Username: name, Role: roleAdmin, Enabled: true}
+			err := a.Store.DB.QueryRow(`SELECT value, COALESCE(
+				(SELECT value='on' FROM settings WHERE key='must_change_pass'),0)
+				FROM settings WHERE key='admin_pass'`).Scan(&account.PasswordHash, &account.MustChange)
+			return account, err
+		}
 		return store.ConsoleAccount{
 			Username: name, Role: roleAdmin, Enabled: true,
 			PasswordHash: a.Store.GetSetting("admin_pass"),

@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strconv"
@@ -11,10 +12,22 @@ import (
 )
 
 // reputationLoop 周期聚合本地攻击历史，对高分 IP 自动封禁（白名单前置、TTL 递增、窗口衰减）
-func (p *Proxy) reputationLoop() {
+func (p *Proxy) reputationLoop(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	p.computeReputation(true)
-	for range time.Tick(60 * time.Second) {
-		p.computeReputation(false)
+	tick := time.NewTicker(60 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			if ctx.Err() == nil {
+				p.computeReputation(false)
+			}
+		}
 	}
 }
 
