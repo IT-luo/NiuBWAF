@@ -39,8 +39,8 @@ func TestClientIPTrustedRightmostUntrusted(t *testing.T) {
 func TestClientIPTrustedAllTrustedFallsBack(t *testing.T) {
 	trusted := ParseTrustedProxies("10.0.0.0/8, 192.168.1.5")
 	r := reqWith("10.1.2.3:443", "10.9.9.9, 10.8.8.8", "192.168.1.5")
-	if got := ClientIP(r, trusted); got != "192.168.1.5" {
-		t.Fatalf("XFF 全可信时应回退 X-Real-IP, got %s", got)
+	if got := ClientIP(r, trusted); got != "10.1.2.3" {
+		t.Fatalf("XFF 全可信时应回退 RemoteAddr, got %s", got)
 	}
 	r2 := reqWith("10.1.2.3:443", "10.9.9.9", "")
 	if got := ClientIP(r2, trusted); got != "10.1.2.3" {
@@ -58,13 +58,30 @@ func TestClientIPXRealOnlyWhenTrusted(t *testing.T) {
 	if got := ClientIP(r2, trusted); got != "203.0.113.9" {
 		t.Fatalf("不可信对端的 X-Real-IP 应忽略, got %s", got)
 	}
+	r.Header.Add("X-Real-IP", "198.51.100.21")
+	if got := ClientIP(r, trusted); got != "10.1.2.3" {
+		t.Fatalf("多个 X-Real-IP 字段应回退 RemoteAddr, got %s", got)
+	}
 }
 
-func TestClientIPIgnoresInvalidXFFEntry(t *testing.T) {
+func TestClientIPUsesAllXFFFieldsInOrder(t *testing.T) {
 	trusted := ParseTrustedProxies("10.0.0.0/8")
-	r := reqWith("10.1.2.3:443", "198.51.100.7, not-an-ip", "")
+	r := reqWith("10.1.2.3:443", "203.0.113.5", "")
+	r.Header.Add("X-Forwarded-For", "198.51.100.7, 10.2.2.2")
+	r.Header.Add("X-Forwarded-For", "10.3.3.3")
 	if got := ClientIP(r, trusted); got != "198.51.100.7" {
-		t.Fatalf("应跳过非法 XFF 项, got %s", got)
+		t.Fatalf("应按顺序检查完整 XFF 字段链, got %s", got)
+	}
+}
+
+func TestClientIPMalformedXFFDoesNotFallBackToOtherHeaders(t *testing.T) {
+	trusted := ParseTrustedProxies("10.0.0.0/8")
+	for _, field := range []string{"", "not-an-ip, 10.4.4.4"} {
+		r := reqWith("10.1.2.3:443", "198.51.100.7", "198.51.100.20")
+		r.Header.Add("X-Forwarded-For", field)
+		if got := ClientIP(r, trusted); got != "10.1.2.3" {
+			t.Errorf("有无法解析的 XFF 字段 %q 时应回退 RemoteAddr, got %s", field, got)
+		}
 	}
 }
 

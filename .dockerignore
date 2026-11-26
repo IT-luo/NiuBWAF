@@ -2,7 +2,6 @@
 *.exe
 *.exe~
 niubwaf
-data/niubwaf.db*
-data/default_*.pem
+data/
 test/
 docker-compose.yml

@@ -64,7 +64,10 @@ func permitConsoleRequest(role, method, path string) bool {
 		case "/api/me", "/api/csrf", "/api/stats", "/api/trend", "/api/analytics", "/api/qps",
 			"/api/top/ips", "/api/top/rules", "/api/top/countries", "/api/top/domains", "/api/logs",
 			"/api/logs/export", "/api/ips", "/api/exclusions", "/api/events", "/api/rules",
-			"/api/rules/shadow", "/api/sites", "/api/upstreams":
+			"/api/rules/shadow", "/api/sites", "/api/upstreams", "/api/request-diagnostics":
+			return true
+		}
+		if strings.HasPrefix(path, "/api/sites/") && strings.HasSuffix(path, "/ingress-verification") {
 			return true
 		}
 		return role == roleOperator && strings.HasPrefix(path, "/api/sites/") && strings.HasSuffix(path, "/api-policy")

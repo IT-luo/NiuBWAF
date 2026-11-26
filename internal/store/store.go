@@ -343,6 +343,7 @@ func (s *Store) migrate() error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_ts ON attack_logs(ts)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_ip ON attack_logs(client_ip)`,
+		`CREATE INDEX IF NOT EXISTS idx_logs_req_id ON attack_logs(req_id) WHERE req_id IS NOT NULL`,
 		// 覆盖索引：信誉评分按 ts 范围 + client_ip 分组 + severity/action 聚合，全部字段入索引可索引-only 扫描，避免 60s 周期回表
 		`CREATE INDEX IF NOT EXISTS idx_logs_rep ON attack_logs(ts, client_ip, severity, action)`,
 		// 域名精确/后缀过滤走索引，避免前导 % LIKE 全表扫
@@ -650,14 +651,24 @@ func (s *Store) CreateSite(t *Site) error {
 }
 
 func (s *Store) UpdateSite(t *Site, replaceTLS bool) (tlsConfigured bool, err error) {
-	err = s.DB.QueryRow(`UPDATE sites SET name=?,domain=?,upstream=?,enabled=?,waf_mode=?,auth_user=?,
+	return s.updateSite(t, replaceTLS, false)
+}
+
+// UpdateSitePreservingUpstream retains the database's current upstream, including data
+// that the console must not reveal, when a different site setting is edited.
+func (s *Store) UpdateSitePreservingUpstream(t *Site, replaceTLS bool) (bool, error) {
+	return s.updateSite(t, replaceTLS, true)
+}
+
+func (s *Store) updateSite(t *Site, replaceTLS, keepUpstream bool) (tlsConfigured bool, err error) {
+	err = s.DB.QueryRow(`UPDATE sites SET name=?,domain=?,upstream=CASE WHEN ? THEN upstream ELSE ? END,enabled=?,waf_mode=?,auth_user=?,
 		auth_pass=COALESCE(NULLIF(?, ''), auth_pass),cc_rate=?,cc_burst=?,captcha=?,resp_detect=?,
 		dynamic_mode=?,bot_mode=?,bot_strict=?,cert_pem=CASE WHEN ? THEN ? ELSE cert_pem END,
 		key_pem=CASE WHEN ? THEN ? ELSE key_pem END,http_redirect=? WHERE id=?
-		RETURNING cert_pem <> '' AND key_pem <> ''`,
-		t.Name, t.Domain, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst,
+		RETURNING cert_pem <> '' AND key_pem <> '', upstream`,
+		t.Name, t.Domain, keepUpstream, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst,
 		t.Captcha, t.RespDetect, t.DynamicMode, t.BotMode, t.BotStrict, replaceTLS, t.CertPEM, replaceTLS,
-		t.KeyPEM, t.HTTPRedirect, t.ID).Scan(&tlsConfigured)
+		t.KeyPEM, t.HTTPRedirect, t.ID).Scan(&tlsConfigured, &t.Upstream)
 	return tlsConfigured, err
 }
 

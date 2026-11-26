@@ -52,8 +52,8 @@ func main() {
 	fmt.Println("  基于 Coraza 引擎 + OWASP CRS 规则集")
 	fmt.Println("==============================================")
 
-	if err := os.MkdirAll(*dataDir, 0755); err != nil {
-		log.Fatal(err)
+	if err := preparePrivateDataDir(*dataDir); err != nil {
+		log.Fatalf("无法保护数据目录: %v", err)
 	}
 
 	st, err := store.Open(filepath.Join(*dataDir, "niubwaf.db"))

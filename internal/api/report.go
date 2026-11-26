@@ -49,7 +49,8 @@ th{background:#eef3fb}
 		if !s.Enabled {
 			status = "停用"
 		}
-		fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`, html.EscapeString(s.Name), html.EscapeString(s.Domain), html.EscapeString(s.Upstream), html.EscapeString(s.WAFMode), status)
+		upstream, _ := store.DisplayUpstreams(s.Upstream)
+		fmt.Fprintf(&b, `<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>`, html.EscapeString(s.Name), html.EscapeString(s.Domain), html.EscapeString(upstream), html.EscapeString(s.WAFMode), status)
 	}
 	b.WriteString(`</table>`)
 

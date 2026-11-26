@@ -6,6 +6,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"database/sql"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"niubwaf/internal/engine"
 	"niubwaf/internal/metrics"
@@ -48,6 +50,7 @@ type API struct {
 	sessions   map[string]time.Time
 	identities map[string]consoleIdentity
 	csrfTokens map[string]string // session token -> CSRF token
+	eventDone  map[string]chan struct{}
 	fails      map[string]*loginFail
 }
 
@@ -140,6 +143,10 @@ func (a *API) authenticatedConsole(r *http.Request) (consoleIdentity, bool) {
 }
 
 func (a *API) deleteSessionLocked(token string) {
+	if done := a.eventDone[token]; done != nil {
+		close(done)
+		delete(a.eventDone, token)
+	}
 	delete(a.sessions, token)
 	delete(a.csrfTokens, token)
 	delete(a.identities, token)
@@ -618,7 +625,12 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 		}
 		response := make([]consoleSite, 0, len(sites))
 		for _, site := range sites {
-			response = append(response, consoleSite{Site: site, TLSConfigured: site.CertPEM != "" && site.KeyPEM != ""})
+			item := siteForConsole(site, site.CertPEM != "" && site.KeyPEM != "")
+			if site.Enabled && a.Proxy != nil {
+				item.Ingress = a.Proxy.SiteIngressStatus(site.ID, site.Domain)
+				item.TrafficObservedAt = a.Proxy.SiteTrafficObservedAt(site.ID, site.Domain)
+			}
+			response = append(response, item)
 		}
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, response)
@@ -644,6 +656,8 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 		a.siteAPIPolicy(w, r)
 	case strings.HasPrefix(path, "/api/sites/") && strings.HasSuffix(path, "/upload-policy"):
 		a.siteUploadPolicy(w, r)
+	case strings.HasPrefix(path, "/api/sites/") && strings.HasSuffix(path, "/ingress-verification"):
+		a.siteIngressVerification(w, r)
 	case strings.HasPrefix(path, "/api/sites/") && r.Method == "PUT":
 		id, err := strconv.ParseInt(strings.TrimPrefix(path, "/api/sites/"), 10, 64)
 		if err != nil || id <= 0 {
@@ -662,6 +676,8 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]string{"ok": "true"})
 	case path == "/api/logs" && r.Method == "GET":
 		a.logs(w, r)
+	case path == "/api/request-diagnostics" && r.Method == "GET":
+		a.requestDiagnostics(w, r)
 	case path == "/api/logs" && r.Method == "DELETE":
 		a.clearLogs(w, r)
 	case path == "/api/logs/export" && r.Method == "GET":
@@ -832,8 +848,9 @@ func (a *API) stats(w http.ResponseWriter, r *http.Request) {
 		"today_reqs": st.TodayReqs, "today_blocks": st.TodayBlocks,
 		"total_reqs": st.TotalReqs, "total_blocks": st.TotalBlocks,
 		"sites": len(sites), "sites_enabled": enabled,
-		"geoip_available": a.Proxy.Geo.Available(),
-		"crs_version":     engine.CRSVersion,
+		"geoip_available":     a.Proxy.Geo.Available(),
+		"crs_version":         engine.CRSVersion,
+		"response_inspection": metrics.Default.ResponseInspectionCounts(),
 	})
 }
 
@@ -872,16 +889,26 @@ func (a *API) top(w http.ResponseWriter, r *http.Request, kind string) {
 
 type consoleSite struct {
 	store.Site
-	TLSConfigured bool `json:"tls_configured"`
+	TLSConfigured     bool                     `json:"tls_configured"`
+	UpstreamRedacted  bool                     `json:"upstream_redacted,omitempty"`
+	Ingress           *proxy.SiteIngressStatus `json:"ingress,omitempty"`
+	TrafficObservedAt *time.Time               `json:"traffic_observed_at,omitempty"`
+}
+
+func siteForConsole(site store.Site, tlsConfigured bool) consoleSite {
+	var redacted bool
+	site.Upstream, redacted = store.DisplayUpstreams(site.Upstream)
+	return consoleSite{Site: site, TLSConfigured: tlsConfigured, UpstreamRedacted: redacted}
 }
 
 func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 	var input struct {
 		store.Site
-		AuthPass string `json:"auth_pass"`
-		CertPEM  string `json:"cert_pem"`
-		KeyPEM   string `json:"key_pem"`
-		ClearTLS bool   `json:"clear_tls"`
+		AuthPass        string `json:"auth_pass"`
+		CertPEM         string `json:"cert_pem"`
+		KeyPEM          string `json:"key_pem"`
+		ClearTLS        bool   `json:"clear_tls"`
+		ReplaceUpstream bool   `json:"replace_upstream"`
 	}
 	if !decodeJSON(w, r, &input, jsonBodyLimit) {
 		return
@@ -894,24 +921,12 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 		writeErr(w, 400, "名称、域名、上游地址不能为空")
 		return
 	}
-	var ups []string
-	for _, raw := range strings.Split(s.Upstream, ",") {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-		u, err := url.Parse(raw)
-		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-			writeErr(w, 400, "上游地址无效（需 http:// 或 https:// 开头，多个用逗号分隔）: "+raw)
-			return
-		}
-		ups = append(ups, raw)
-	}
-	if len(ups) == 0 {
-		writeErr(w, 400, "上游地址不能为空")
+	upstream, err := store.NormalizeUpstreams(s.Upstream)
+	if err != nil {
+		writeErr(w, 400, "上游地址须为 HTTP 或 HTTPS URL（多个用逗号分隔），不允许包含凭据、查询参数或片段")
 		return
 	}
-	s.Upstream = strings.Join(ups, ",")
+	s.Upstream = upstream
 	if input.ClearTLS && (s.CertPEM != "" || s.KeyPEM != "") {
 		writeErr(w, 400, "不能同时上传和移除证书")
 		return
@@ -945,13 +960,30 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 	}
 	tlsConfigured := s.CertPEM != ""
 	action := "新增站点"
-	var err error
 	if id == 0 {
 		err = a.Store.CreateSite(&s)
 	} else {
 		s.ID = id
 		action = "修改站点"
-		tlsConfigured, err = a.Store.UpdateSite(&s, input.ClearTLS || tlsConfigured)
+		keepUpstream := false
+		if !input.ReplaceUpstream {
+			previous, readErr := a.Store.GetSite(id)
+			if errors.Is(readErr, sql.ErrNoRows) {
+				writeErr(w, http.StatusNotFound, "站点不存在")
+				return
+			}
+			if readErr != nil {
+				writeErr(w, http.StatusInternalServerError, "读取站点失败")
+				return
+			}
+			visible, redacted := store.DisplayUpstreams(previous.Upstream)
+			keepUpstream = redacted && visible == s.Upstream
+		}
+		if keepUpstream {
+			tlsConfigured, err = a.Store.UpdateSitePreservingUpstream(&s, input.ClearTLS || tlsConfigured)
+		} else {
+			tlsConfigured, err = a.Store.UpdateSite(&s, input.ClearTLS || tlsConfigured)
+		}
 		if errors.Is(err, sql.ErrNoRows) {
 			writeErr(w, http.StatusNotFound, "站点不存在")
 			return
@@ -964,7 +996,7 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 	a.audit(r, action, s.Domain)
 	a.Proxy.Reload()
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, consoleSite{Site: s, TLSConfigured: tlsConfigured})
+	writeJSON(w, siteForConsole(s, tlsConfigured))
 }
 
 var paramRe = regexp.MustCompile(`^[A-Za-z0-9_.\-\[\]]+$`)
@@ -1106,17 +1138,12 @@ func (a *API) exportCSV(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
 	w.Header().Set("Content-Disposition", "attachment; filename=niubwaf-attack-logs.csv")
 	bw := bufio.NewWriterSize(w, 32*1024)
-	bw.Write([]byte{0xEF, 0xBB, 0xBF})
-	bw.WriteString("时间,站点域名,客户端IP,国家,城市,方法,URL,动作,规则ID,描述,严重级别,状态码,请求ID\n")
-	csvEsc := func(s string) string {
-		// 以 = + - @ 开头的单元格会被表格软件当公式执行（CSV injection），前缀单引号强制文本
-		if s != "" && strings.ContainsRune("=+-@", rune(s[0])) {
-			s = "'" + s
-		}
-		if strings.ContainsAny(s, ",\"\n") {
-			return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
-		}
-		return s
+	if _, err := bw.WriteString("\uFEFF"); err != nil {
+		return
+	}
+	writer := csv.NewWriter(bw)
+	if err := writer.Write([]string{"时间", "站点域名", "客户端IP", "国家", "城市", "方法", "URL", "动作", "规则ID", "描述", "严重级别", "状态码", "请求ID"}); err != nil {
+		return
 	}
 	cityOn := a.Proxy.Geo.CityAvailable()
 	rows := 0
@@ -1125,11 +1152,16 @@ func (a *API) exportCSV(w http.ResponseWriter, r *http.Request) {
 		if cityOn && l.City == "" {
 			l.City = a.Proxy.Geo.CityInfo(l.ClientIP).City
 		}
-		_, err := fmt.Fprintf(bw, "%s,%s,%s,%s,%s,%s,%s,%s,%d,%s,%s,%d,%s\n",
-			l.Ts, csvEsc(l.Domain), l.ClientIP, l.Country, csvEsc(l.City), l.Method, csvEsc(l.URL),
-			l.Action, l.RuleID, csvEsc(l.Msg), l.Severity, l.Status, l.ReqID)
-		return err
+		return writer.Write([]string{
+			csvText(l.Ts), csvText(l.Domain), csvText(l.ClientIP), csvText(l.Country), csvText(l.City),
+			csvText(l.Method), csvText(l.URL), csvText(l.Action), strconv.Itoa(l.RuleID), csvText(l.Msg),
+			csvText(l.Severity), strconv.Itoa(l.Status), csvText(l.ReqID),
+		})
 	})
+	writer.Flush()
+	if err == nil {
+		err = writer.Error()
+	}
 	flushErr := bw.Flush()
 	if err == nil {
 		err = flushErr
@@ -1139,6 +1171,19 @@ func (a *API) exportCSV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.audit(r, "导出攻击日志CSV", fmt.Sprintf("%d 条", rows))
+}
+
+func csvText(s string) string {
+	if strings.HasPrefix(s, "\r") || strings.HasPrefix(s, "\n") || strings.HasPrefix(s, "\t") {
+		return "'" + s
+	}
+	for _, initial := range strings.TrimLeftFunc(s, unicode.IsSpace) {
+		if strings.ContainsRune("=+-@＝＋－＠", initial) {
+			return "'" + s
+		}
+		break
+	}
+	return s
 }
 
 func (a *API) reputationLookup(w http.ResponseWriter, r *http.Request) {
@@ -1564,31 +1609,4 @@ func (a *API) listBackups(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]any{"name": n, "size": info.Size(), "mtime": info.ModTime().Format("2006-01-02 15:04:05")})
 	}
 	writeJSON(w, out)
-}
-
-func (a *API) events(w http.ResponseWriter, r *http.Request) {
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeErr(w, 500, "不支持 SSE")
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	ch := a.Proxy.Hub.Subscribe()
-	defer a.Proxy.Hub.Unsubscribe(ch)
-	fmt.Fprintf(w, "data: {\"type\":\"hello\"}\n\n")
-	flusher.Flush()
-	for {
-		select {
-		case data := <-ch:
-			fmt.Fprintf(w, "data: %s\n\n", data)
-			flusher.Flush()
-		case <-r.Context().Done():
-			return
-		case <-time.After(25 * time.Second):
-			fmt.Fprintf(w, ": ping\n\n")
-			flusher.Flush()
-		}
-	}
 }

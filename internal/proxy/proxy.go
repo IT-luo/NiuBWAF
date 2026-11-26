@@ -54,6 +54,7 @@ type cachedSite struct {
 	uploadPolicies map[uploadRoute]store.UploadPolicy
 	verifyCrawlers bool
 	botPathLimit   int
+	ingressSeen    *atomic.Int64
 }
 
 // pick 轮询选择健康上游；全部故障时仍返回一个尝试转发
@@ -125,6 +126,8 @@ type Proxy struct {
 	upstreamLimit     int
 	upstreamTransport *http.Transport
 	uploadBudget      uploadBudget
+	diagnostics       diagnosticCache
+	ingress           ingressVerifier
 	// HTTPSAddr 用于 HTTP→HTTPS 跳转时构造目标地址，如 ":8443"
 	HTTPSAddr string
 
@@ -185,35 +188,42 @@ func NewWithUpstreamLimit(st *store.Store, eng *engine.Engine, geo *GeoIP, idc *
 
 const healthCheckUserAgent = "NiuBWAF-HealthCheck/1.0"
 
-// healthLoop 主动探测上游：任意 HTTP 响应视为健康，连接失败摘除 5 秒
+// healthLoop 定期探测已启用站点的上游。
 func (p *Proxy) healthLoop() {
-	client := &http.Client{Timeout: 2 * time.Second}
 	for range time.Tick(5 * time.Second) {
-		p.mu.RLock()
-		type siteTargets struct {
-			domain  string
-			targets []*upstreamTarget
-		}
-		var all []siteTargets
-		for _, s := range p.sites {
-			all = append(all, siteTargets{s.Domain, s.targets})
-		}
-		p.mu.RUnlock()
-		var ups []metrics.UpstreamSample
-		for _, st := range all {
-			for _, t := range st.targets {
-				err := probeUpstream(client, t.u.String()+"/")
-				up := err == nil
-				if err != nil {
-					atomic.StoreInt64(&t.downUntil, time.Now().Unix()+5)
-				} else {
-					atomic.StoreInt64(&t.downUntil, 0)
-				}
-				ups = append(ups, metrics.UpstreamSample{Site: st.domain, URL: t.u.String(), Up: up})
-			}
-		}
-		metrics.Default.SetUpstreams(ups)
+		metrics.Default.SetUpstreams(p.checkUpstreams())
 	}
+}
+
+// 只探测配置的上游。任意 HTTP 响应仍视为可达，连接失败时摘除 5 秒。
+func (p *Proxy) checkUpstreams() []metrics.UpstreamSample {
+	client := &http.Client{
+		Timeout: 2 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	p.mu.RLock()
+	var sites []*cachedSite
+	for _, site := range p.sites {
+		if site.Enabled {
+			sites = append(sites, site)
+		}
+	}
+	p.mu.RUnlock()
+	var ups []metrics.UpstreamSample
+	for _, site := range sites {
+		for _, target := range site.targets {
+			up := probeUpstream(client, target.u.String()+"/") == nil
+			var downUntil int64
+			if !up {
+				downUntil = time.Now().Unix() + 5
+			}
+			atomic.StoreInt64(&target.downUntil, downUntil)
+			ups = append(ups, metrics.UpstreamSample{Site: site.Domain, URL: store.DisplayUpstreamURL(target.u), Up: up})
+		}
+	}
+	return ups
 }
 
 func probeUpstream(client *http.Client, target string) error {
@@ -249,7 +259,7 @@ func (p *Proxy) UpstreamHealth() []UpstreamStatus {
 	for _, s := range p.sites {
 		st := UpstreamStatus{SiteID: s.ID, Domain: s.Domain, Targets: []TargetStatus{}}
 		for _, t := range s.targets {
-			st.Targets = append(st.Targets, TargetStatus{URL: t.u.String(), Up: atomic.LoadInt64(&t.downUntil) <= now})
+			st.Targets = append(st.Targets, TargetStatus{URL: store.DisplayUpstreamURL(t.u), Up: atomic.LoadInt64(&t.downUntil) <= now})
 		}
 		out = append(out, st)
 	}
@@ -359,7 +369,7 @@ func (p *Proxy) Reload() {
 			}
 			u, err := url.Parse(raw)
 			if err != nil || u.Host == "" {
-				log.Printf("站点 %s 上游地址无效: %s", s.Domain, raw)
+				log.Printf("站点 %s 存在无效上游地址", s.Domain)
 				continue
 			}
 			target := oldTargets[targetKey{s.ID, u.String()}]
@@ -376,7 +386,7 @@ func (p *Proxy) Reload() {
 			targets = append(targets, target)
 		}
 		if len(targets) == 0 {
-			log.Printf("站点 %s 无有效上游地址: %s", s.Domain, s.Upstream)
+			log.Printf("站点 %s 无有效上游地址", s.Domain)
 			continue
 		}
 		cs := &cachedSite{Site: s, targets: targets, verifyCrawlers: verifyCrawlers, botPathLimit: botPathLimit}
@@ -478,6 +488,7 @@ func (p *Proxy) Reload() {
 		certs[domain] = &cert
 	}
 	p.mu.Lock()
+	p.initIngressTraffic(m)
 	p.sites, p.blackNet, p.whiteNet, p.blackIP, p.whiteIP = m, bn, wn, bi, wi
 	p.trustedNet = engine.ParseTrustedProxies(p.Store.GetSetting("trusted_proxies"))
 	p.certs = certs
@@ -566,6 +577,9 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	metricSite, metricBlocked := "", false
 	var sw *statusWriter
 	defer func() {
+		if sw != nil && sw.diagnostic.Module == "resp" && sw.diagnostic.Outcome == "blocked" {
+			metricBlocked = true
+		}
 		metrics.Default.ObserveDuration(time.Since(start).Seconds())
 		if metricSite != "" {
 			result := "allowed"
@@ -575,6 +589,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			metrics.Default.IncRequest(metricSite, result)
 		}
 		if sw != nil {
+			sw.diagnostic.complete(sw.code)
+			p.diagnostics.record(sw.diagnostic)
 			refHost, refPage := externalReferer(r.Referer(), metricSite)
 			p.Ana.Record(ReqStat{
 				IP: ip, Host: metricSite, Path: truncStr(r.URL.Path, pathMaxLen), Page: visitedPage(r.TLS != nil, metricSite, r.URL.EscapedPath()),
@@ -598,19 +614,40 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	repBanned := p.dynBlack[ip] > time.Now().Unix()
 	p.mu.RUnlock()
 
+	reqID := store.RandToken()[:12]
+	w.Header().Set(requestDiagnosticHeader, reqID)
 	if site == nil {
 		metricBlocked = true
+		d := RequestDiagnostic{ReqID: reqID, TS: start, Method: diagnosticMethod(r.Method), Status: http.StatusNotFound}
+		d.setWAFDecision("rejected", "未找到该域名对应的防护站点", "routing", 0)
+		p.diagnostics.record(d)
 		WriteBlock(w, http.StatusNotFound, RenderBlockPage("", map[string]string{
-			"REQ_ID": store.RandToken()[:12], "REASON": "未找到该域名对应的防护站点",
+			"REQ_ID": reqID, "REASON": d.Reason,
 			"CLIENT_IP": ip, "DOMAIN": host, "TIME": nowStr(),
 		}))
 		return
 	}
 	metricSite = host
-	sw = &statusWriter{ResponseWriter: w}
+	site.noteIngressTraffic(start, r)
+	sw = &statusWriter{ResponseWriter: w, diagnostic: RequestDiagnostic{
+		ReqID: reqID, TS: start, Domain: site.Domain, Method: diagnosticMethod(r.Method),
+	}}
 	w = sw
 
+	if len(r.Header.Values(ingressVerificationHeader)) != 0 {
+		if probe := p.claimIngressProbe(r, site, ip, reqID, white); probe != nil {
+			r = probe.attach(r)
+			defer func() { probe.finish(sw.code) }()
+			if probe.block {
+				sw.diagnostic.setWAFDecision("blocked", "接入验收测试拦截", "ingress_verification", 0)
+				writeIngressBlock(w, reqID, ip, host)
+				return
+			}
+		}
+	}
+
 	if site.Enabled && site.HTTPRedirect && r.TLS == nil && p.HTTPSAddr != "" {
+		sw.diagnostic.setWAFDecision("redirected", "站点配置将 HTTP 重定向至 HTTPS", "routing", 0)
 		target := "https://" + host
 		if p.HTTPSAddr != ":443" {
 			target += p.HTTPSAddr
@@ -619,15 +656,23 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reqID := store.RandToken()[:12]
 	block := func(status int, action, reason string, ruleID int) {
 		metricBlocked = true
+		sw.diagnostic.setWAFDecision("blocked", DiagnosticRuleReason(action, status), action, ruleID)
 		p.logAttack(site, ip, r, action, reason, ruleID, status, reqID)
 		WriteBlock(w, status, RenderBlockPage(p.Store.GetSetting("block_page"), map[string]string{
 			"REQ_ID": reqID, "REASON": reason, "CLIENT_IP": ip,
 			"DOMAIN": host, "TIME": nowStr(), "RULE_ID": fmt.Sprintf("%d", ruleID),
 		}))
 		p.Store.AddTraffic(site.ID, true, 0)
+	}
+	logEvent := func(outcome, action, msg string, ruleID, status int) {
+		if outcome == "observed" {
+			sw.diagnostic.observe(action, ruleID)
+		} else {
+			sw.diagnostic.setWAFDecision(outcome, DiagnosticRuleReason(action, status), action, ruleID)
+		}
+		p.logAttack(site, ip, r, action, msg, ruleID, status, reqID)
 	}
 
 	if !site.Enabled || white {
@@ -673,7 +718,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				return
 			case "redirect":
 				if target := SafeRedirect(hit.ActionParam); target != "" {
-					p.logAttack(site, ip, r, "custom", "自定义规则重定向："+hit.Name, rid, http.StatusFound, reqID)
+					logEvent("redirected", "custom", "自定义规则重定向："+hit.Name, rid, http.StatusFound)
 					p.Store.AddTraffic(site.ID, false, 0)
 					http.Redirect(w, r, target, http.StatusFound)
 					return
@@ -682,12 +727,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				purpose := "rule-" + strconv.FormatInt(hit.ID, 10)
 				if !p.Cap.ValidCookie(r, ip, site.ID, purpose) {
 					p.Store.AddTraffic(site.ID, true, 0)
-					p.logAttack(site, ip, r, "custom", "命中自定义规则，触发人机验证："+hit.Name, rid, http.StatusTooManyRequests, reqID)
+					logEvent("challenged", "custom", "命中自定义规则，触发人机验证："+hit.Name, rid, http.StatusTooManyRequests)
 					p.Cap.Issue(w, ip, host, site.ID, purpose, r.URL.RequestURI())
 					return
 				}
 			case "log":
-				p.logAttack(site, ip, r, "custom", "命中自定义规则（观察）："+hit.Name, rid, http.StatusOK, reqID)
+				logEvent("observed", "custom", "命中自定义规则（观察）："+hit.Name, rid, http.StatusOK)
 			}
 		}
 		rateRule = engine.MatchRule(site.rateRules, in)
@@ -729,13 +774,13 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if !p.Cap.ValidCookie(r, ip, site.ID, captchaBot) {
 					metricBlocked = true
 					p.Store.AddTraffic(site.ID, true, 0)
-					p.logAttack(site, ip, r, "bot", reason+"，触发人机验证", botRuleID, http.StatusTooManyRequests, reqID)
+					logEvent("challenged", "bot", reason+"，触发人机验证", botRuleID, http.StatusTooManyRequests)
 					p.Cap.Issue(w, ip, host, site.ID, captchaBot, r.URL.RequestURI())
 					return
 				}
 			case "log":
 				if identified || first {
-					p.logAttack(site, ip, r, "bot", "Bot 防护观察："+sig, botRuleID, http.StatusOK, reqID)
+					logEvent("observed", "bot", "Bot 防护观察："+sig, botRuleID, http.StatusOK)
 				}
 			}
 		}
@@ -756,7 +801,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if site.Captcha && !p.Cap.ValidCookie(r, ip, site.ID, captchaRate) {
 				metricBlocked = true
 				p.Store.AddTraffic(site.ID, true, 0)
-				p.logAttack(site, ip, r, "cc", reason+"，触发人机验证", ruleID, http.StatusTooManyRequests, reqID)
+				logEvent("challenged", "cc", reason+"，触发人机验证", ruleID, http.StatusTooManyRequests)
 				p.Cap.Issue(w, ip, host, site.ID, captchaRate, r.URL.RequestURI())
 				return
 			}
@@ -780,6 +825,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	uploadPolicy, matchedUpload := site.uploadPolicies[route]
 	if matchedUpload {
 		limit = int64(uploadPolicy.MaxBodyMiB) << 20
+		sw.diagnostic.BodyLimitKind = "upload_policy"
+	} else {
+		sw.diagnostic.BodyLimitKind = "inspection"
+	}
+	sw.diagnostic.BodyLimitBytes = limit
+	if r.ContentLength > 0 {
+		sw.diagnostic.BodyBytes = r.ContentLength
+		sw.diagnostic.BodyBytesKind = "declared"
 	}
 	if r.ContentLength > limit {
 		block(http.StatusRequestEntityTooLarge, "waf", "请求体超过完整检测上限", 0)
@@ -796,6 +849,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			key := uploadRouteKey{siteID: site.ID, route: route}
 			if !p.uploadBudget.acquire(key, uploadPolicy, reserve) {
 				metrics.Default.IncOverloadRejected("upload_capacity")
+				sw.diagnostic.setWAFDecision("rejected", "大文件上传并发槽位或在途请求体容量已满", "upload_capacity", 0)
 				w.Header().Set("Retry-After", "1")
 				WriteBlock(w, http.StatusServiceUnavailable, RenderBlockPage(p.Store.GetSetting("block_page"), map[string]string{
 					"REQ_ID": reqID, "REASON": "大文件上传繁忙，请稍后重试",
@@ -818,12 +872,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			var tooLarge *http.MaxBytesError
 			if errors.As(err, &tooLarge) {
+				if tooLarge.Limit != sw.diagnostic.BodyLimitBytes {
+					sw.diagnostic.BodyLimitKind = "declared_upload"
+				}
+				sw.diagnostic.BodyLimitBytes = tooLarge.Limit
+				sw.diagnostic.BodyBytes = tooLarge.Limit + 1
+				sw.diagnostic.BodyBytesKind = "at_least"
 				block(http.StatusRequestEntityTooLarge, "waf", "请求体超过完整检测上限", 0)
 			} else {
 				block(http.StatusBadRequest, "waf", "请求体读取失败", 0)
 			}
 			return
 		}
+		sw.diagnostic.BodyBytes = int64(len(body))
+		sw.diagnostic.BodyBytesKind = "read"
 		r.Body.Close()
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		r.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(body)), nil }
@@ -871,7 +933,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if res.LogOnly {
-		p.logAttack(site, ip, r, "waf", res.Msg+"（语义复核未确认，放行）", res.RuleID, http.StatusOK, reqID)
+		logEvent("observed", "waf", res.Msg+"（语义复核未确认，放行）", res.RuleID, http.StatusOK)
 	}
 
 	if diagnostic := site.apiPolicy.Check(r, body); diagnostic != "" {
@@ -879,7 +941,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			block(http.StatusBadRequest, "api_schema", diagnostic, 0)
 			return
 		}
-		p.logAttack(site, ip, r, "api_schema", "API 契约观察："+diagnostic, 0, http.StatusOK, reqID)
+		logEvent("observed", "api_schema", "API 契约观察："+diagnostic, 0, http.StatusOK)
 	}
 
 	semMode := p.Store.GetSetting("semantic_mode")
@@ -892,7 +954,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				block(http.StatusForbidden, "semantic", hit.Msg, hit.RuleID)
 				return
 			}
-			p.logAttack(site, ip, r, "semantic", hit.Msg, hit.RuleID, http.StatusOK, reqID)
+			logEvent("observed", "semantic", hit.Msg, hit.RuleID, http.StatusOK)
 		}
 	}
 
@@ -904,7 +966,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				block(http.StatusForbidden, "dynamic", "动态防护：缺少有效动态令牌，疑似自动化或重放请求", dynRuleID)
 				return
 			}
-			p.logAttack(site, ip, r, "dynamic", "动态防护（观察）：写操作缺少有效动态令牌", dynRuleID, http.StatusOK, reqID)
+			logEvent("observed", "dynamic", "动态防护（观察）：写操作缺少有效动态令牌", dynRuleID, http.StatusOK)
 		} else {
 			nextDynToken = p.issueDynToken(ip, site.ID)
 		}
@@ -1017,7 +1079,7 @@ func (t *upstreamTarget) recordFailure(err error) {
 	atomic.StoreInt64(&t.downUntil, now+10)
 	next := atomic.LoadInt64(&t.nextErrorLog)
 	if now >= next && atomic.CompareAndSwapInt64(&t.nextErrorLog, next, now+int64(upstreamErrorLogInterval/time.Second)) {
-		log.Printf("上游错误 %s: %v", t.u.Redacted(), err)
+		log.Printf("上游错误 %s (%T)", store.DisplayUpstreamURL(t.u), err)
 	}
 }
 
@@ -1101,6 +1163,9 @@ func (p *Proxy) requireSiteAuth(w http.ResponseWriter, r *http.Request, site *ca
 			return true
 		}
 	}
+	if sw, ok := w.(*statusWriter); ok {
+		sw.diagnostic.setWAFDecision("rejected", "未通过站点身份认证", "site_auth", 0)
+	}
 	w.Header().Set("WWW-Authenticate", `Basic realm="NiuB WAF Authentication"`)
 	http.Error(w, "401 Unauthorized - 牛B WAF 身份认证", http.StatusUnauthorized)
 	p.Store.AddTraffic(site.ID, false, 0)
@@ -1111,6 +1176,7 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 	if r.Context().Err() != nil {
 		return
 	}
+	sw, _ := w.(*statusWriter)
 	transport := p.upstreamTransport
 	if transport == nil {
 		transport = upstreamTransport
@@ -1118,7 +1184,7 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 	needResp := site.RespDetect && site.Enabled
 	needDyn := site.DynamicMode != "" && site.DynamicMode != "off" && site.Enabled
 	var hdr http.Header
-	if needResp || needDyn {
+	if needResp {
 		hdr = r.Header.Clone()
 		hdr.Set("Host", r.Host)
 	}
@@ -1138,7 +1204,7 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 			return
 		}
 		var respBlocked bool
-		var respBytes int64
+		var responseBlock engine.Result
 		var upstreamErr error
 		rp := &httputil.ReverseProxy{
 			Transport:  transport,
@@ -1158,7 +1224,7 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 					"Forwarded", "X-Forwarded", "X-Forwarded-For", "X-Forwarded-Host",
 					"X-Forwarded-Proto", "X-Forwarded-Port", "X-Forwarded-Server",
 					"X-Forwarded-Ssl", "X-Original-Forwarded-For", "X-Real-IP",
-					"X-NiuB-WAF-Req-ID",
+					requestDiagnosticHeader, ingressVerificationHeader,
 				} {
 					pr.Out.Header.Del(h)
 				}
@@ -1174,11 +1240,19 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 				pr.Out.Header.Set("X-Forwarded-Host", pr.In.Host)
 				pr.Out.Header.Set("X-Forwarded-Proto", proto)
 				pr.Out.Header.Set("X-Real-IP", ip)
-				pr.Out.Header.Set("X-NiuB-WAF-Req-ID", reqID)
+				pr.Out.Header.Set(requestDiagnosticHeader, reqID)
 			},
 			ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
 				// 客户端取消请求不会降低上游健康状态，也无需继续尝试。
 				if r.Context().Err() != nil {
+					return
+				}
+				if errors.Is(err, errResponseInspectionBlocked) {
+					msg := "响应内容检测：" + responseBlock.Msg
+					WriteBlock(w, responseBlock.Status, RenderBlockPage(p.Store.GetSetting("block_page"), map[string]string{
+						"REQ_ID": reqID, "REASON": msg, "CLIENT_IP": ip,
+						"DOMAIN": site.Domain, "TIME": nowStr(), "RULE_ID": strconv.Itoa(responseBlock.RuleID),
+					}))
 					return
 				}
 				upstreamErr = err
@@ -1196,6 +1270,12 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 			},
 		}
 		rp.ModifyResponse = func(resp *http.Response) error {
+			observeIngressOrigin(r, resp.StatusCode)
+			if sw != nil {
+				sw.diagnostic.UpstreamStatus = resp.StatusCode
+			}
+			resp.Header.Del(requestDiagnosticHeader)
+			resp.Trailer.Del(requestDiagnosticHeader)
 			filterProxyCookies(resp.Header, "Set-Cookie", false)
 			// 续发令牌只由 WAF 生成，忽略上游伪造的同名响应头。
 			resp.Header.Del("X-NiuB-Dyn-Token")
@@ -1203,71 +1283,35 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 				resp.Header.Set("X-NiuB-Dyn-Token", nextDynToken)
 				resp.Header.Set("Cache-Control", "no-store")
 			}
-			if hdr == nil {
-				return nil
-			}
-			ct := resp.Header.Get("Content-Type")
-			ce := resp.Header.Get("Content-Encoding")
-			// SSE(text/event-stream) 必须流式透传，缓冲会断流；编码内容/非文本同样跳过
-			if ce != "" || resp.Body == nil || strings.Contains(ct, "text/event-stream") || (!strings.Contains(ct, "text/") && !strings.Contains(ct, "json")) {
-				return nil
-			}
-			isHTML := strings.Contains(ct, "text/html")
-			if !needResp && !(needDyn && isHTML) {
-				return nil
-			}
-			limit := int64(1 << 20)
-			if needDyn && isHTML {
-				limit = 5 << 20
-			}
-			// 已知超大响应直接透传，避免缓冲占用与截断
-			if resp.ContentLength > limit {
-				return nil
-			}
-			body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
-			if err != nil {
-				resp.Body.Close()
-				return err
-			}
-			if int64(len(body)) > limit {
-				// 长度未知且超限：拼接已读部分与剩余流，原样透传不截断
-				resp.Body = &multiReadCloser{io.MultiReader(bytes.NewReader(body), resp.Body), resp.Body}
-				return nil
-			}
-			resp.Body.Close()
-			respBytes = int64(len(body))
 			if needResp {
-				res := p.Engine.DetectResponse(site.WAFMode, site.excl, &engine.RequestInfo{
+				res, err := p.inspectUpstreamResponse(r, site, &engine.RequestInfo{
 					ClientIP: ip, Method: r.Method, URL: r.URL.RequestURI(), Proto: r.Proto, Headers: hdr,
-				}, resp.StatusCode, resp.Header, body)
+				}, resp)
 				if res.Blocked {
 					respBlocked = true
-					html := RenderBlockPage(p.Store.GetSetting("block_page"), map[string]string{
-						"REQ_ID": reqID, "REASON": "响应内容检测：" + res.Msg, "CLIENT_IP": ip,
-						"DOMAIN": site.Domain, "TIME": nowStr(), "RULE_ID": fmt.Sprintf("%d", res.RuleID),
-					})
+					responseBlock = res
+					if sw != nil {
+						sw.diagnostic.setWAFDecision("blocked", DiagnosticRuleReason("resp", res.Status), "resp", res.RuleID)
+					}
 					p.logAttack(site, ip, r, "resp", res.Msg, res.RuleID, res.Status, reqID)
-					resp.StatusCode = res.Status
-					resp.Body = io.NopCloser(strings.NewReader(html))
-					resp.ContentLength = int64(len(html))
-					resp.Header.Set("Content-Type", "text/html; charset=utf-8")
-					resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(html)))
-					resp.Header.Del("Content-Encoding")
-					return nil
+					return errResponseInspectionBlocked
+				}
+				if err != nil {
+					return err
 				}
 			}
-			if needDyn && isHTML {
-				resp.Header.Set("Cache-Control", "no-store")
-				body = p.injectDynamic(body, ip, site.ID)
+			if needDyn {
+				return p.injectDynamicResponse(resp, r, ip, site.ID)
 			}
-			resp.Body = io.NopCloser(bytes.NewReader(body))
-			resp.ContentLength = int64(len(body))
-			resp.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
 			return nil
 		}
 
 		if i > 0 && r.GetBody != nil {
 			r.Body, _ = r.GetBody()
+		}
+		if sw != nil {
+			sw.diagnostic.UpstreamAttempted = true
+			sw.diagnostic.UpstreamStatus = 0
 		}
 		rec := &countWriter{ResponseWriter: w}
 		t.serve(rp, rec, r)
@@ -1275,9 +1319,9 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 			return
 		}
 		if upstreamErr == nil {
-			metrics.Default.AddResponseBytes(rec.n + respBytes)
+			metrics.Default.AddResponseBytes(rec.n)
 			if countTraffic {
-				p.Store.AddTraffic(site.ID, respBlocked, rec.n+respBytes)
+				p.Store.AddTraffic(site.ID, respBlocked, rec.n)
 			}
 			return
 		}
@@ -1295,6 +1339,10 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 			break
 		}
 	}
+	if sw != nil {
+		sw.diagnostic.Source, sw.diagnostic.Outcome = "upstream", "upstream_error"
+		sw.diagnostic.Reason, sw.diagnostic.Module = "回源失败，WAF 未能转发有效的上游响应", "upstream_unavailable"
+	}
 	WriteBlock(w, http.StatusBadGateway, RenderBlockPage("", map[string]string{
 		"REQ_ID": reqID, "REASON": "上游站点无法访问", "CLIENT_IP": ip,
 		"DOMAIN": site.Domain, "TIME": nowStr(),
@@ -1305,6 +1353,10 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 }
 
 func (p *Proxy) writeUpstreamBusy(w http.ResponseWriter, siteID int64, nextDynToken string, countTraffic bool, reason string) {
+	if sw, ok := w.(*statusWriter); ok {
+		sw.diagnostic.Source, sw.diagnostic.Outcome = "upstream", "rejected"
+		sw.diagnostic.Reason, sw.diagnostic.Module = "回源连接池繁忙，WAF 拒绝请求", reason
+	}
 	metrics.Default.IncOverloadRejected(reason)
 	w.Header().Set("Retry-After", "1")
 	if nextDynToken != "" {
@@ -1356,19 +1408,29 @@ type countWriter struct {
 // statusWriter 记录响应状态码供流量分析聚合（未显式 WriteHeader 视为 200）
 type statusWriter struct {
 	http.ResponseWriter
-	code int
+	code       int
+	diagnostic RequestDiagnostic
 }
 
 func (s *statusWriter) WriteHeader(code int) {
 	if s.code != 0 {
 		return // 与 net/http 一致：重复 WriteHeader 忽略，避免 superfluous 日志
 	}
-	s.code = code
+	if s.diagnostic.ReqID != "" {
+		s.Header().Set(requestDiagnosticHeader, s.diagnostic.ReqID)
+	}
+	// 103 等临时状态之后仍需记录并发送真正响应。
+	if code >= 200 || code == http.StatusSwitchingProtocols {
+		s.code = code
+	}
 	s.ResponseWriter.WriteHeader(code)
 }
 
 func (s *statusWriter) Write(b []byte) (int, error) {
 	if s.code == 0 {
+		if s.diagnostic.ReqID != "" {
+			s.Header().Set(requestDiagnosticHeader, s.diagnostic.ReqID)
+		}
 		s.code = http.StatusOK
 	}
 	return s.ResponseWriter.Write(b)

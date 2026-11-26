@@ -171,6 +171,7 @@ func (e *Engine) buildWAF(mode string, excl []Exclusion, extraCT []string, bodyL
 		pl = 2
 	}
 	// 用下方同阶段的本地规则保留原有参数限额规则 ID。
+	// 响应体扫描在代理层限长，给 Coraza 的阈值多留一字节，避免正好达到上限时被标为截断。
 	directives := fmt.Sprintf(`
 Include @coraza.conf-recommended
 SecRuleRemoveById 200004 200005
@@ -185,8 +186,8 @@ SecRule ARGUMENTS_LIMIT_REACHED "@eq 1" "id:100011,phase:2,t:none,deny,status:40
 SecRule REQUEST_HEADERS:Content-Type "@rx ^[^/;[:blank:]]+/[^;[:blank:]]+[+]json[[:blank:]]*(?:;|$)" "id:100012,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=JSON"
 SecRule REQUEST_HEADERS:Content-Type "@rx ^[^/;[:blank:]]+/[^;[:blank:]]+[+]xml[[:blank:]]*(?:;|$)" "id:100013,phase:1,t:none,t:lowercase,pass,nolog,ctl:requestBodyProcessor=XML"
 SecResponseBodyAccess On
-SecResponseBodyLimit 1048576
-SecResponseBodyMimeType text/plain text/html text/xml application/json
+SecResponseBodyLimit %d
+SecResponseBodyMimeType text/plain text/html text/xml application/xml application/json
 SecAuditEngine Off
 Include @crs-setup-lts.conf.example
 SecAction "id:900000,phase:1,nolog,pass,t:none,setvar:tx.blocking_paranoia_level=%d,setvar:tx.detection_paranoia_level=%d"
@@ -194,7 +195,7 @@ SecAction "id:900001,phase:1,nolog,pass,t:none,setvar:tx.inbound_anomaly_score_t
 SecAction "id:900003,phase:1,nolog,pass,t:none,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'"
 %s%sSecRule ARGS|ARGS_NAMES|REQUEST_URI|REQUEST_BODY "(?:;|\||\x60|&&|\$\()\s*(?:cat|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php|chmod|chown|rm|dd|mkfifo|telnet)(?:[\s/\\;|&]|$)" "id:100001,phase:2,block,t:none,t:urlDecodeUni,t:lowercase,setvar:tx.anomaly_score=+5,setvar:tx.inbound_anomaly_score_pl1=+5,setvar:tx.inbound_anomaly_score_pl2=+5,msg:'牛B WAF: Unix 命令注入尝试',logdata:'Matched Data: %%{MATCHED_VAR} found within %%{MATCHED_VAR_NAME}',severity:'CRITICAL'"
 Include @owasp_crs_lts/*.conf
-`, bodyLimit, pl, pl, contentTypeDirectives(extraCT), exclusionDirectives(append(defaultExclusions(extraCT), excl...)))
+`, bodyLimit, maxScanLimit+1, pl, pl, contentTypeDirectives(extraCT), exclusionDirectives(append(defaultExclusions(extraCT), excl...)))
 	return coraza.NewWAF(coraza.NewWAFConfig().
 		WithRootFS(ruleFiles).
 		WithErrorCallback(func(mr types.MatchedRule) {
@@ -453,11 +454,14 @@ func soleDetectionRule(matched []types.MatchedRule) int {
 	return sole
 }
 
-func (e *Engine) DetectResponse(mode string, excl []Exclusion, req *RequestInfo, status int, headers http.Header, body []byte) Result {
+// DetectResponse always evaluates the response headers. readBody is called only
+// after the engine accepts the headers and determines the body is inspectable.
+func (e *Engine) DetectResponse(mode string, excl []Exclusion, req *RequestInfo, status int, headers http.Header, readBody func() ([]byte, error)) (Result, error) {
 	w := e.wafFor(mode, excl)
 	tx := w.NewTransaction()
 	defer tx.Close()
 	txID := tx.ID()
+	defer e.takeMatched(txID)
 
 	tx.ProcessConnection(req.ClientIP, 0, req.ServerIP, 0)
 	tx.ProcessURI(req.URL, req.Method, req.Proto)
@@ -466,11 +470,8 @@ func (e *Engine) DetectResponse(mode string, excl []Exclusion, req *RequestInfo,
 			tx.AddRequestHeader(k, v)
 		}
 	}
-	tx.ProcessRequestHeaders()
-	reqBody := req.Body[:min(len(req.Body), e.ScanLimit())]
-	if len(reqBody) > 0 {
-		tx.WriteRequestBody(reqBody)
-		tx.ProcessRequestBody()
+	if tx.ProcessRequestHeaders() != nil {
+		return Result{}, fmt.Errorf("请求上下文未通过规则检查，无法执行响应检测")
 	}
 	for k, vv := range headers {
 		for _, v := range vv {
@@ -478,19 +479,35 @@ func (e *Engine) DetectResponse(mode string, excl []Exclusion, req *RequestInfo,
 		}
 	}
 	if it := tx.ProcessResponseHeaders(status, req.Proto); it != nil {
-		return resultFrom(it, e.takeMatched(txID))
+		return resultFrom(it, e.takeMatched(txID)), nil
 	}
-	respBody := body[:min(len(body), e.ScanLimit())]
-	if len(respBody) > 0 {
-		if it, _, err := tx.WriteResponseBody(respBody); err == nil && it != nil {
-			return resultFrom(it, e.takeMatched(txID))
+	var bodyErr error
+	if readBody != nil && tx.IsResponseBodyAccessible() && tx.IsResponseBodyProcessable() {
+		var body []byte
+		body, bodyErr = readBody()
+		if bodyErr == nil && len(body) > 0 {
+			// Callers bound the body to the same effective scan limit. Keep the
+			// hard ceiling here as well to protect Coraza from future callers.
+			body = body[:min(len(body), maxScanLimit)]
+			it, n, err := tx.WriteResponseBody(body)
+			if it != nil {
+				return resultFrom(it, e.takeMatched(txID)), nil
+			}
+			bodyErr = err
+			if bodyErr == nil && n != len(body) {
+				bodyErr = fmt.Errorf("响应检测输入不完整")
+			}
 		}
 	}
-	if it, err := tx.ProcessResponseBody(); err == nil && it != nil {
-		return resultFrom(it, e.takeMatched(txID))
+	// CRS consolidates phase-3 findings in phase 4, even for headers-only checks.
+	it, err := tx.ProcessResponseBody()
+	if it != nil {
+		return resultFrom(it, e.takeMatched(txID)), nil
 	}
-	e.takeMatched(txID)
-	return Result{}
+	if bodyErr != nil {
+		return Result{}, bodyErr
+	}
+	return Result{}, err
 }
 
 func resultFrom(it *types.Interruption, matched []types.MatchedRule) Result {
@@ -535,9 +552,9 @@ func resultFrom(it *types.Interruption, matched []types.MatchedRule) Result {
 	return res
 }
 
-// ClientIP 解析真实客户端 IP。仅当直连对端位于可信代理网段时才采信 X-Forwarded-For /
-// X-Real-IP，并从右向左跳过可信代理取第一个不可信 IP；否则一律使用 RemoteAddr，
-// 杜绝客户端伪造 XFF 绕过黑名单/白名单/信誉/地域策略。trusted 为空即安全默认（忽略转发头）。
+// ClientIP 仅接受可信直连代理发送的转发头。按接收顺序处理所有
+// X-Forwarded-For 字段，从右向左跳过可信代理。链尾部有非法项或找不到客户端时，使用直连地址。
+// 仅在没有 X-Forwarded-For 字段且代理已重建请求头时使用单个 X-Real-IP。
 func ClientIP(r *http.Request, trusted []*net.IPNet) string {
 	host := r.RemoteAddr
 	if h, _, err := net.SplitHostPort(host); err == nil {
@@ -551,17 +568,23 @@ func ClientIP(r *http.Request, trusted []*net.IPNet) string {
 	if !ipInNets(remote, trusted) {
 		return remote.String()
 	}
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		for i := len(parts) - 1; i >= 0; i-- {
-			cand := net.ParseIP(strings.TrimSpace(parts[i]))
-			if cand != nil && !ipInNets(cand, trusted) {
-				return cand.String()
+	if forwarded := r.Header.Values("X-Forwarded-For"); len(forwarded) > 0 {
+		for field := len(forwarded) - 1; field >= 0; field-- {
+			hops := strings.Split(forwarded[field], ",")
+			for hop := len(hops) - 1; hop >= 0; hop-- {
+				ip := net.ParseIP(strings.TrimSpace(hops[hop]))
+				if ip == nil {
+					return remote.String()
+				}
+				if !ipInNets(ip, trusted) {
+					return ip.String()
+				}
 			}
 		}
+		return remote.String()
 	}
-	if xr := r.Header.Get("X-Real-IP"); xr != "" {
-		if cand := net.ParseIP(strings.TrimSpace(xr)); cand != nil {
+	if real := r.Header.Values("X-Real-IP"); len(real) == 1 {
+		if cand := net.ParseIP(strings.TrimSpace(real[0])); cand != nil {
 			return cand.String()
 		}
 	}

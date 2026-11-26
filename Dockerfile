@@ -3,7 +3,7 @@ FROM golang:1.26.11-alpine AS builder
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
-COPY main.go ./
+COPY main.go data_permissions*.go ./
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/niubwaf .
 
@@ -14,7 +14,6 @@ RUN apk add --no-cache ca-certificates tzdata \
     && adduser -S -D -H -u 10001 -G niubwaf niubwaf
 WORKDIR /app
 COPY --from=builder /out/niubwaf /app/niubwaf
-COPY data/geoip.mmdb /app/seed/geoip.mmdb
 COPY docker-entrypoint.sh /app/docker-entrypoint.sh
 RUN mkdir -p /app/data \
     && chown niubwaf:niubwaf /app/data \

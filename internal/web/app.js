@@ -73,6 +73,7 @@ function showLogin() {
   csrfToken = '';
   currentAccount = null;
   closeLive();
+  closeModal();
   $('#login').classList.remove('hidden');
   $('#app').classList.add('hidden');
   $('#force-change').classList.add('hidden');
@@ -559,7 +560,7 @@ async function sites() {
   const m = $('#main');
   const admin = currentAccount.role === 'admin';
   const canEditAPI = currentAccount.role !== 'viewer';
-  m.innerHTML = pageHead('防护站点', '将域名解析指向本 WAF 即可开启防护 · 多上游自动负载均衡与健康检查',
+  m.innerHTML = pageHead('防护站点', '配置站点后，从用户访问的入口验证流量、拦截和回源',
     `${admin ? `<button class="btn" onclick="siteForm()">${ico('plus')}添加站点</button>` : ''}
      <button class="btn ghost" onclick="sites()">${ico('refresh')}刷新状态</button>`) + `
   <div class="panel table-panel"><table>
@@ -577,8 +578,9 @@ async function sites() {
       <td>${s.waf_mode === 'strict' ? '<span class="tag orange">严格</span>' : '<span class="tag blue">平衡</span>'}${s.dynamic_mode === 'block' ? ' <span class="tag cyan">动态拦截</span>' : s.dynamic_mode === 'observe' ? ' <span class="tag cyan">动态观察</span>' : ''}${s.bot_mode && s.bot_mode !== 'off' ? ' <span class="tag violet">反爬' + ({block: '拦截', captcha: '验证', log: '观察'}[s.bot_mode] || '') + '</span>' : ''}</td>
       <td>${s.cc_rate > 0 ? s.cc_rate + ' req/s' + (s.captcha ? ' +人机验证' : '') : '<span class="hint">关闭</span>'}</td>
       <td>${s.auth_user ? '<span class="tag on">开启</span>' : '<span class="hint">关闭</span>'}</td>
-      <td>${s.enabled ? '<span class="tag on">防护中</span>' : '<span class="tag off">已停用</span>'}</td>
+      <td data-ingress-site="${esc(s.id)}">${ingressBadge(s, s.ingress)}</td>
       <td>
+        <button class="btn ghost sm" data-site-action="ingress" data-id="${esc(s.id)}">接入验收</button>
         ${canEditAPI ? `<button class="btn ghost sm" data-site-action="api" data-id="${esc(s.id)}">API 契约</button>` : ''}
         ${admin ? `<button class="btn ghost sm" data-site-action="upload" data-id="${esc(s.id)}">上传策略</button>` : ''}
         ${admin ? `<button class="btn ghost sm" data-site-action="edit" data-id="${esc(s.id)}">编辑</button>
@@ -594,8 +596,125 @@ async function sites() {
       else if (btn.dataset.siteAction === 'delete') delSite(s.id, s.domain);
       else if (btn.dataset.siteAction === 'api') openAPIPolicy(s);
       else if (btn.dataset.siteAction === 'upload') openUploadPolicy(s);
+      else if (btn.dataset.siteAction === 'ingress') openIngressVerification(s);
     });
   } catch (e) { if (e.message !== '未登录') toast(e.message, true); }
+}
+
+function ingressBadge(site, status) {
+  if (!site.enabled) return '<span class="tag off">已停用</span>';
+  if (status?.verified) {
+    const label = status.source === 'external' ? '外部入口已验收' : '本地入口已验收';
+    const verifiedAt = [status.pass?.observed_at, status.block?.observed_at]
+      .filter(Boolean).sort().at(-1);
+    return `<span class="tag on">${label}</span><div class="hint">${esc(status.entry_url)}</div>
+      ${verifiedAt ? `<div class="hint">${esc(inspectionTime(verifiedAt))}</div>` : ''}`;
+  }
+  if (status?.pass?.observed_at || status?.block?.observed_at || site.traffic_observed_at) {
+    const observedAt = status?.pass?.observed_at || status?.block?.observed_at || site.traffic_observed_at;
+    return `<span class="tag blue">已收到流量</span><div class="hint">${esc(inspectionTime(observedAt))}</div>`;
+  }
+  return '<span class="tag orange">已配置</span><div class="hint">待验收</div>';
+}
+
+async function openIngressVerification(site) {
+  const endpoint = '/api/sites/' + encodeURIComponent(site.id) + '/ingress-verification';
+  const canStart = currentAccount.role === 'admin' && site.enabled;
+  $('#modal-root').innerHTML = `<div class="modal-mask" onclick="if(event.target===this)closeModal()">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="ingress-title">
+      <h3 id="ingress-title">接入验收 · ${esc(site.domain)}</h3>
+      ${canStart ? `<form id="ingress-form">
+        <div class="form-grid">
+          <label class="form-row"><span>协议</span><select name="scheme"><option value="https">HTTPS</option><option value="http">HTTP</option></select></label>
+          <label class="form-row"><span>用户访问的端口</span><input name="port" type="number" required min="1" max="65535" value="443"></label>
+          <label class="form-row"><span>GET 路径</span><input name="path" required maxlength="256" value="/" autocomplete="off" spellcheck="false"></label>
+          <label class="form-row"><span>执行位置</span><select name="source"><option value="external">外部网络</option><option value="local">内网或本机</option></select></label>
+        </div>
+        <p class="hint">选一个可正常访问的只读路径。外部网络验收请在站点所在局域网之外执行。</p>
+        <div class="verify-actions"><button class="btn" type="submit">生成验收命令</button></div>
+      </form>` : `<p class="hint">${site.enabled ? '管理员可以生成验收命令。' : '启用站点后可生成验收命令。'}</p>`}
+      <div id="ingress-commands" hidden></div>
+      <div id="ingress-result" class="verify-result" role="status" aria-live="polite"></div>
+      <div class="modal-actions"><button id="ingress-refresh" class="btn ghost" type="button">刷新结果</button><button class="btn ghost" onclick="closeModal()">关闭</button></div>
+    </section></div>`;
+  const result = $('#ingress-result');
+  const commands = $('#ingress-commands');
+  const refresh = $('#ingress-refresh');
+  const form = $('#ingress-form');
+  let resultRevision = 0;
+  let commandCreatedAt;
+  function render(status) {
+    if (!result.isConnected) return;
+    const expired = status?.expires_at && Date.parse(status.expires_at) <= Date.now();
+    if (status?.created_at !== commandCreatedAt || expired) commands.hidden = true;
+    const cell = document.querySelector(`[data-ingress-site="${Number(site.id)}"]`);
+    if (cell) cell.innerHTML = ingressBadge(site, status);
+    if (!status?.entry_url) {
+      result.textContent = '还没有接入验收记录。';
+      return;
+    }
+    const verificationRow = (label, item) => {
+      if (!item?.observed_at) return `<dt>${label}</dt><dd>${expired ? '验收命令已过期' : '等待请求到达'}</dd>`;
+      const detail = item.origin_status ? ` · 上游 HTTP ${item.origin_status}` : '';
+      const reasons = {origin_reached: '源站已响应', origin_error_status: '源站返回非成功状态', response_status_changed: 'WAF 返回的状态与源站不同',
+        request_interrupted: '请求处理未完成', no_origin_response: '没有收到源站响应', verification_blocked: 'WAF 返回预期的验证拦截'};
+      return `<dt>${label}</dt><dd><span class="tag ${item.matched ? 'on' : 'orange'}">${item.matched ? '通过' : '未通过'}</span>
+        HTTP ${esc(item.status)}${esc(detail)}<div class="hint">${esc(inspectionTime(item.observed_at))} · ${esc(item.request_id || '—')}</div>
+        ${reasons[item.reason] ? `<div class="hint">${reasons[item.reason]}</div>` : ''}</dd>`;
+    };
+    result.innerHTML = `<dl class="verify-details">
+      <dt>验证入口</dt><dd class="mono">${esc(status.entry_url)}</dd>
+      <dt>执行位置</dt><dd>${status.source === 'external' ? '外部网络（由操作者选择）' : '内网或本机'}</dd>
+      ${verificationRow('正常回源', status.pass)}${verificationRow('WAF 验证拦截', status.block)}
+      ${status.expires_at ? `<dt>命令有效期</dt><dd>${esc(inspectionTime(status.expires_at))}</dd>` : ''}
+    </dl><p class="hint">验收结果反映本 WAF 节点观测到的请求。</p>`;
+  }
+  async function loadResult() {
+    const revision = ++resultRevision;
+    refresh.disabled = true;
+    try {
+      const status = await api(endpoint);
+      if (revision === resultRevision) render(status);
+    } catch (e) {
+      if (result.isConnected && revision === resultRevision) result.textContent = e.message;
+    } finally {
+      if (revision === resultRevision) refresh.disabled = false;
+    }
+  }
+  refresh.onclick = loadResult;
+  if (form) {
+    const {scheme, port, path, source} = form.elements;
+    const submit = form.querySelector('button[type="submit"]');
+    scheme.onchange = () => { port.value = scheme.value === 'https' ? '443' : '80'; };
+    form.onsubmit = async event => {
+      event.preventDefault();
+      const probePath = path.value.trim();
+      if (!/^\/[a-zA-Z0-9._~/-]*$/.test(probePath) || probePath.startsWith('//')) {
+        toast('请输入简单的站内路径，例如 / 或 /health，省略查询参数。', true);
+        return;
+      }
+      ++resultRevision;
+      submit.disabled = refresh.disabled = true;
+      try {
+        const data = await api(endpoint, {method: 'POST', body: {scheme: scheme.value, port: Number(port.value), path: probePath, source: source.value}});
+        if (!form.isConnected) return;
+        const target = data.status.entry_url;
+        if (!/^https?:\/\/[a-zA-Z0-9.-]+(?::[0-9]+)?\/[a-zA-Z0-9._~/-]*$/.test(target) ||
+            !/^[a-zA-Z0-9-]+$/.test(data.header) || !/^[a-zA-Z0-9_-]+$/.test(data.pass_token) || !/^[a-zA-Z0-9_-]+$/.test(data.block_token)) {
+          throw new Error('验收命令包含无效字符，请检查站点域名和路径。');
+        }
+        const cmd = token => `curl -i --max-time 20 -H "${data.header}: ${token}" "${target}"`;
+        commands.innerHTML = `<p class="hint">在所选网络执行两条命令，然后刷新结果。Windows PowerShell 中请使用 curl.exe。</p>
+          <label class="form-row"><span>验证正常回源</span><input class="mono" readonly value="${esc(cmd(data.pass_token))}" onclick="this.select()"></label>
+          <label class="form-row"><span>验证 WAF 拦截</span><input class="mono" readonly value="${esc(cmd(data.block_token))}" onclick="this.select()"></label>`;
+        commandCreatedAt = data.status.created_at;
+        commands.hidden = false;
+        render(data.status);
+      } catch (e) { if (form.isConnected) toast(e.message, true); }
+      finally { submit.disabled = refresh.disabled = false; }
+    };
+  }
+  await loadResult();
 }
 
 async function openAPIPolicy(site) {
@@ -715,6 +834,7 @@ function siteForm(s) {
     <div class="form-row"><label>防护域名</label><input id="f-domain" placeholder="www.example.com" value="${esc(s.domain)}"></div>
   </div>
   <div class="form-row"><label>上游地址（真实服务器，多个用逗号分隔，自动负载均衡与健康检查）</label><input id="f-upstream" placeholder="http://192.168.1.10:80, http://192.168.1.11:80" value="${esc(s.upstream)}"></div>
+  ${s.upstream_redacted ? '<label class="check"><input id="f-replace-upstream" type="checkbox"> 用当前输入值替换上游（旧地址的凭据或查询参数已隐藏，地址不变时默认保留旧配置）</label>' : ''}
   <div class="form-grid">
     <div class="form-row"><label>防护模式</label><select id="f-mode">
       <option value="balanced" ${s.waf_mode === 'balanced' ? 'selected' : ''}>平衡（推荐，低误报）</option>
@@ -728,7 +848,8 @@ function siteForm(s) {
   <div class="form-row"><label>认证密码（哈希存储，不回显）</label><input id="f-authp" type="password" value="" autocomplete="new-password" placeholder="${s.auth_user ? '留空保持原密码不变' : '设置认证密码'}"></div>
   <label class="check"><input id="f-enabled" type="checkbox" ${s.enabled ? 'checked' : ''}> 启用防护</label>
   <label class="check"><input id="f-captcha" type="checkbox" ${s.captcha ? 'checked' : ''}> CC 超限时显示人机验证（验证后仍执行限流）</label>
-  <label class="check"><input id="f-resp" type="checkbox" ${s.resp_detect ? 'checked' : ''}> 响应内容检测（防信息泄露/网页挂马）</label>
+  <label class="check"><input id="f-resp" type="checkbox" ${s.resp_detect ? 'checked' : ''}> 响应内容检测</label>
+  <p class="hint">检查响应头及支持类型的正文。部分响应只检查响应头，覆盖结果见「运行维护」。</p>
   <div class="form-row"><label>动态防护（向页面植入混淆令牌，拦截无令牌的自动化写操作 / 重放 / CSRF）</label><select id="f-dyn">
     <option value="off" ${s.dynamic_mode !== 'observe' && s.dynamic_mode !== 'block' ? 'selected' : ''}>关闭</option>
     <option value="observe" ${s.dynamic_mode === 'observe' ? 'selected' : ''}>观察（仅记录，不拦截）</option>
@@ -756,7 +877,7 @@ function closeModal() { $('#modal-root').innerHTML = ''; }
 async function saveSite(id) {
   const body = {
     name: $('#f-name').value.trim(), domain: $('#f-domain').value.trim(),
-    upstream: $('#f-upstream').value.trim(), waf_mode: $('#f-mode').value,
+    upstream: $('#f-upstream').value.trim(), replace_upstream: $('#f-replace-upstream')?.checked || false, waf_mode: $('#f-mode').value,
     cc_rate: +$('#f-cc').value || 0, cc_burst: +$('#f-burst').value || 0,
     auth_user: $('#f-authu').value.trim(), auth_pass: $('#f-authp').value,
     enabled: $('#f-enabled').checked, captcha: $('#f-captcha').checked, resp_detect: $('#f-resp').checked,
@@ -781,7 +902,8 @@ let logPage = 1;
 let logRows = [];
 async function logs() {
   const m = $('#main');
-  m.innerHTML = pageHead('攻击日志', '全量攻击事件检索 · 支持一键豁免误报') + `
+  m.innerHTML = pageHead('攻击日志', '检索防护事件，按请求 ID 定位拦截与回源结果',
+    `<button class="btn ghost" onclick="openRequestDiagnostic()">${ico('search')}请求诊断</button>`) + `
   <div class="toolbar">
     <input id="q-ip" placeholder="客户端 IP">
     <input id="q-domain" placeholder="站点域名">
@@ -815,7 +937,8 @@ async function loadLogs() {
       <td class="mono url-cell" title="${esc(l.url)}">${esc(l.url)}</td>
       <td>${actionTag(l.action)}</td><td class="url-cell" title="${esc(l.msg)}">${esc(l.msg)}</td>
       <td class="mono">${l.status}</td>
-      <td>${l.rule_id > 0 && (l.action === 'waf' || l.action === 'resp' || l.action === 'semantic') ? `<button class="btn ghost sm" onclick="exclFromLog(${i})">豁免</button>` : ''}</td></tr>`).join('')
+      <td>${l.req_id ? `<button class="btn ghost sm" onclick="openRequestDiagnostic(logRows[${i}].req_id)">诊断</button>` : ''}
+        ${l.rule_id > 0 && (l.action === 'waf' || l.action === 'resp' || l.action === 'semantic') ? `<button class="btn ghost sm" onclick="exclFromLog(${i})">豁免</button>` : ''}</td></tr>`).join('')
       : emptyHTML(11, '暂无记录');
     const pages = Math.max(1, Math.ceil(d.total / d.size));
     $('#log-pager').innerHTML = `共 ${d.total} 条 · ${logPage}/${pages} 页
@@ -823,6 +946,57 @@ async function loadLogs() {
       <button class="btn ghost sm" ${logPage >= pages ? 'disabled' : ''} onclick="logPage++;loadLogs()">下一页</button>`;
   } catch (e) { if (e.message !== '未登录') toast(e.message, true); }
 }
+
+function openRequestDiagnostic(reqID = '') {
+  $('#modal-root').innerHTML = `<div class="modal-mask" onclick="if(event.target===this)closeModal()">
+    <section class="modal" role="dialog" aria-modal="true" aria-labelledby="diag-title">
+      <h3 id="diag-title">请求诊断</h3>
+      <form id="diagnostic-form" class="toolbar">
+        <input class="mono" name="requestID" aria-label="请求 ID" placeholder="输入请求 ID" value="${esc(reqID)}" required pattern="[a-fA-F0-9]{12}" maxlength="12" autocomplete="off" spellcheck="false">
+        <button class="btn" type="submit">查询</button>
+      </form>
+      <p class="hint">请求 ID 可在拦截页或响应头 X-NiuB-WAF-Req-ID 中找到。</p>
+      <div id="diagnostic-result" class="verify-result" role="status" aria-live="polite"></div>
+      <div class="modal-actions"><button class="btn ghost" onclick="closeModal()">关闭</button></div>
+    </section></div>`;
+  const form = $('#diagnostic-form');
+  const input = form.elements.requestID;
+  const result = $('#diagnostic-result');
+  const button = form.querySelector('button');
+  async function lookup() {
+    const id = input.value.trim();
+    if (!/^[a-fA-F0-9]{12}$/.test(id)) return;
+    button.disabled = true;
+    result.textContent = '正在查询…';
+    try {
+      const item = await api('/api/request-diagnostics?id=' + encodeURIComponent(id));
+      if (!result.isConnected) return;
+      const sources = {waf: 'WAF', origin: '源站', upstream: 'WAF 回源过程', unknown: '未记录'};
+      const outcomes = {allowed: '放行', observed: '观察', blocked: '拦截', challenged: '人机验证', redirected: '重定向',
+        rejected: '拒绝', origin_error: '源站错误', upstream_error: '回源失败', unknown: '未记录'};
+      const sizes = {declared: '客户端声明', read: '实际读取', at_least: '至少已读取'};
+      const limits = {upload_policy: '站点上传策略', inspection: '通用完整检测设置', declared_upload: '上传声明长度'};
+      const detail = (label, value) => value == null || value === '' ? '' : `<dt>${label}</dt><dd>${esc(value)}</dd>`;
+      const bytes = value => `${fmtN(value)} 字节`;
+      result.innerHTML = `<dl class="verify-details">
+        ${detail('请求 ID', item.req_id)}${detail('时间', inspectionTime(item.ts))}${detail('站点', item.domain)}
+        ${detail('请求方法', item.method)}${detail('处置结果', outcomes[item.outcome] || '未记录')}
+        ${detail('响应来源', sources[item.source] || '未记录')}${detail('客户端状态码', item.status || '')}
+        ${detail('已发起回源', item.upstream_attempted === true ? '是' : item.historical ? '未记录' : '否')}
+        ${detail('上游状态码', item.upstream_status || '')}${detail('模块', item.module)}${detail('规则 ID', item.rule_id || '')}
+        ${detail('原因', item.reason)}
+        ${detail('请求体大小', item.body_bytes == null ? '' : `${bytes(item.body_bytes)}（${sizes[item.body_bytes_kind] || '已记录'}）`)}
+        ${detail('生效的请求体上限', item.body_limit_bytes ? bytes(item.body_limit_bytes) : '')}
+        ${detail('上限来源', limits[item.body_limit_kind])}
+      </dl>${item.observations?.length ? `<p class="hint">观察命中 ${item.observations.map(o => esc(o.module) + (o.rule_id ? ' #' + esc(o.rule_id) : '')).join(' · ')}</p>` : ''}
+      ${item.historical ? '<p class="hint">结果来自留存的防护日志，部分过程字段可能未记录。</p>' : ''}`;
+    } catch (e) { if (result.isConnected) result.textContent = e.message; }
+    finally { button.disabled = false; }
+  }
+  form.onsubmit = event => { event.preventDefault(); lookup(); };
+  if (reqID) lookup(); else input.focus();
+}
+
 function exportCSV() { window.open('/api/logs/export?' + logQuery()); }
 async function clearAttackLogs() {
   if (!confirm('确认清空全部攻击日志？此操作不可撤销（审计日志与生效中的信誉封禁不受影响）。')) return;
@@ -1462,7 +1636,7 @@ async function settings() {
       <input id="trusted-proxies" placeholder="可信代理 IP/CIDR，逗号分隔，如 10.0.0.0/8,192.168.1.5" style="min-width:min(100%,320px)">
       <button class="btn" onclick="saveTrusted()">保存</button>
     </div>
-    <p class="hint">仅当 WAF 部署在反向代理/负载均衡之后时填写上游代理地址。留空（默认）则忽略 X-Forwarded-For / X-Real-IP，一律以直连 IP 为准，防止客户端伪造 IP 绕过黑名单/白名单/信誉/地域策略；填写后从右向左跳过可信代理，取首个不可信 IP 作为真实客户端。</p>
+    <p class="hint">仅填写实际前置代理的 IP 或 CIDR。公网入口须清理客户端自带的 X-Forwarded-For 和 X-Real-IP，并用连接来源重建转发头。WAF 从右向左检查完整的 X-Forwarded-For 链，无法识别客户端时使用直连 IP。没有 X-Forwarded-For 时才接受可信代理提供的单个 X-Real-IP。留空则始终使用直连 IP。</p>
   </div>
   <div class="panel"><h3>告警通知（攻击激增推送）</h3>
     <div class="toolbar">
@@ -1612,6 +1786,10 @@ async function operations() {
     </div>
     <p class="hint">抓取端点 <code>/metrics</code>（管理端口，默认 9443）。已配置令牌时，请将令牌填入 Prometheus 抓取配置。清除令牌后仅允许环回地址访问。指标含请求量与时延直方图、攻击计数、上游健康与排队、超时和拒绝数、信誉封禁数、响应字节与 Go 运行时。</p>
   </div>
+  <div class="panel"><h3>响应检测覆盖</h3>
+    <p class="hint">统计当前节点自启动以来已启用响应检测的站点。流式和部分下载响应保留原转发方式。</p>
+    <dl id="ops-response" class="runtime-info" style="margin-top:12px" aria-live="polite"></dl>
+  </div>
   <div class="panel"><h3>审计日志采集</h3>
     <p class="hint">采集器通过 Bearer 令牌读取 <code>/audit/events?after_id=0</code>，使用返回的 <code>X-NiuB-Audit-Next-ID</code> 继续采集。</p>
     <div class="toolbar">
@@ -1651,6 +1829,11 @@ async function operations() {
     if (!runtime.isConnected) return;
     $('#ops-crs').textContent = stats.crs_version || '—';
     $('#ops-geo').textContent = stats.geoip_available ? '已加载' : '未加载';
+    const responseCounts = stats.response_inspection || {};
+    const responseLabels = {complete:'完整检查',partial:'正文前缀',blocked:'检测拦截',no_body:'无正文',stream:'流式或升级（仅响应头）',
+      range:'分段下载（仅响应头）',media_type:'其他类型（仅响应头）',encoding:'其他编码（仅响应头）',decode_error:'解码失败',read_error:'读取失败',engine_error:'检测未完成'};
+    $('#ops-response').innerHTML = Object.entries(responseLabels).filter(([key]) => responseCounts[key] > 0)
+      .map(([key, label]) => `<div><dt>${label}</dt><dd>${fmtN(responseCounts[key])}</dd></div>`).join('') || '<div class="hint">暂无检测记录</div>';
     setSecretField('metrics_token', settings.metrics_token_configured === 'true');
     $('#audit-feed-state').textContent = auditFeed.enabled ? '采集已开启' : '采集已关闭';
     $('#audit-feed-enable').onclick = () => configureAuditFeed($('#audit-token').value.trim(), true);

@@ -692,7 +692,7 @@ func normalizeConfigSite(v ConfigSite) (ConfigSite, error) {
 		return v, err
 	}
 	v.Domain = domain
-	v.Upstream, err = normalizeConfigUpstreams(v.Upstream)
+	v.Upstream, err = NormalizeUpstreams(v.Upstream)
 	if err != nil {
 		return v, configInvalid("站点 %s 的上游地址无效或含 userinfo/query", v.Domain)
 	}
@@ -740,26 +740,6 @@ func canonicalConfigDomain(raw string) (string, error) {
 		}
 	}
 	return d, nil
-}
-
-func normalizeConfigUpstreams(raw string) (string, error) {
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, item := range parts {
-		item = strings.TrimSpace(item)
-		if item == "" || len(item) > 8192 {
-			return "", ErrConfigInvalid
-		}
-		u, err := url.Parse(item)
-		if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Opaque != "" || (u.Scheme != "http" && u.Scheme != "https") {
-			return "", ErrConfigInvalid
-		}
-		out = append(out, u.String())
-	}
-	if len(out) == 0 || len(out) > 32 {
-		return "", ErrConfigInvalid
-	}
-	return strings.Join(out, ","), nil
 }
 
 func normalizeConfigRule(v ConfigRule) (ConfigRule, error) {

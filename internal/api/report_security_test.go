@@ -31,7 +31,7 @@ func TestReportEscapesStoredFields(t *testing.T) {
 			t.Fatalf("报告包含未转义字段 %q", raw)
 		}
 	}
-	for _, escaped := range []string{"&lt;img src=x onerror=alert(1)&gt;", "&lt;script&gt;alert(2)&lt;/script&gt;"} {
+	for _, escaped := range []string{"&lt;img src=x onerror=alert(1)&gt;", "http://127.0.0.1/%3Cscript%3E"} {
 		if !strings.Contains(body, escaped) {
 			t.Fatalf("报告缺少转义文本 %q", escaped)
 		}

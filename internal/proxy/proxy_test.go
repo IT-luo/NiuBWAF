@@ -33,6 +33,32 @@ func TestProbeUpstreamUserAgent(t *testing.T) {
 	}
 }
 
+func TestCheckUpstreamsOnlyProbesEnabledTargetsWithoutRedirects(t *testing.T) {
+	var disabledHits, enabledHits atomic.Int64
+	disabled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		disabledHits.Add(1)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer disabled.Close()
+	enabled := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		enabledHits.Add(1)
+		http.Redirect(w, r, disabled.URL+"/health", http.StatusTemporaryRedirect)
+	}))
+	defer enabled.Close()
+	enabledSite := mkSite(enabled.URL)
+	enabledSite.Domain, enabledSite.Enabled = "enabled.example", true
+	disabledSite := mkSite(disabled.URL)
+	disabledSite.Domain = "disabled.example"
+	proxy := &Proxy{sites: map[string]*cachedSite{enabledSite.Domain: enabledSite, disabledSite.Domain: disabledSite}}
+	results := proxy.checkUpstreams()
+	if len(results) != 1 || results[0].Site != enabledSite.Domain || !results[0].Up {
+		t.Fatalf("应仅报告启用站点，且 HTTP 重定向视为源站可达: %+v", results)
+	}
+	if enabledHits.Load() != 1 || disabledHits.Load() != 0 {
+		t.Fatalf("探测请求次数不匹配，启用站点 %d，停用站点 %d", enabledHits.Load(), disabledHits.Load())
+	}
+}
+
 func TestPickRoundRobin(t *testing.T) {
 	s := mkSite("http://a:80", "http://b:80", "http://c:80")
 	seen := map[string]int{}
