@@ -50,7 +50,7 @@ func (p *Proxy) checkAlert() {
 	p.alertMu.Lock()
 	p.lastAlert = time.Now()
 	p.alertMu.Unlock()
-	msg := fmt.Sprintf("牛B WAF 告警：近 %d 秒检测到 %d 次攻击事件，超过阈值 %d，请及时处置。", window, count, threshold)
+	msg := fmt.Sprintf("NiuB WAF 告警：近 %d 秒检测到 %d 次攻击事件，超过阈值 %d，请及时处置。", window, count, threshold)
 	p.dispatchAlert(msg, count, window, threshold)
 	p.Store.Audit("system", "触发告警", msg)
 	p.Hub.Broadcast(map[string]any{"type": "alert", "ts": nowStr(), "message": msg, "count": count})
@@ -152,7 +152,7 @@ func (p *Proxy) postJSONContext(ctx context.Context, rawURL string, payload any)
 
 // AlertTest 同步向已配置通道发送测试消息，返回各通道结果，供控制台验证连通性
 func (p *Proxy) AlertTest() map[string]string {
-	msg := "牛B WAF 告警测试：通知通道连通性验证。"
+	msg := "NiuB WAF 告警测试：通知通道连通性验证。"
 	out := map[string]string{}
 	for _, name := range []string{"webhook", "dingtalk", "wecom"} {
 		u := strings.TrimSpace(p.Store.GetSetting("alert_" + name))

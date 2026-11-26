@@ -21,7 +21,7 @@ func (a *API) report(w http.ResponseWriter, r *http.Request) {
 	a.audit(r, "导出防护报告", "")
 
 	var b strings.Builder
-	b.WriteString(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>牛B WAF 防护报告</title><style>
+	b.WriteString(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'"><title>NiuB WAF 防护报告</title><style>
 body{font-family:"Microsoft YaHei",sans-serif;margin:40px auto;max-width:900px;color:#222;line-height:1.6}
 h1{color:#1a56b0;border-bottom:3px solid #1a56b0;padding-bottom:10px}
 h2{color:#1a56b0;margin-top:32px;font-size:18px}
@@ -34,7 +34,7 @@ th{background:#eef3fb}
 .meta{color:#777;font-size:13px}
 @media print{body{margin:10mm}}
 </style></head><body>`)
-	fmt.Fprintf(&b, `<h1>牛B WAF 防护报告</h1><p class="meta">生成时间：%s · 本报告由牛B WAF 自动生成</p>`, time.Now().Format("2006-01-02 15:04:05"))
+	fmt.Fprintf(&b, `<h1>NiuB WAF 防护报告</h1><p class="meta">生成时间：%s · 本报告由NiuB WAF 自动生成</p>`, time.Now().Format("2006-01-02 15:04:05"))
 	b.WriteString(`<h2>一、总体概况</h2><div class="cards">`)
 	fmt.Fprintf(&b, `<div class="card"><div class="n">%d</div>累计请求</div>`, st.TotalReqs)
 	fmt.Fprintf(&b, `<div class="card"><div class="n">%d</div>累计拦截</div>`, st.TotalBlocks)
@@ -73,7 +73,7 @@ th{background:#eef3fb}
 			html.EscapeString(l.Ts), html.EscapeString(l.Domain), html.EscapeString(l.ClientIP), html.EscapeString(l.Action), html.EscapeString(l.Msg), l.Status)
 	}
 	b.WriteString(`</table>`)
-	b.WriteString(`<p class="meta" style="margin-top:40px">—— 报告结束 · 牛B WAF ——</p></body></html>`)
+	b.WriteString(`<p class="meta" style="margin-top:40px">—— 报告结束 · NiuB WAF ——</p></body></html>`)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'")

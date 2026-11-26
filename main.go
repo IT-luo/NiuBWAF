@@ -46,7 +46,7 @@ func main() {
 	}
 
 	fmt.Println("==============================================")
-	fmt.Println("  牛B WAF - 新一代智能 Web 应用防火墙")
+	fmt.Println("  NiuB WAF - 新一代智能 Web 应用防火墙")
 	fmt.Println("  基于 Coraza 引擎 + OWASP CRS 规则集")
 	fmt.Println("==============================================")
 

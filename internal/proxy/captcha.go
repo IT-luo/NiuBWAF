@@ -231,7 +231,7 @@ func (c *Captcha) Verify(w http.ResponseWriter, r *http.Request, ip string) {
 
 var captchaPage = template.Must(template.New("captcha").Parse(`<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>牛B WAF - 人机验证</title>
+<title>NiuB WAF - 人机验证</title>
 <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
 <style>
 body{margin:0;min-height:100vh;display:grid;place-items:center;background:#070a12;color:#e6edf7;font:16px system-ui}

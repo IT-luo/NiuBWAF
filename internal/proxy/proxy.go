@@ -1220,7 +1220,7 @@ func (p *Proxy) requireSiteAuth(w http.ResponseWriter, r *http.Request, site *ca
 		sw.diagnostic.setWAFDecision("rejected", "未通过站点身份认证", "site_auth", 0)
 	}
 	w.Header().Set("WWW-Authenticate", `Basic realm="NiuB WAF Authentication"`)
-	http.Error(w, "401 Unauthorized - 牛B WAF 身份认证", http.StatusUnauthorized)
+	http.Error(w, "401 Unauthorized - NiuB WAF 身份认证", http.StatusUnauthorized)
 	p.Store.AddTraffic(site.ID, false, 0)
 	return false
 }

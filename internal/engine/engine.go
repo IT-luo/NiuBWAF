@@ -193,7 +193,7 @@ Include @crs-setup-lts.conf.example
 SecAction "id:900000,phase:1,nolog,pass,t:none,setvar:tx.blocking_paranoia_level=%d,setvar:tx.detection_paranoia_level=%d"
 SecAction "id:900001,phase:1,nolog,pass,t:none,setvar:tx.inbound_anomaly_score_threshold=5,setvar:tx.outbound_anomaly_score_threshold=4"
 SecAction "id:900003,phase:1,nolog,pass,t:none,setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'"
-%s%sSecRule ARGS|ARGS_NAMES|REQUEST_URI|REQUEST_BODY "(?:;|\||\x60|&&|\$\()\s*(?:cat|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php|chmod|chown|rm|dd|mkfifo|telnet)(?:[\s/\\;|&]|$)" "id:100001,phase:2,block,t:none,t:urlDecodeUni,t:lowercase,setvar:tx.anomaly_score=+5,setvar:tx.inbound_anomaly_score_pl1=+5,setvar:tx.inbound_anomaly_score_pl2=+5,msg:'牛B WAF: Unix 命令注入尝试',logdata:'Matched Data: %%{MATCHED_VAR} found within %%{MATCHED_VAR_NAME}',severity:'CRITICAL'"
+%s%sSecRule ARGS|ARGS_NAMES|REQUEST_URI|REQUEST_BODY "(?:;|\||\x60|&&|\$\()\s*(?:cat|wget|curl|bash|sh|nc|netcat|python|perl|ruby|php|chmod|chown|rm|dd|mkfifo|telnet)(?:[\s/\\;|&]|$)" "id:100001,phase:2,block,t:none,t:urlDecodeUni,t:lowercase,setvar:tx.anomaly_score=+5,setvar:tx.inbound_anomaly_score_pl1=+5,setvar:tx.inbound_anomaly_score_pl2=+5,msg:'NiuB WAF: Unix 命令注入尝试',logdata:'Matched Data: %%{MATCHED_VAR} found within %%{MATCHED_VAR_NAME}',severity:'CRITICAL'"
 Include @owasp_crs_lts/*.conf
 `, bodyLimit, maxScanLimit+1, pl, pl, contentTypeDirectives(extraCT), exclusionDirectives(append(defaultExclusions(extraCT), excl...)))
 	return coraza.NewWAF(coraza.NewWAFConfig().

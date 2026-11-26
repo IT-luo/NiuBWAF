@@ -463,7 +463,7 @@ func (e *Engine) Semantic(excl []Exclusion, uri string, body []byte) *SemanticHi
 		if h := hits[ruleID]; h == nil || score > h.Score || (score == h.Score && h.Param == "body" && param != "body") {
 			hits[ruleID] = &SemanticHit{
 				RuleID: ruleID, Score: score, Param: param,
-				Msg: "牛B WAF 语义引擎: " + kind + "（" + reason + "，评分 " + strconv.Itoa(score) + "）",
+				Msg: "NiuB WAF 语义引擎: " + kind + "（" + reason + "，评分 " + strconv.Itoa(score) + "）",
 			}
 		}
 	}

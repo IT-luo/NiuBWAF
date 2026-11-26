@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-  <b>牛B WAF (NiuBWAF)</b> · 开源自托管 Web 应用防火墙<br>
+  <b>NiuB WAF (NiuBWAF)</b> · 开源自托管 Web 应用防火墙<br>
   Go · Coraza v3 + OWASP CRS4 · 单二进制部署
 </p>
 
@@ -19,7 +19,7 @@
 
 ## 简介
 
-牛B WAF 是一款以反向代理模式部署的**开源自托管 Web 应用防火墙**，用于保护 HTTP/HTTPS 网站和 API。
+NiuB WAF 是一款以反向代理模式部署的**开源自托管 Web 应用防火墙**，用于保护 HTTP/HTTPS 网站和 API。
 
 - **请求检测**：内嵌 OWASP CRS 4.25.2 LTS 和语义分析引擎（SQLi / XSS / RCE / 命令注入 / 扫描器特征）
 - **CC 防护**：支持站点默认限额、按路径及方法配置的接口限流，以及 JS 人机验证
@@ -36,10 +36,10 @@
 
 ## 快速开始
 
-Linux x86_64 和 Windows x64 用户可以从 [GitHub Releases](https://github.com/IT-luo/NiuBWAF/releases) 下载对应平台的发布包和同一版本的 `SHA256SUMS`。以下以 Linux `v1.2.2` 为例。
+Linux x86_64 和 Windows x64 用户可以从 [GitHub Releases](https://github.com/IT-luo/NiuBWAF/releases) 下载对应平台的发布包和同一版本的 `SHA256SUMS`。以下以 Linux `v1.3.1` 为例。
 
 ```bash
-sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.2.2-linux-amd64.tar.gz && \
+sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.1-linux-amd64.tar.gz && \
   ./niubwaf -proxy :8080 -tls :8443 -admin 127.0.0.1:9443 -data ./data
 ```
 
