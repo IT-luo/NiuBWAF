@@ -10,6 +10,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
+	"net/textproto"
 	"net/url"
 	"path/filepath"
 	"strings"
@@ -499,6 +501,65 @@ func TestSecurityRewriteRebuildsForwardingHeadersAfterConnectionStripping(t *tes
 	}
 }
 
+func TestPublicServerHeaderDoesNotExposeUpstream(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Server", "gunicorn-early")
+		w.Header().Set("Link", "</main.css>; rel=preload; as=style")
+		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Set("Server", "gunicorn")
+		w.Header().Add("Server", "python")
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Trailer", "Server, X-Test-Trailer")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "origin body")
+		w.Header().Set("Server", "gunicorn-trailer")
+		w.Header().Set("X-Test-Trailer", "preserved")
+	}))
+	defer upstream.Close()
+	p := newSecurityTestProxy(t, store.Site{Domain: "site.test", Upstream: upstream.URL, Enabled: false}, nil)
+	edge := httptest.NewServer(p)
+	defer edge.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var early http.Header
+	trace := &httptrace.ClientTrace{Got1xxResponse: func(code int, headers textproto.MIMEHeader) error {
+		if code == http.StatusEarlyHints {
+			early = http.Header(headers).Clone()
+		}
+		return nil
+	}}
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, edge.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "site.test"
+	resp, err := edge.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil || string(body) != "origin body" {
+		t.Fatalf("正文 = %q, %v", body, err)
+	}
+	for name, headers := range map[string]http.Header{"103": early, "200": resp.Header} {
+		values := headers.Values("Server")
+		if len(values) != 1 || values[0] != "NiuBWAF" {
+			t.Errorf("%s Server = %v, 期望单个 NiuBWAF", name, values)
+		}
+	}
+	if early.Get("Link") == "" || resp.Trailer.Get("Server") != "" || resp.Trailer.Get("X-Test-Trailer") != "preserved" {
+		t.Fatalf("其他响应头或尾部字段未保留，或源站 Server 泄漏: 103 Link=%q, trailer=%v", early.Get("Link"), resp.Trailer)
+	}
+
+	local := httptest.NewRecorder()
+	p.ServeHTTP(local, httptest.NewRequest(http.MethodGet, "http://unknown.test/", nil))
+	if local.Code != http.StatusNotFound || local.Header().Get("Server") != "NiuBWAF" {
+		t.Fatalf("WAF 本地响应 = %d, Server=%q", local.Code, local.Header().Get("Server"))
+	}
+}
+
 func TestSecurityBodyDetectionIgnoresClientContentType(t *testing.T) {
 	var upstreamHits atomic.Int32
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -577,7 +638,7 @@ func TestSecurityReadTimeoutClearedOnWebSocketHijack(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_, _ = rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nServer: gunicorn\r\n\r\n")
 		_ = rw.Flush()
 		time.Sleep(200 * time.Millisecond)
 		_, _ = conn.Write([]byte(payload))
@@ -603,14 +664,12 @@ func TestSecurityReadTimeoutClearedOnWebSocketHijack(t *testing.T) {
 	if err != nil || !strings.Contains(status, "101") {
 		t.Fatalf("WebSocket 升级失败: status=%q err=%v", status, err)
 	}
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if line == "\r\n" {
-			break
-		}
+	headers, err := textproto.NewReader(reader).ReadMIMEHeader()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values := http.Header(headers).Values("Server"); len(values) != 1 || values[0] != "NiuBWAF" {
+		t.Fatalf("WebSocket Server = %v, 期望单个 NiuBWAF", values)
 	}
 	got := make([]byte, len(payload))
 	if _, err := io.ReadFull(reader, got); err != nil {

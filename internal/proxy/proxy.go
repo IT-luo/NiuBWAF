@@ -613,7 +613,10 @@ func stripPort(host string) string {
 	return host
 }
 
+const publicServerName = "NiuBWAF"
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Server", publicServerName)
 	if r.Method == http.MethodConnect {
 		http.Error(w, "CONNECT is not supported", http.StatusMethodNotAllowed)
 		return
@@ -1297,6 +1300,8 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 				if r.Context().Err() != nil {
 					return
 				}
+				// ReverseProxy clears the header map after forwarding a 1xx.
+				w.Header().Set("Server", publicServerName)
 				if errors.Is(err, errResponseInspectionBlocked) {
 					msg := "响应内容检测：" + responseBlock.Msg
 					WriteBlock(w, responseBlock.Status, RenderBlockPage(p.Store.GetSetting("block_page"), map[string]string{
@@ -1350,6 +1355,12 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 					return err
 				}
 			}
+			// Response inspection still sees the original upstream headers.
+			// The proxy adds upstream headers to the existing response, so
+			// remove all upstream Server values before copying (including 101).
+			resp.Header.Del("Server")
+			resp.Trailer.Del("Server")
+			w.Header().Set("Server", publicServerName)
 			if needDyn {
 				return p.injectDynamicResponse(resp, r, ip, site.ID)
 			}
@@ -1365,6 +1376,8 @@ func (p *Proxy) forwardWithDynToken(w http.ResponseWriter, r *http.Request, site
 		}
 		rec := &countWriter{ResponseWriter: w}
 		t.serve(rp, rec, r)
+		// Trailers received at EOF may be added after ModifyResponse.
+		w.Header().Del(http.TrailerPrefix + "Server")
 		if r.Context().Err() != nil {
 			return
 		}
@@ -1453,6 +1466,14 @@ func isProxyCookie(name string) bool {
 type countWriter struct {
 	http.ResponseWriter
 	n int64
+}
+
+func (c *countWriter) WriteHeader(code int) {
+	if code >= 100 && code < 200 {
+		// Informational responses bypass ReverseProxy.ModifyResponse.
+		c.Header().Set("Server", publicServerName)
+	}
+	c.ResponseWriter.WriteHeader(code)
 }
 
 // statusWriter 记录响应状态码供流量分析聚合（未显式 WriteHeader 视为 200）
