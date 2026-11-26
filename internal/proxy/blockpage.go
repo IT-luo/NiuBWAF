@@ -5,14 +5,18 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"niubwaf/internal/web"
 )
 
-const DefaultBlockPage = `<!doctype html>
+var DefaultBlockPage = strings.Replace(defaultBlockPageHTML, "{{BRAND_ICON}}", web.BrandIconDataURI(), 1)
+
+const defaultBlockPageHTML = `<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>请求已拦截 · 牛B WAF</title>
+<title>请求已拦截 · NiuB WAF</title>
 <style>
 :root{
   color-scheme:light;
@@ -35,7 +39,7 @@ body{
 .brand-mark,.status-mark{display:grid;place-items:center;flex:none}
 .brand-mark{width:36px;height:36px;border-radius:11px;background:var(--soft-blue);color:var(--blue)}
 .status-mark{width:52px;height:52px;border-radius:15px;color:var(--red);background:#ffe3e9}
-.brand-mark svg{width:22px;height:22px}
+.brand-mark img{width:28px;height:28px}
 .status-mark svg{width:27px;height:27px}
 .status{display:flex;align-items:flex-start;gap:15px;padding:18px;border-radius:17px;background:var(--soft-red)}
 .status-copy{flex:1;min-width:0}
@@ -64,8 +68,8 @@ dd{margin:3px 0 0;font-size:13px;overflow-wrap:anywhere}
 <body>
 <main class="card" aria-labelledby="block-title">
   <div class="brand">
-    <span class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path fill="#fff" d="M12.55 6.5 7.05 13.1h4.9l-.5 4.4 5.55-6.6h-5z"/></svg></span>
-    <span>牛B WAF</span>
+    <span class="brand-mark" aria-hidden="true"><img src="{{BRAND_ICON}}" alt=""></span>
+    <span>NiuB WAF</span>
   </div>
   <div class="status">
     <span class="status-mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M12 8v4M12 16h.01"/></svg></span>

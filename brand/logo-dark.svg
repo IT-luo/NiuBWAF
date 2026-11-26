@@ -1,20 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 248 64" fill="none">
-  <defs>
-    <linearGradient id="nbIcon" x1="4.5" y1="2.5" x2="19.5" y2="21.5" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#22d3ee"/>
-      <stop offset=".5" stop-color="#6366f1"/>
-      <stop offset="1" stop-color="#a855f7"/>
-    </linearGradient>
-    <linearGradient id="nbText" x1="70" y1="20" x2="240" y2="46" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#22d3ee"/>
-      <stop offset=".55" stop-color="#818cf8"/>
-      <stop offset="1" stop-color="#c084fc"/>
-    </linearGradient>
-  </defs>
-  <g transform="translate(8,8) scale(2)">
-    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" fill="url(#nbIcon)"/>
-    <path d="M12 2l8 3v7c0 6-8 10-8 10z" fill="#fff" opacity=".12"/>
-    <path d="M12.55 6.5 7.05 13.1h4.9l-.5 4.4 5.55-6.6h-5z" fill="#fff"/>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 76" role="img" aria-labelledby="title">
+  <title id="title">NiuB WAF</title>
+  <g transform="translate(6 3) scale(.14) translate(-175 -122)">
+    <path fill="#5b8aff" fill-rule="evenodd" d="M250 163c7-3 13 3 9 12-11 25-4 47 18 60 24 14 61 13 94-1 37-16 75-21 116-3 37 16 71 20 95 4 22-14 28-40 18-63-3-8 3-13 10-9 27 16 55 57 55 87 0 36-26 63-69 80v48c0 83-66 154-170 195-102-42-168-111-168-195v-48c-43-16-67-43-67-80 0-30 29-71 59-87Zm107 128c-7 0-10 5-4 10l99 76c4 3 4 7 0 11l-94 89c-5 5-2 11 5 11h32c10 0 17-3 24-10l99-90c5-4 5-8 0-12l-99-75c-8-7-16-10-25-10Z"/>
   </g>
-  <text x="70" y="43" font-family="'PingFang SC','HarmonyOS Sans SC','MiSans','Microsoft YaHei',sans-serif" font-size="30" font-weight="800" letter-spacing="1" fill="url(#nbText)">牛B WAF</text>
+  <text x="84" y="57" fill="#e8f0ff" font-family="'Inter','Segoe UI',sans-serif" font-size="49" font-weight="800">NiuB WAF</text>
 </svg>

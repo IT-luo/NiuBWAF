@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="brand/logo-dark.png">
-    <img src="brand/logo-light.png" alt="牛B WAF" height="88">
+    <img src="brand/logo-light.png" alt="NiuB WAF" height="88">
   </picture>
 </p>
 
