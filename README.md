@@ -59,6 +59,18 @@ Windows x64 可解压运行原生 `niubwaf.exe`，Linux arm64 可从版本标签
 | --- | --- |
 | ![流量分析](docs/screenshots/traffic-analysis.png) | ![安全态势](docs/screenshots/security-posture.png) |
 
+## 微信体验交流群
+
+欢迎正在试用 NiuB WAF 的朋友入群交流。无论是第一次接入站点，还是已经在用，都欢迎聊聊部署中卡住的步骤、界面用起来不顺手的地方，以及希望增加的功能。
+
+<img src="docs/screenshots/wechat-group-qr.png" alt="NiuB WAF 微信体验交流群二维码" width="280">
+
+微信扫码入群。本次邀请二维码在 **2026 年 12 月 4 日前**有效。二维码过期后，仍可通过下方 GitHub Issues 反馈。
+
+反馈问题时，带上 **NiuB WAF 版本、部署方式、复现步骤、预期结果和实际表现**。截图和日志请先隐去账号、令牌、域名等敏感信息。
+
+也欢迎通过 [GitHub Issues](https://github.com/IT-luo/NiuBWAF/issues) 提交问题或功能建议，方便后续跟踪。
+
 ## 项目结构
 
 ```
