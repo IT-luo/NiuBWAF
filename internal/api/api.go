@@ -1149,6 +1149,15 @@ func (a *API) saveRule(w http.ResponseWriter, r *http.Request, id int64) {
 
 func (a *API) logs(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
+	if q.Get("screen") == "1" {
+		recent, err := a.Store.RecentAttackLogs(60)
+		if err != nil {
+			writeErr(w, 500, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"list": a.logsWithCoordinates(recent)})
+		return
+	}
 	page, _ := strconv.Atoi(q.Get("page"))
 	size, _ := strconv.Atoi(q.Get("size"))
 	if page < 1 {
@@ -1174,6 +1183,43 @@ func (a *API) logs(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, map[string]any{"list": list, "total": total, "page": page, "size": size})
+}
+
+type locatedAttackLog struct {
+	store.AttackLog
+	Lat *float64 `json:"lat,omitempty"`
+	Lon *float64 `json:"lon,omitempty"`
+}
+
+func (a *API) logsWithCoordinates(list []store.AttackLog) []locatedAttackLog {
+	out := make([]locatedAttackLog, 0, len(list))
+	locations := make(map[string]proxy.GeoCity, len(list))
+	for _, entry := range list {
+		geo, ok := locations[entry.ClientIP]
+		if !ok {
+			geo = a.Proxy.Geo.CityInfo(entry.ClientIP)
+			locations[entry.ClientIP] = geo
+		}
+		out = append(out, locateAttackLog(entry, geo))
+	}
+	return out
+}
+
+func locateAttackLog(entry store.AttackLog, geo proxy.GeoCity) locatedAttackLog {
+	if entry.Country != "" && !strings.EqualFold(entry.Country, geo.Country) {
+		// IP 归属会变动。数据库已保存国家时，回放应与该次事件的国家一致。
+		geo = proxy.GeoCity{Country: entry.Country, City: entry.City}
+	}
+	if geo.City == "" {
+		geo.City = entry.City
+	}
+	entry.Country, entry.City = geo.Country, geo.City
+	lat, lon := geo.Coordinates()
+	located := locatedAttackLog{AttackLog: entry}
+	if (lat != 0 || lon != 0) && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 {
+		located.Lat, located.Lon = &lat, &lon
+	}
+	return located
 }
 
 // clearLogs 清空攻击日志（不影响审计日志与生效中的信誉封禁）

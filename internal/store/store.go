@@ -764,6 +764,10 @@ func (s *Store) QueryAttackLogs(ip, domain, action string, limit, offset int) ([
 	return s.queryLogs(ip, domain, action, limit, offset, true)
 }
 
+func (s *Store) RecentAttackLogs(limit int) ([]AttackLog, error) {
+	return s.readLogRows(" WHERE status<>200", nil, limit, 0)
+}
+
 func (s *Store) queryLogs(ip, domain, action string, limit, offset int, attackOnly bool) ([]AttackLog, int, error) {
 	where, args := logWhere(ip, domain, action)
 	if attackOnly {
@@ -771,22 +775,30 @@ func (s *Store) queryLogs(ip, domain, action string, limit, offset int, attackOn
 	}
 	var total int
 	s.DB.QueryRow(`SELECT COUNT(*) FROM attack_logs`+where, args...).Scan(&total)
+	list, err := s.readLogRows(where, args, limit, offset)
+	if err != nil {
+		return nil, 0, err
+	}
+	return list, total, nil
+}
+
+func (s *Store) readLogRows(where string, args []any, limit, offset int) ([]AttackLog, error) {
 	rows, err := s.DB.Query(`SELECT id,ts,site_id,domain,client_ip,country,method,url,action,rule_id,msg,severity,status,req_id,query_redacted
 		FROM attack_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`, append(args, limit, offset)...)
 	if err != nil {
-		return nil, 0, err
+		return nil, err
 	}
 	defer rows.Close()
 	out := []AttackLog{}
 	for rows.Next() {
 		var l AttackLog
 		if err := rows.Scan(&l.ID, &l.Ts, &l.SiteID, &l.Domain, &l.ClientIP, &l.Country, &l.Method, &l.URL, &l.Action, &l.RuleID, &l.Msg, &l.Severity, &l.Status, &l.ReqID, &l.QueryRedacted); err != nil {
-			return nil, 0, err
+			return nil, err
 		}
 		l.RedactQuery()
 		out = append(out, l)
 	}
-	return out, total, nil
+	return out, rows.Err()
 }
 
 // EachAttackForAnalytics 遍历指定时段的已处置日志，用于修复旧版小时汇总。

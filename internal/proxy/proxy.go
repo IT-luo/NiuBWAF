@@ -1570,7 +1570,7 @@ func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, 
 		metrics.Default.IncAttack(action)
 	}
 	geo := p.Geo.CityInfo(ip)
-	lat, lon := geoCoords(geo)
+	lat, lon := geo.Coordinates()
 	logURL := r.URL.EscapedPath()
 	if !observation {
 		p.Ana.Event(EvStat{IP: ip, Action: action, Msg: msg, RuleID: ruleID, Status: status, Country: geo.Country, City: geo.City, Lat: lat, Lon: lon, URL: logURL, Domain: site.Domain})
@@ -1590,7 +1590,7 @@ func (p *Proxy) logAttack(site *cachedSite, ip string, r *http.Request, action, 
 	p.Hub.Broadcast(map[string]any{
 		"type": eventType, "ts": nowStr(), "domain": site.Domain, "ip": ip,
 		"country": geo.Country, "city": geo.City, "method": r.Method, "url": l.URL,
-		"action": action, "msg": msg, "status": status, "lat": lat, "lon": lon,
+		"action": action, "msg": msg, "status": status, "lat": lat, "lon": lon, "req_id": reqID,
 	})
 }
 

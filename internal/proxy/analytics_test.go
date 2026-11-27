@@ -634,23 +634,23 @@ func TestBucketJSONRoundTrip(t *testing.T) {
 }
 
 func TestGeoCoordsFallback(t *testing.T) {
-	lat, lon := geoCoords(GeoCity{Country: "US"})
+	lat, lon := (GeoCity{Country: "US"}).Coordinates()
 	if lat == 0 && lon == 0 {
 		t.Fatal("country centroid fallback failed for US")
 	}
-	lat, lon = geoCoords(GeoCity{Country: "CN", Region: "广东"})
+	lat, lon = (GeoCity{Country: "CN", Region: "广东"}).Coordinates()
 	cent := provinceCentroid["广东"]
 	if lat != cent[0] || lon != cent[1] {
 		t.Fatalf("province fallback = %v/%v, want %v/%v", lat, lon, cent[0], cent[1])
 	}
 	// ip2region 风格后缀也必须命中同一质心
 	for _, region := range []string{"广东省", "北京市", "广西壮族自治区", "香港特别行政区", "内蒙古自治区"} {
-		lat, lon = geoCoords(GeoCity{Country: "CN", Region: region})
+		lat, lon = (GeoCity{Country: "CN", Region: region}).Coordinates()
 		if lat == 0 || lon == 0 {
 			t.Fatalf("province fallback failed for %s", region)
 		}
 	}
-	lat, lon = geoCoords(GeoCity{})
+	lat, lon = (GeoCity{}).Coordinates()
 	if lat != 0 || lon != 0 {
 		t.Fatalf("empty geo should be 0/0, got %v/%v", lat, lon)
 	}

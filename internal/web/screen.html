@@ -32,23 +32,32 @@
 .wallboard .chart{height:222px}
 .wallboard .chart-geo{height:165px}
 #feed{max-height:560px;overflow:auto;font-size:12px;scrollbar-width:thin}
-.ev{padding:9px 4px;border-bottom:1px solid var(--border);overflow-wrap:anywhere;animation:flash 1s ease-out}
+.ev{padding:9px 6px;border-bottom:1px solid var(--border);overflow-wrap:anywhere}
+.ev.is-active{background:var(--blue-soft);box-shadow:inset 3px 0 var(--sky);border-radius:6px}
 .ev:last-child{border-bottom:0}
 .ev .t{color:var(--faint);font-family:var(--mono)}
 .ev .ip{color:var(--amber);font-family:var(--mono)}
+.ev .unlocated{color:var(--faint)}
 .ev .m{color:var(--dim);display:block;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ev .tag{margin:3px 5px;padding:1px 6px}
-@keyframes flash{from{background:var(--blue-soft)}to{background:transparent}}
+.feed-connection{color:var(--faint);font-size:11px;margin:0 0 8px}
 #map-box{position:relative;height:clamp(270px,34vw,425px);margin-bottom:14px;border-radius:14px;overflow:hidden;background:radial-gradient(ellipse at center,#f8fcff,#eaf4fa)}
 #c-vector,#c-map{position:absolute;inset:0;width:100%;height:100%}
 #c-map{pointer-events:none}
-.map-legend{position:absolute;left:9px;bottom:8px;display:flex;gap:9px;padding:4px 7px;border-radius:7px;background:#fff;color:var(--dim);font-size:10px;pointer-events:none}
+.map-legend{position:absolute;left:9px;bottom:8px;display:flex;flex-wrap:wrap;gap:4px 9px;max-width:calc(100% - 18px);padding:4px 7px;border-radius:7px;background:#fff;color:var(--dim);font-size:11px;pointer-events:none}
 .map-legend span{display:flex;align-items:center;gap:4px}
 .map-legend i{display:inline-block;width:6px;height:6px;border-radius:50%}
 .map-legend .source{background:#bc771e}
 .map-legend .target{background:#16899e}
 .map-legend .path{width:13px;height:2px;border-radius:2px;background:linear-gradient(90deg,#bc771e,#d14c6b)}
 .map-source{position:absolute;right:9px;top:8px;color:var(--faint);font-size:9px;pointer-events:none}
+.map-flight{position:absolute;z-index:2;display:grid;gap:3px;min-width:132px;max-width:min(210px,calc(100% - 16px));padding:7px 9px;border:1px solid var(--border);border-radius:9px;background:var(--panel);box-shadow:var(--shadow);color:var(--text);font-size:12px;line-height:1.35;pointer-events:none;overflow-wrap:anywhere}
+.map-flight[hidden]{display:none}
+.map-flight-mode{justify-self:start;padding:2px 5px;border-radius:4px;background:#fff0f3;color:var(--red);font-size:11px;font-weight:700}
+.map-flight[data-mode="replay"] .map-flight-mode{background:var(--blue-soft);color:var(--sky)}
+.map-flight-ip{font-family:var(--mono)}
+.map-flight-detail{color:var(--dim);font-size:11px}
+.map-note{margin-top:-6px;color:var(--faint);font-size:11px}
 .china-map-dialog{width:min(820px,calc(100% - 24px));max-height:calc(100% - 24px);margin:auto;padding:16px;border:1px solid var(--border);border-radius:16px;background:var(--panel);color:var(--text);box-shadow:var(--shadow-raised)}
 .china-map-dialog::backdrop{background:rgba(23,42,70,.38)}
 .china-map-dialog h2{margin:0;font-size:17px}
@@ -105,15 +114,23 @@
         <div><b id="m-qp">0</b><span>60s 峰值</span></div>
         <div><b id="m-blocked">0</b><span>24H 拦截</span></div>
         <div><b id="m-srcs">0</b><span>攻击源地域</span></div>
-        <div><b id="m-events">0</b><span>实时事件</span></div>
+        <div><b id="m-events">0</b><span>本次实时事件</span></div>
       </div>
       <div id="map-box">
         <div id="c-vector"></div><canvas id="c-map"></canvas>
-        <div class="map-legend"><span><i class="source"></i>攻击来源</span><span><i class="target"></i>受保护站点</span><span><i class="path"></i>攻击轨迹</span></div>
+        <div id="map-flight" class="map-flight" hidden>
+          <span id="map-flight-mode" class="map-flight-mode"></span>
+          <strong id="map-flight-place"></strong>
+          <span id="map-flight-ip" class="map-flight-ip"></span>
+          <span id="map-flight-target" class="map-flight-detail"></span>
+          <time id="map-flight-time" class="map-flight-detail"></time>
+        </div>
+        <div class="map-legend"><span><i class="source"></i>攻击来源</span><span><i class="target"></i>站点示意落点</span><span><i class="path"></i>攻击轨迹</span></div>
         <div class="map-source">Natural Earth · 110m</div>
       </div>
+      <p class="map-note">来源按 IP 归属地估算。<span id="map-unlocated"></span></p>
     </div>
-    <div class="panel wall-events"><h3><span class="live-dot"></span>实时攻击事件</h3><div id="feed"><p id="feed-empty" class="empty">暂无攻击事件</p></div></div>
+    <div class="panel wall-events"><h3><span class="live-dot"></span>实时攻击事件</h3><p id="feed-connection" class="feed-connection" role="status" hidden></p><div id="feed"><p class="empty">暂无攻击事件</p></div></div>
   </div>
 </div>
 <footer class="wall-footer">NiuB WAF · Coraza 智能语义分析引擎 + OWASP CRS 规则集 · 数据每 10 秒刷新</footer>
@@ -134,6 +151,7 @@
 <script src="echarts.min.js"></script>
 <script src="topojson-client.min.js"></script>
 <script src="world-110m.js"></script>
+<script src="screen-events.js"></script>
 <script>
 const $ = s => document.querySelector(s);
 $('#open-china-map').addEventListener('click', () => $('#china-map-dialog').showModal());
@@ -188,113 +206,138 @@ function buildMap(){
   if(!boxW||!boxH)return;
   mapCv.width=boxW*dpr;mapCv.height=boxH*dpr;mapCtx.setTransform(dpr,0,0,dpr,0,0);
   mapC.resize();mapC.setOption({geo:{layoutSize:mapLayoutSize()}});
+  mapDirty = true;
 }
-let arcs=[],evCount=0,seeded=false,ripples=[];
-function addArc(lon,lat,label,n,live){
-  if(!lon&&!lat)return;
-  const dup=arcs.find(a=>a.label===(label||'')&&Math.abs(a.lon-lon)<1.4&&Math.abs(a.lat-lat)<0.5);
-  if(dup){dup.n+=(n||1);dup.born=performance.now();dup.live=false;if(label)dup.label=label;return;}
-  arcs.push({lon,lat,label:label||'',n:n||1,born:performance.now(),seed:Math.random()*1000,live:!!live,lastT:0});
-  if(arcs.length>48)arcs.shift();
-}
-function placeMapLabels(hx,hy){
-  mapCtx.font='600 10.5px sans-serif';
-  const placed=[{x:hx-32,y:hy-33,w:78,h:66}],out=[];
-  for(const a of arcs.slice(-10)){
-    if(!a.label)continue;
-    const name=a.label.length>8?a.label.slice(0,8)+'…':a.label;
-    const txt=name+(a.n>1?' ×'+a.n:''),w=mapCtx.measureText(txt).width+8,h=18;
-    const p=project(a.lon,a.lat),sx=p[0],sy=p[1],candidates=[];
-    for(const d of [10,54,98,142,186]){
-      for(const dy of [-100,-63,-26,9,46,83,120]){
-        candidates.push([sx+d,sy+dy],[sx-w-d-4,sy+dy]);
-        if(d===10)candidates.push([sx-w/2,sy+dy]);
-      }
-    }
-    let best=null,bestScore=Infinity;
-    for(const c of candidates){
-      const r={x:Math.max(4,Math.min(boxW-w-4,c[0])),y:Math.max(4,Math.min(boxH-84,c[1])),w,h};
-      let hits=0;
-      for(const p of placed)if(r.x<p.x+p.w+5&&r.x+r.w+5>p.x&&r.y<p.y+p.h+5&&r.y+r.h+5>p.y)hits++;
-      const tx=Math.max(r.x,Math.min(sx,r.x+w)),ty=Math.max(r.y,Math.min(sy,r.y+h));
-      const score=hits*100000+Math.hypot(tx-sx,ty-sy)+Math.hypot(r.x-c[0],r.y-c[1])*1.5;
-      if(score<bestScore){bestScore=score;best=r;}
-    }
-    placed.push(best);
-    out.push({...best,sx,sy,txt});
+const timeline = new ScreenAttackTimeline();
+const mapCard = $('#map-flight');
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const flightTime = 1350;
+const arrivalTime = 950;
+let flight = null, evCount = 0, mapDirty = true, feedDirty = true;
+let aggregateSources = [], mapPoints = [], feedRows = new Map();
+
+function updateMapPoints() {
+  const places = new Map();
+  for (const point of [...aggregateSources, ...timeline.recent.filter(event => event.located)]) {
+    if (!Number.isFinite(point.lon) || !Number.isFinite(point.lat) || (!point.lon && !point.lat)) continue;
+    places.set(point.lon.toFixed(3) + ',' + point.lat.toFixed(3), point);
   }
-  return out;
+  mapPoints = [...places.values()];
+  mapDirty = true;
 }
-function frame(now){
-  if(boxW){
-    mapCtx.clearRect(0,0,boxW,boxH);
-    arcs=arcs.filter(a=>!a.live||now-a.born<14000);
-    ripples=ripples.filter(r=>now-r.born<1500);
-    const hp=project(HOME.lon,HOME.lat),hx=hp[0],hy=hp[1];
-    for(const a of arcs){
-      const ap=project(a.lon,a.lat),sx=ap[0],sy=ap[1],dx=hx,dy=hy;
-      const dist=Math.hypot(dx-sx,dy-sy)||1;
-      const cxp=(sx+dx)/2-(dy-sy)*0.22,cyp=Math.max(Math.min(sy,dy),(sy+dy)/2+(dx-sx)*0.22-dist*0.08);
-      // 轨迹线：琥珀(源)→玫红(本站)渐变
-      const alpha=Math.min(0.6,0.18+a.n*0.04);
-      const grad=mapCtx.createLinearGradient(sx,sy,dx,dy);
-      grad.addColorStop(0,`rgba(188,119,30,${(alpha*0.65).toFixed(3)})`);
-      grad.addColorStop(1,`rgba(209,76,107,${alpha.toFixed(3)})`);
-      mapCtx.beginPath();mapCtx.moveTo(sx,sy);mapCtx.quadraticCurveTo(cxp,cyp,dx,dy);
-      mapCtx.strokeStyle=grad;
-      mapCtx.lineWidth=Math.min(2.6,0.8+Math.log2(1+a.n)*0.5);mapCtx.stroke();
-      // 彗头 + 渐隐拖尾；每绕完一圈在本站激起拦截涟漪
-      const t=((now-a.born)/2600+a.seed)%1;
-      if(t<a.lastT)ripples.push({born:now});
-      a.lastT=t;
-      for(let k=8;k>=0;k--){
-        const tt=t-k*0.025;
-        if(tt<0)continue;
-        const it=1-tt;
-        const px=it*it*sx+2*it*tt*cxp+tt*tt*dx,py=it*it*sy+2*it*tt*cyp+tt*tt*dy;
-        mapCtx.beginPath();mapCtx.arc(px,py,k===0?2.4:1.8*(1-k/10),0,Math.PI*2);
-        mapCtx.fillStyle=`rgba(209,76,107,${((1-k/9)*0.85).toFixed(3)})`;
-        if(k===0){mapCtx.shadowColor='#d14c6b';mapCtx.shadowBlur=12;}
-        mapCtx.fill();mapCtx.shadowBlur=0;
-      }
-      // 源点：光晕 + 扩散环 + 核心
-      const sr=(now%1800)/1800;
-      mapCtx.beginPath();mapCtx.arc(sx,sy,2+sr*9,0,Math.PI*2);
-      mapCtx.strokeStyle=`rgba(188,119,30,${(0.45*(1-sr)).toFixed(3)})`;mapCtx.lineWidth=1;mapCtx.stroke();
-      mapCtx.beginPath();mapCtx.arc(sx,sy,4.5,0,Math.PI*2);mapCtx.fillStyle='rgba(188,119,30,.16)';mapCtx.fill();
-      mapCtx.beginPath();mapCtx.arc(sx,sy,2,0,Math.PI*2);mapCtx.fillStyle='#bc771e';mapCtx.fill();
+
+function highlightFeed(reveal = false) {
+  const active = feedRows.get(flight?.event.key);
+  for (const row of feedRows.values()) row.classList.toggle('is-active', row === active);
+  if (!reveal || !active) return;
+  const feed = $('#feed');
+  const viewport = feed.getBoundingClientRect();
+  const row = active.getBoundingClientRect();
+  if (row.top < viewport.top) feed.scrollTop += row.top - viewport.top;
+  else if (row.bottom > viewport.bottom) feed.scrollTop += row.bottom - viewport.bottom;
+}
+
+function setFlight(cue, now) {
+  flight = cue && { ...cue, started: now };
+  mapCard.hidden = !flight;
+  mapDirty = true;
+  highlightFeed(true);
+  if (!flight) return;
+
+  const { mode, event } = flight;
+  mapCard.dataset.mode = mode;
+  $('#map-flight-mode').textContent = mode === 'live' ? '实时事件' : '历史回放';
+  $('#map-flight-place').textContent = event.city || event.country || '攻击来源';
+  $('#map-flight-ip').textContent = event.ip;
+  $('#map-flight-target').textContent = '目标 · ' + (event.domain || '受保护站点');
+  $('#map-flight-time').textContent = event.ts;
+}
+
+function positionCard(x, y) {
+  const width = mapCard.offsetWidth, height = mapCard.offsetHeight;
+  const left = x + width + 20 < boxW ? x + 12 : x - width - 12;
+  const top = y - height - 9 >= 8 ? y - height - 9 : y + 10;
+  mapCard.style.left = Math.max(8, Math.min(boxW - width - 8, left)) + 'px';
+  mapCard.style.top = Math.max(8, Math.min(boxH - height - 32, top)) + 'px';
+}
+
+function dot(x, y, radius, color) {
+  mapCtx.beginPath();
+  mapCtx.arc(x, y, radius, 0, Math.PI * 2);
+  mapCtx.fillStyle = color;
+  mapCtx.fill();
+}
+
+function drawFlight(now, dx, dy) {
+  const { event, mode, started } = flight;
+  const from = project(event.lon, event.lat);
+  if (!from?.every(Number.isFinite)) {
+    mapCard.hidden = true;
+    return;
+  }
+  const [sx, sy] = from;
+  if (mapDirty) positionCard(sx, sy);
+  const elapsed = now - started;
+  const progress = reduceMotion.matches ? 1 : Math.min(1, elapsed / flightTime);
+  const lift = Math.max(28, Math.min(116, Math.hypot(dx - sx, dy - sy) * .27));
+  const cx = (sx + dx) / 2;
+  const cy = Math.min(sy, dy) - lift;
+  const partialX = sx + (cx - sx) * progress;
+  const partialY = sy + (cy - sy) * progress;
+  const px = partialX + (cx + (dx - cx) * progress - partialX) * progress;
+  const py = partialY + (cy + (dy - cy) * progress - partialY) * progress;
+  const color = mode === 'live' ? '#c53063' : '#365bd6';
+  const gradient = mapCtx.createLinearGradient(sx, sy, dx, dy);
+  gradient.addColorStop(0, '#cb791f');
+  gradient.addColorStop(1, color);
+  mapCtx.beginPath();
+  mapCtx.moveTo(sx, sy);
+  mapCtx.quadraticCurveTo(partialX, partialY, px, py);
+  mapCtx.strokeStyle = gradient;
+  mapCtx.lineWidth = mode === 'live' ? 2.8 : 2;
+  mapCtx.stroke();
+  dot(sx, sy, 4.5, '#cb791f');
+  dot(px, py, 4, color);
+  if (progress === 1) {
+    const fade = reduceMotion.matches ? .32 : Math.max(0, 1 - (elapsed - flightTime) / arrivalTime);
+    mapCtx.save();
+    mapCtx.globalAlpha = fade;
+    mapCtx.beginPath();
+    mapCtx.arc(dx, dy, 9 + (1 - fade) * 20, 0, Math.PI * 2);
+    mapCtx.strokeStyle = color;
+    mapCtx.lineWidth = 2;
+    mapCtx.stroke();
+    mapCtx.restore();
+  }
+}
+
+function drawMap(now) {
+  mapCtx.clearRect(0, 0, boxW, boxH);
+  for (const point of mapPoints) {
+    const projected = project(point.lon, point.lat);
+    if (projected?.every(Number.isFinite)) dot(...projected, 2.7, 'rgba(182,107,26,.55)');
+  }
+  const home = project(HOME.lon, HOME.lat);
+  if (home?.every(Number.isFinite)) {
+    dot(...home, 9, 'rgba(22,137,158,.18)');
+    dot(...home, 5, '#16899e');
+    if (flight) drawFlight(now, ...home);
+  }
+  mapDirty = false;
+}
+
+function frame(now) {
+  if (feedDirty) renderFeed();
+  if (boxW) {
+    if (flight && (now - flight.started >= flightTime + arrivalTime || !feedRows.has(flight.event.key) ||
+      (flight.mode === 'replay' && timeline.hasLive(now)))) {
+      setFlight(null, now);
     }
-    const labels=placeMapLabels(hx,hy);
-    for(const l of labels){
-      const tx=Math.max(l.x,Math.min(l.sx,l.x+l.w)),ty=Math.max(l.y,Math.min(l.sy,l.y+l.h));
-      if(Math.hypot(tx-l.sx,ty-l.sy)>18){
-        mapCtx.beginPath();mapCtx.moveTo(l.sx,l.sy);mapCtx.lineTo(tx,ty);
-        mapCtx.strokeStyle='rgba(188,119,30,.28)';mapCtx.lineWidth=0.8;mapCtx.stroke();
-      }
-      mapCtx.fillStyle='rgba(255,255,255,.92)';
-      mapCtx.beginPath();mapCtx.roundRect(l.x,l.y,l.w,l.h,4);mapCtx.fill();
-      mapCtx.fillStyle='#865411';mapCtx.fillText(l.txt,l.x+4,l.y+13);
+    if (!flight) {
+      const next = timeline.take(now);
+      if (next) setFlight(next, now);
     }
-    // 拦截到达涟漪
-    for(const rp of ripples){
-      const p=(now-rp.born)/1500;
-      mapCtx.beginPath();mapCtx.arc(hx,hy,7+p*32,0,Math.PI*2);
-      mapCtx.strokeStyle=`rgba(209,76,107,${(0.5*(1-p)).toFixed(3)})`;mapCtx.lineWidth=1.4;mapCtx.stroke();
-    }
-    // 本站：双层脉冲 + 高亮核心 + 标签
-    const pr=(now%2400)/2400;
-    for(const off of [0,0.5]){
-      const p=(pr+off)%1;
-      mapCtx.beginPath();mapCtx.arc(hx,hy,6+p*26,0,Math.PI*2);
-      mapCtx.strokeStyle=`rgba(22,137,158,${(0.5*(1-p)).toFixed(3)})`;mapCtx.lineWidth=1.6;mapCtx.stroke();
-    }
-    mapCtx.beginPath();mapCtx.arc(hx,hy,9,0,Math.PI*2);mapCtx.fillStyle='rgba(22,137,158,.18)';mapCtx.fill();
-    mapCtx.beginPath();mapCtx.arc(hx,hy,5,0,Math.PI*2);
-    mapCtx.fillStyle='#16899e';mapCtx.shadowColor='#16899e';mapCtx.shadowBlur=16;mapCtx.fill();mapCtx.shadowBlur=0;
-    mapCtx.font='600 11px sans-serif';
-    mapCtx.fillStyle='rgba(255,255,255,.92)';
-    mapCtx.beginPath();mapCtx.roundRect(hx+8,hy-20,36,17,4);mapCtx.fill();
-    mapCtx.fillStyle='#096c83';mapCtx.fillText('本站',hx+12,hy-8);
+    if (mapDirty || flight) drawMap(now);
   }
   requestAnimationFrame(frame);
 }
@@ -317,7 +360,8 @@ async function refresh() {
     $('#s-total').textContent = st.total_blocks.toLocaleString();
     $('#m-blocked').textContent = ((an.totals && an.totals.blocked) || 0).toLocaleString();
     $('#m-srcs').textContent = an.arc_srcs || (an.arcs || []).length;
-    if (!seeded) { seeded = true; (an.arcs || []).forEach(a => addArc(a.lon, a.lat, a.name || a.key, a.count, false)); }
+    aggregateSources = an.arcs || [];
+    updateMapPoints();
     ipsC.setOption({
       title:emptyTitle(ips),
       tooltip:tip, grid:{left:10,right:30,top:10,bottom:10,containLabel:true},
@@ -338,8 +382,52 @@ refresh();
 setInterval(refresh, 10000);
 j('/api/qps').then(d => { $('#m-qps').textContent = d.qps; $('#m-qp').textContent = d.peak; }).catch(() => {});
 
-const tag = a => ({waf:'<span class="tag red">WAF拦截</span>',resp:'<span class="tag red">响应拦截</span>',cc:'<span class="tag orange">CC限频</span>',blacklist:'<span class="tag red">黑名单</span>',geo:'<span class="tag blue">地区限制</span>',semantic:'<span class="tag blue">语义检测</span>',reputation:'<span class="tag orange">信誉封禁</span>',custom:'<span class="tag violet">自定义</span>',dynamic:'<span class="tag cyan">动态防护</span>',bot:'<span class="tag violet">Bot防护</span>'}[a] || esc(a));
+const tag = a => ({waf:'<span class="tag red">WAF拦截</span>',resp:'<span class="tag red">响应拦截</span>',cc:'<span class="tag orange">CC限频</span>',blacklist:'<span class="tag red">黑名单</span>',geo:'<span class="tag blue">地区限制</span>',semantic:'<span class="tag blue">语义检测</span>',reputation:'<span class="tag orange">信誉封禁</span>',custom:'<span class="tag violet">自定义</span>',dynamic:'<span class="tag cyan">动态防护</span>',bot:'<span class="tag violet">Bot防护</span>',api_schema:'<span class="tag violet">API 契约</span>'}[a] || esc(a));
+
+function renderFeed() {
+  const feed = $('#feed');
+  const unlocated = timeline.recent.filter(event => !event.located).length;
+  $('#map-unlocated').textContent = unlocated ? '近期 ' + unlocated + ' 条日志未定位。' : '';
+  feed.innerHTML = timeline.recent.map(event => {
+    const place = event.city || event.country;
+    const location = place ? ' · ' + esc(place) : '';
+    const unknown = event.located ? '' : '<span class="unlocated"> · 未定位</span>';
+    return '<div class="ev" data-event="' + esc(event.key) + '"><span class="t">' + esc(event.ts) + '</span>' +
+      tag(event.action) + '<span class="ip">' + esc(event.ip) + '</span>' + location + unknown +
+      ' → ' + esc(event.domain) + '<span class="m">' + esc(event.method) + ' ' + esc(event.url) +
+      ' · ' + esc(event.msg) + '</span></div>';
+  }).join('') || '<p class="empty">暂无攻击事件</p>';
+  feedRows = new Map([...feed.querySelectorAll('.ev')].map(row => [row.dataset.event, row]));
+  highlightFeed();
+  feedDirty = false;
+}
+
+let historyLoading = false;
+async function refreshHistory() {
+  if (historyLoading) return;
+  historyLoading = true;
+  try {
+    const result = await j('/api/logs?screen=1');
+    timeline.mergeHistory(result.list);
+    updateMapPoints();
+    feedDirty = true;
+  } catch (e) {
+    console.warn('攻击日志补载失败', e);
+  } finally {
+    historyLoading = false;
+  }
+}
+
 const es = new EventSource('/api/events');
+const feedConnection = $('#feed-connection');
+es.onopen = () => {
+  feedConnection.hidden = true;
+  refreshHistory();
+};
+es.onerror = () => {
+  feedConnection.textContent = '实时连接暂不可用，正在从攻击日志补载。';
+  feedConnection.hidden = false;
+};
 es.onmessage = ev => {
   const d = JSON.parse(ev.data);
   if (d.type === 'qps') {
@@ -347,17 +435,13 @@ es.onmessage = ev => {
     $('#m-qp').textContent = d.peak;
     return;
   }
-  if (d.type !== 'attack' || d.status === 200) return;
-  evCount++; $('#m-events').textContent = evCount;
-  if (d.lat || d.lon) addArc(d.lon, d.lat, d.city || d.country || d.ip, 1, true);
-  const feed = $('#feed');
-  $('#feed-empty')?.remove();
-  feed.insertAdjacentHTML('afterbegin', `<div class="ev"><span class="t">${esc(d.ts)}</span>${tag(d.action)}<span class="ip">${esc(d.ip)}</span>${d.city ? ' · ' + esc(d.city) : (d.country ? ' · ' + esc(d.country) : '')} → ${esc(d.domain)}<span class="m">${esc(d.method)} ${esc(d.url)} · ${esc(d.msg)}</span></div>`);
-  while (feed.children.length > 60) feed.lastChild.remove();
+  if (d.type !== 'attack' || !timeline.addLive(d, performance.now())) return;
+  $('#m-events').textContent = ++evCount;
+  updateMapPoints();
+  feedDirty = true;
 };
-j('/api/logs?size=20&attack_only=1').then(d => {
-  d.list.reverse().forEach(l => es.onmessage({data: JSON.stringify({type:'attack',ts:l.ts,ip:l.client_ip,country:l.country,city:l.city,domain:l.domain,method:l.method,url:l.url,action:l.action,msg:l.msg,status:l.status})}));
-}).catch(() => {});
+refreshHistory();
+setInterval(refreshHistory, 10000);
 </script>
 </body>
 </html>

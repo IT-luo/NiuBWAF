@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 )
 
-//go:embed index.html app.js style.css screen.html echarts.min.js topojson-client.min.js world-110m.js china-standard-gs2023-2762.jpg
+//go:embed index.html app.js style.css screen.html screen-events.js echarts.min.js topojson-client.min.js world-110m.js china-standard-gs2023-2762.jpg
 //go:embed brand-logo.png brand-icon.svg favicon.ico
 var FS embed.FS
 

@@ -186,7 +186,7 @@ func (a *Analytics) rebuildAttackStats(b *hourBucket) error {
 		if geo.Country == "" {
 			geo.Country = l.Country
 		}
-		lat, lon := geoCoords(geo)
+		lat, lon := geo.Coordinates()
 		rebuilt.recordAttack(EvStat{IP: l.ClientIP, Action: l.Action, Msg: l.Msg, RuleID: l.RuleID, Status: l.Status,
 			Country: geo.Country, City: geo.City, Lat: lat, Lon: lon, URL: l.URL, Domain: l.Domain})
 	})

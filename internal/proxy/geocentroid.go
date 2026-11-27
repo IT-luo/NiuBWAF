@@ -57,7 +57,6 @@ var provinceCentroid = map[string][2]float64{
 	"香港": {22.32, 114.17}, "澳门": {22.20, 113.55},
 }
 
-// geoCoords 事件坐标：mmdb 经纬度优先，中国回退省份质心，海外回退国家质心
 // provinceCoords 兼容 ip2region 的行政区后缀（广东省/北京市/广西壮族自治区/香港特别行政区…）
 func provinceCoords(region string) ([2]float64, bool) {
 	if region == "" {
@@ -81,7 +80,8 @@ func provinceCoords(region string) ([2]float64, bool) {
 	return [2]float64{}, false
 }
 
-func geoCoords(g GeoCity) (float64, float64) {
+// Coordinates 优先使用城市库经纬度，再按省份或国家回退。
+func (g GeoCity) Coordinates() (float64, float64) {
 	if g.Latitude != 0 || g.Longitude != 0 {
 		return g.Latitude, g.Longitude
 	}

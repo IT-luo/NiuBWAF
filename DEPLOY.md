@@ -1,6 +1,6 @@
 # NiuB WAF（NiuBWAF）部署文档
 
-预编译包以 `v1.3.1` 为例。该版本内置 Coraza v3.8.1 和 OWASP CRS 4.25.2 LTS，使用 Go 1.26.11 和 `CGO_ENABLED=0` 构建 Linux AMD64 和 Windows x64 二进制。[发布页](https://github.com/IT-luo/NiuBWAF/releases/tag/v1.3.1)
+预编译包以 `v1.3.2` 为例。该版本内置 Coraza v3.8.1 和 OWASP CRS 4.25.2 LTS，使用 Go 1.26.11 和 `CGO_ENABLED=0` 构建 Linux AMD64 和 Windows x64 二进制。[发布页](https://github.com/IT-luo/NiuBWAF/releases/tag/v1.3.2)
 
 | 部署方式 | 交付范围 |
 |---|---|
@@ -56,10 +56,10 @@
 
 ### 3.1 下载发布包（Linux x86_64）
 
-从 [GitHub Releases](https://github.com/IT-luo/NiuBWAF/releases) 下载同一版本的 `niubwaf-<版本>-linux-amd64.tar.gz` 和 `SHA256SUMS`。以下以 `v1.3.1` 为例，在下载目录运行。成功时会报告压缩包 `OK`，并解压得到 `niubwaf`。
+从 [GitHub Releases](https://github.com/IT-luo/NiuBWAF/releases) 下载同一版本的 `niubwaf-<版本>-linux-amd64.tar.gz` 和 `SHA256SUMS`。以下以 `v1.3.2` 为例，在下载目录运行。成功时会报告压缩包 `OK`，并解压得到 `niubwaf`。
 
 ```bash
-sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.1-linux-amd64.tar.gz
+sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.2-linux-amd64.tar.gz
 ```
 
 ### 3.2 从版本标签编译
@@ -67,7 +67,7 @@ sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.1-linux-amd64.
 进入仓库，在 Bash 中执行以下命令。Windows PowerShell 可用 `$env:CGO_ENABLED='0'`、`$env:GOOS='linux'` 和 `$env:GOARCH='amd64'` 设置环境变量，再执行其中的 `go build`。
 
 ```bash
-git checkout v1.3.1
+git checkout v1.3.2
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o niubwaf .
 # arm64 目标：GOARCH=arm64
 ```
@@ -86,16 +86,16 @@ git rev-parse HEAD
 
 ### 3.4 Windows x64 原生部署
 
-从发布页下载同一版本的 `niubwaf-v1.3.1-windows-amd64.zip` 和 `SHA256SUMS`，在下载目录的 PowerShell 中执行。管理台默认仅绑定本机 HTTPS `9443`。
+从发布页下载同一版本的 `niubwaf-v1.3.2-windows-amd64.zip` 和 `SHA256SUMS`，在下载目录的 PowerShell 中执行。管理台默认仅绑定本机 HTTPS `9443`。
 
 ```powershell
-$package = 'niubwaf-v1.3.1-windows-amd64.zip'
+$package = 'niubwaf-v1.3.2-windows-amd64.zip'
 $expected = (Select-String -LiteralPath SHA256SUMS -Pattern ('^[0-9a-f]{64}  ' + [regex]::Escape($package) + '$')).Line -split '  '
 if (-not $expected -or (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -ne $expected[0]) {
     throw 'SHA-256 校验失败'
 }
-Expand-Archive -LiteralPath $package -DestinationPath '.\niubwaf-v1.3.1'
-Set-Location '.\niubwaf-v1.3.1'
+Expand-Archive -LiteralPath $package -DestinationPath '.\niubwaf-v1.3.2'
+Set-Location '.\niubwaf-v1.3.2'
 .\niubwaf.exe -proxy ':8080' -tls ':8443' -admin '127.0.0.1:9443' -data 'C:\NiuBWAF\data'
 ```
 

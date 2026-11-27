@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	"niubwaf/internal/engine"
+	"niubwaf/internal/proxy"
+	"niubwaf/internal/store"
 )
 
 func seedAttackLog(t *testing.T, a *API, ip, domain, action string) {
@@ -46,6 +48,83 @@ func TestAttackLogFeedFiltersBeforePaging(t *testing.T) {
 		if response.Total != tc.total || len(response.List) != 1 || response.List[0].Action != tc.action {
 			t.Fatalf("查询 %s: %s", tc.query, rec.Body)
 		}
+	}
+}
+
+func TestAttackLogFeedReturnsCoordinatesWhenRequested(t *testing.T) {
+	a := fullTestAPI(t)
+	seedAttackLog(t, a, "192.0.2.1", "site.test", "waf")
+	seedAttackLog(t, a, "192.0.2.2", "site.test", "cc")
+	if _, err := a.Store.DB.Exec("UPDATE attack_logs SET country='' WHERE action='cc'"); err != nil {
+		t.Fatal(err)
+	}
+	type row struct {
+		Action string
+		Lat    *float64
+		Lon    *float64
+	}
+	query := func(path string) map[string]row {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		a.logs(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		var got struct{ List []row }
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil || rec.Code != http.StatusOK || len(got.List) != 2 {
+			t.Fatalf("load %s: status=%d, %v, body=%s", path, rec.Code, err, rec.Body)
+		}
+		return map[string]row{got.List[0].Action: got.List[0], got.List[1].Action: got.List[1]}
+	}
+	located := query("/api/logs?screen=1")
+	if entry := located["waf"]; entry.Lat == nil || entry.Lon == nil || *entry.Lat != 35.9 || *entry.Lon != 104.2 {
+		t.Fatalf("stored country should supply fallback coordinates: %+v", entry)
+	}
+	if entry := located["cc"]; entry.Lat != nil || entry.Lon != nil {
+		t.Fatalf("unknown locations must not receive coordinates: %+v", entry)
+	}
+	if entry := query("/api/logs?attack_only=1")["waf"]; entry.Lat != nil || entry.Lon != nil {
+		t.Fatalf("the standard log response should omit coordinates: %+v", entry)
+	}
+}
+
+func TestScreenLogFeedReturnsBoundedAttacksWithoutTotal(t *testing.T) {
+	a := fullTestAPI(t)
+	for i := 0; i < 62; i++ {
+		seedAttackLog(t, a, fmt.Sprintf("192.0.2.%d", i+1), "site.test", "waf")
+	}
+	seedAttackLog(t, a, "192.0.2.200", "site.test", "bot")
+	if _, err := a.Store.DB.Exec("UPDATE attack_logs SET status=200 WHERE action='bot'"); err != nil {
+		t.Fatal(err)
+	}
+
+	path := "/api/logs?screen=1&size=200"
+	rec := httptest.NewRecorder()
+	a.logs(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	var result struct {
+		List []struct {
+			ClientIP string `json:"client_ip"`
+		}
+		Total *int
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &result); err != nil || rec.Code != http.StatusOK {
+		t.Fatalf("screen feed: status=%d, %v", rec.Code, err)
+	}
+	if result.Total != nil || len(result.List) != 60 || result.List[0].ClientIP != "192.0.2.62" ||
+		result.List[59].ClientIP != "192.0.2.3" {
+		t.Fatalf("expected the latest 60 attacks and no total, got %d rows, total=%v", len(result.List), result.Total)
+	}
+	unauthenticated := httptest.NewRecorder()
+	a.Handler(http.NotFoundHandler()).ServeHTTP(unauthenticated, httptest.NewRequest(http.MethodGet, path, nil))
+	if unauthenticated.Code != http.StatusUnauthorized {
+		t.Fatalf("screen feed requires authentication, got %d", unauthenticated.Code)
+	}
+}
+
+func TestScreenHistoryKeepsLocationConsistentWithStoredCountry(t *testing.T) {
+	entry := store.AttackLog{Country: "CN"}
+	lookup := proxy.GeoCity{Country: "US", City: "Seattle", Latitude: 47.61, Longitude: -122.33}
+	got := locateAttackLog(entry, lookup)
+	if got.Country != "CN" || got.City != "" || got.Lat == nil || got.Lon == nil ||
+		*got.Lat != 35.9 || *got.Lon != 104.2 {
+		t.Fatalf("expected recorded country and its approximate location, got %+v", got)
 	}
 }
 
