@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -29,8 +30,6 @@ import (
 	"niubwaf/internal/engine"
 	"niubwaf/internal/metrics"
 	"niubwaf/internal/store"
-
-	"golang.org/x/crypto/acme/autocert"
 )
 
 type upstreamTarget struct {
@@ -145,21 +144,18 @@ type Proxy struct {
 	// HTTPSAddr 用于 HTTP→HTTPS 跳转时构造目标地址，如 ":8443"
 	HTTPSAddr string
 
-	reloadMu    sync.Mutex
-	mu          sync.RWMutex
-	sites       map[string]*cachedSite
-	blackNet    []*net.IPNet
-	whiteNet    []*net.IPNet
-	trustedNet  []*net.IPNet // 可信代理网段：仅这些对端追加的 XFF 才被采信
-	blackIP     map[string]bool
-	whiteIP     map[string]bool
-	dynBlack    map[string]int64 // IP 信誉自动封禁：ip → unix 到期秒
-	certs       map[string]*tls.Certificate
-	defaultCert *tls.Certificate
-
-	acme        *autocert.Manager
-	acmeDataDir string
-	acmeSig     string
+	reloadMu     sync.Mutex
+	mu           sync.RWMutex
+	sites        map[string]*cachedSite
+	blackNet     []*net.IPNet
+	whiteNet     []*net.IPNet
+	trustedNet   []*net.IPNet // 可信代理网段：仅这些对端追加的 XFF 才被采信
+	blackIP      map[string]bool
+	whiteIP      map[string]bool
+	dynBlack     map[string]int64 // IP 信誉自动封禁：ip → unix 到期秒
+	certs        map[string]*tls.Certificate
+	managedCerts map[string]*tls.Certificate
+	defaultCert  *tls.Certificate
 
 	dynSecret []byte
 	dynMu     sync.Mutex
@@ -320,10 +316,6 @@ func (p *Proxy) Reload() {
 	p.reloadMu.Lock()
 	defer p.reloadMu.Unlock()
 
-	if err := p.Engine.SetContentTypes(engine.ParseContentTypes(p.Store.GetSetting("allowed_content_types"))); err != nil {
-		log.Printf("应用允许内容类型失败: %v", err)
-	}
-	p.Engine.SetScanLimit(p.bodyScanLimit())
 	sites, err := p.Store.ListSites()
 	if err != nil {
 		log.Printf("加载站点失败: %v", err)
@@ -340,7 +332,11 @@ func (p *Proxy) Reload() {
 		return
 	}
 	m := map[string]*cachedSite{}
-	excls, _ := p.Store.ListExclusions()
+	excls, err := p.Store.ListExclusions()
+	if err != nil {
+		log.Printf("加载规则豁免失败: %v", err)
+		return
+	}
 	var globalExcl []engine.Exclusion
 	perSite := map[int64][]engine.Exclusion{}
 	for _, x := range excls {
@@ -351,7 +347,11 @@ func (p *Proxy) Reload() {
 			perSite[x.SiteID] = append(perSite[x.SiteID], e)
 		}
 	}
-	crs, _ := p.Store.ListRules()
+	crs, err := p.Store.ListRules()
+	if err != nil {
+		log.Printf("加载自定义规则失败: %v", err)
+		return
+	}
 	var globalRules []engine.CompiledRule
 	var globalShadowRules []cachedShadowRule
 	perSiteRules := map[int64][]engine.CompiledRule{}
@@ -499,7 +499,11 @@ func (p *Proxy) Reload() {
 		})
 		m[strings.ToLower(s.Domain)] = cs
 	}
-	ips, _ := p.Store.ListIPs("")
+	ips, err := p.Store.ListIPs("")
+	if err != nil {
+		log.Printf("加载 IP 名单失败: %v", err)
+		return
+	}
 	var bn, wn []*net.IPNet
 	bi, wi := map[string]bool{}, map[string]bool{}
 	now := time.Now().Format("2006-01-02 15:04:05")
@@ -537,15 +541,45 @@ func (p *Proxy) Reload() {
 		}
 		certs[domain] = &cert
 	}
+	managed, err := p.Store.ManagedSiteCertificates()
+	if err != nil {
+		log.Printf("加载托管证书失败: %v", err)
+		return
+	}
+	managedCerts := make(map[string]*tls.Certificate, len(managed))
+	for _, item := range managed {
+		cert, err := tls.X509KeyPair([]byte(item.CertPEM), []byte(item.KeyPEM))
+		if err != nil {
+			log.Printf("站点 %s 托管证书解析失败: %v", item.Domain, err)
+			continue
+		}
+		if cert.Leaf == nil {
+			cert.Leaf, err = x509.ParseCertificate(cert.Certificate[0])
+			if err != nil {
+				log.Printf("站点 %s 托管证书解析失败: %v", item.Domain, err)
+				continue
+			}
+		}
+		managedCerts[strings.ToLower(item.Domain)] = &cert
+	}
+	dynBlack, err := p.Store.ActiveBans(now)
+	if err != nil {
+		log.Printf("加载 IP 封禁失败: %v", err)
+		return
+	}
+	if err := p.Engine.SetContentTypes(engine.ParseContentTypes(p.Store.GetSetting("allowed_content_types"))); err != nil {
+		log.Printf("应用允许内容类型失败: %v", err)
+	}
+	p.Engine.SetScanLimit(p.bodyScanLimit())
 	p.mu.Lock()
 	p.initIngressTraffic(m)
 	p.sites, p.blackNet, p.whiteNet, p.blackIP, p.whiteIP = m, bn, wn, bi, wi
 	p.trustedNet = engine.ParseTrustedProxies(p.Store.GetSetting("trusted_proxies"))
 	p.certs = certs
-	p.dynBlack = p.Store.ActiveBans(now)
+	p.managedCerts = managedCerts
+	p.dynBlack = dynBlack
 	p.pruneDynPools(m)
 	p.mu.Unlock()
-	p.refreshACME()
 }
 
 func (p *Proxy) SetDefaultCert(certPEM, keyPEM []byte) error {
@@ -568,19 +602,22 @@ func (p *Proxy) HasCerts() bool {
 func (p *Proxy) TLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"h2", "http/1.1"},
 		GetCertificate: func(hello *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			name := strings.ToLower(hello.ServerName)
 			p.mu.RLock()
 			cert := p.certs[name]
+			managed := p.managedCerts[name]
 			def := p.defaultCert
-			mgr := p.acme
 			p.mu.RUnlock()
+			if managed != nil {
+				now := time.Now()
+				if !now.Before(managed.Leaf.NotBefore) && now.Before(managed.Leaf.NotAfter) {
+					return managed, nil
+				}
+			}
 			if cert != nil {
 				return cert, nil
-			}
-			// 释放读锁后再尝试 ACME：签发可能耗时数秒，持锁会阻塞 Reload
-			if c, err := acmeCertificate(mgr, hello); err == nil && c != nil {
-				return c, nil
 			}
 			if def != nil {
 				return def, nil

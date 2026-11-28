@@ -94,13 +94,20 @@ func TestReputationBanLifecycle(t *testing.T) {
 	if r == nil || r.Score != 30 || r.BanCount != 1 || r.BannedUntil != future {
 		t.Fatalf("信誉记录写入错误: %+v", r)
 	}
-	bans := s.ActiveBans(nowStr)
+	bans, err := s.ActiveBans(nowStr)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if bans["1.2.3.4"] == 0 {
 		t.Error("生效封禁应包含 1.2.3.4")
 	}
 	// 过期封禁不在生效列表
 	s.UpsertReputation("5.6.7.8", 30, 1, past, "已过期")
-	if _, ok := s.ActiveBans(nowStr)["5.6.7.8"]; ok {
+	bans, err = s.ActiveBans(nowStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := bans["5.6.7.8"]; ok {
 		t.Error("过期封禁不应生效")
 	}
 	// 人工解封：清空封禁 + 重置计数 + 赦免
@@ -112,7 +119,11 @@ func TestReputationBanLifecycle(t *testing.T) {
 	if r.BannedUntil != "" || r.BanCount != 0 || r.PardonedUntil != pardon {
 		t.Errorf("解封后状态错误: %+v", r)
 	}
-	if _, ok := s.ActiveBans(nowStr)["1.2.3.4"]; ok {
+	bans, err = s.ActiveBans(nowStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := bans["1.2.3.4"]; ok {
 		t.Error("解封后不应再封禁")
 	}
 	// 列表与计数

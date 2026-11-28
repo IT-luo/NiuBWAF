@@ -36,10 +36,10 @@ NiuB WAF 是一款以反向代理模式部署的**开源自托管 Web 应用防�
 
 ## 快速开始
 
-Linux x86_64 和 Windows x64 用户可以从 [GitHub Releases](https://github.com/IT-luo/NiuBWAF/releases) 下载对应平台的发布包和同一版本的 `SHA256SUMS`。以下以 Linux `v1.3.2` 为例。
+Linux x86_64 和 Windows x64 用户可以从 [GitHub Releases](https://github.com/IT-luo/NiuBWAF/releases) 下载对应平台的发布包和同一版本的 `SHA256SUMS`。以下以 Linux `v1.3.3` 为例。
 
 ```bash
-sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.2-linux-amd64.tar.gz && \
+sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.3-linux-amd64.tar.gz && \
   ./niubwaf -proxy :8080 -tls :8443 -admin 127.0.0.1:9443 -data ./data
 ```
 

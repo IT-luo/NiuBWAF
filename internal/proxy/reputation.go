@@ -36,7 +36,13 @@ func (p *Proxy) RefreshReputation() { p.computeReputation(true) }
 
 // RefreshBans 从持久化记录重载生效中的自动封禁到内存判定层
 func (p *Proxy) RefreshBans() {
-	bans := p.Store.ActiveBans(time.Now().Format("2006-01-02 15:04:05"))
+	p.reloadMu.Lock()
+	defer p.reloadMu.Unlock()
+	bans, err := p.Store.ActiveBans(time.Now().Format("2006-01-02 15:04:05"))
+	if err != nil {
+		log.Printf("刷新 IP 封禁失败: %v", err)
+		return
+	}
 	p.mu.Lock()
 	p.dynBlack = bans
 	p.mu.Unlock()

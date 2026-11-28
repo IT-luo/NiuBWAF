@@ -10,21 +10,6 @@ import (
 	"niubwaf/internal/store"
 )
 
-func TestValidACMEDomain(t *testing.T) {
-	good := []string{"example.com", "www.example.com", "a.b.example.co.uk", "xn--fiqs8s.example", "my-site.example.com"}
-	for _, d := range good {
-		if !validACMEDomain(d) {
-			t.Errorf("合法域名被拒: %s", d)
-		}
-	}
-	bad := []string{"", "*.example.com", "1.2.3.4", "http://example.com", "example.com/path", "example", ".example.com", "example.com.", "a..b.com", "example.com:443", "EXAMPLE.COM", "exa mple.com", "example.com\\x"}
-	for _, d := range bad {
-		if validACMEDomain(d) {
-			t.Errorf("非法域名应被拒: %s", d)
-		}
-	}
-}
-
 func metricsTestAPI(t *testing.T) *API {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "api.db"))

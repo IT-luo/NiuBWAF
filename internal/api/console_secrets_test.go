@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	"niubwaf/internal/store"
 )
 
 func adminJSONRequests(t *testing.T, a *API) func(string, string, any) *httptest.ResponseRecorder {
@@ -99,6 +101,11 @@ func TestAdminSiteTLSWriteOnly(t *testing.T) {
 		t.Fatalf("mismatched pair accepted: %d", rec.Code)
 	}
 	body["key_pem"] = newKey
+	body["domain"] = "other.example"
+	if rec := request(http.MethodPut, path, body); rec.Code != http.StatusBadRequest {
+		t.Fatalf("certificate for a different hostname accepted: %d", rec.Code)
+	}
+	body["domain"] = " SITE.EXAMPLE "
 	assertSafe(request(http.MethodPut, path, body))
 	current, err = a.Store.GetSite(result.ID)
 	if err != nil || current.KeyPEM != newKey || current.CertPEM != newCert {
@@ -106,12 +113,41 @@ func TestAdminSiteTLSWriteOnly(t *testing.T) {
 	}
 	delete(body, "cert_pem")
 	delete(body, "key_pem")
+	body["domain"] = "other.example"
+	if rec := request(http.MethodPut, path, body); rec.Code != http.StatusBadRequest {
+		t.Fatalf("rename retained a certificate for the previous hostname: %d", rec.Code)
+	}
+	current, err = a.Store.GetSite(result.ID)
+	if err != nil || current.Domain != "site.example" || current.CertPEM != newCert {
+		t.Fatalf("rejected rename changed stored site or certificate: %v", err)
+	}
 	body["clear_tls"] = true
 	cleared := request(http.MethodPut, path, body)
 	assertSafe(cleared)
 	current, err = a.Store.GetSite(result.ID)
-	if err != nil || current.KeyPEM != "" || current.CertPEM != "" || !strings.Contains(cleared.Body.String(), `"tls_configured":false`) {
+	if err != nil || current.Domain != "other.example" || current.KeyPEM != "" || current.CertPEM != "" || !strings.Contains(cleared.Body.String(), `"tls_configured":false`) {
 		t.Fatalf("explicit TLS removal failed: %v", err)
+	}
+}
+
+func TestSitePasswordWithReservedPrefixIsStoredAsPlaintextInput(t *testing.T) {
+	a := fullTestAPI(t)
+	request := adminJSONRequests(t, a)
+	const password = "pbkdf2_sha256$test-password"
+	rec := request(http.MethodPost, "/api/sites", map[string]any{
+		"name": "Site", "domain": "site.example", "upstream": "http://127.0.0.1:1",
+		"auth_user": "test", "auth_pass": password,
+	})
+	var result consoleSite
+	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &result) != nil {
+		t.Fatalf("create site status=%d", rec.Code)
+	}
+	site, err := a.Store.GetSite(result.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := store.VerifyPass(password, site.AuthPass); !ok {
+		t.Fatal("API password was not treated as plaintext input")
 	}
 }
 

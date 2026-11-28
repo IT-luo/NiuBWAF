@@ -57,3 +57,12 @@ func TestVerifyPassMalformed(t *testing.T) {
 		}
 	}
 }
+
+func TestVerifyPassRejectsNonstandardDigestLength(t *testing.T) {
+	salt := make([]byte, 16)
+	short := pbkdf2SHA256([]byte("example"), salt, 1, 1)
+	stored := "pbkdf2_sha256$1$" + hex.EncodeToString(salt) + "$" + hex.EncodeToString(short)
+	if ok, _ := VerifyPass("example", stored); ok {
+		t.Fatal("short PBKDF2 digest must be rejected")
+	}
+}

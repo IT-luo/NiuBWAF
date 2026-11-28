@@ -2,7 +2,9 @@ package monitor
 
 import (
 	"context"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,22 +33,82 @@ func TestCertificateSourcesAndPEMOrder(t *testing.T) {
 
 	m := newTestMonitor(t, baseMonitorConfig(st, dir, &now))
 	recordHealthyBackup(t, m)
+	const legacyKey = "cert:acme:cached.example"
+	m.alerts[legacyKey] = &alertState{Finding: Finding{Key: legacyKey, Kind: kindCertificateExpiry}}
 	m.Run(context.Background())
 	snapshot := m.Snapshot()
-	if got := len(findingsByKind(snapshot, kindCertificateExpiry)); got != 3 {
-		t.Fatalf("expected site/default/ACME findings only, got %+v", snapshot.Findings)
+	if got := len(findingsByKind(snapshot, kindCertificateExpiry)); got != 2 {
+		t.Fatalf("expected site/default findings only, got %+v", snapshot.Findings)
 	}
-	for _, key := range []string{"cert:site:1", "cert:default", "cert:acme:cached.example"} {
+	for _, key := range []string{"cert:site:1", "cert:default"} {
 		finding, ok := findingByKey(snapshot, key)
 		if !ok || !finding.First.Equal(now) || !finding.LastNotified.IsZero() {
 			t.Errorf("missing or incorrect %s: %+v", key, finding)
 		}
 	}
-	if finding, _ := findingByKey(snapshot, "cert:acme:cached.example"); finding.Severity != SeverityCritical {
-		t.Fatalf("expired ACME certificate should be critical: %+v", finding)
+	if _, ok := findingByKey(snapshot, legacyKey); ok {
+		t.Fatal("retired certificate alert should be removed")
 	}
 	if _, ok := findingByKey(snapshot, "cert:admin"); ok {
 		t.Fatal("healthy admin certificate produced a finding")
+	}
+}
+
+func TestManagedProductionCertificatesAreMonitored(t *testing.T) {
+	dir := t.TempDir()
+	st := openMonitorStore(t, dir)
+	now := time.Date(2026, 11, 23, 12, 0, 0, 0, time.UTC)
+	site := &store.Site{Name: "site", Domain: "active.example", Upstream: "http://127.0.0.1:8080"}
+	if err := st.CreateSite(site); err != nil {
+		t.Fatal(err)
+	}
+
+	addCertificate := func(domain string, staging bool, expires time.Time, status string) int64 {
+		t.Helper()
+		_, certPEM := pem.Decode(testCertificateBundle(t, now, expires, domain))
+		result, err := st.DB.Exec(`INSERT INTO managed_certificates(account_id, domains, email, staging, account_key, cert_pem, expires_at, status)
+			VALUES(1, ?, 'test@example.com', ?, X'', ?, ?, ?)`, domain, staging, string(certPEM), expires.Unix(), status)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, err := result.LastInsertId()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	expiredID := addCertificate(site.Domain, false, now.Add(-time.Minute), "ready")
+	if _, err := st.DB.Exec(`INSERT INTO managed_certificate_sites(site_id, certificate_id, domain) VALUES(?, ?, ?)`,
+		site.ID, expiredID, site.Domain); err != nil {
+		t.Fatal(err)
+	}
+	warningID := addCertificate("unbound.example", false, now.Add(2*24*time.Hour), "failed")
+	addCertificate("staging.example", true, now.Add(-time.Minute), "ready")
+	addCertificate("healthy.example", false, now.Add(30*24*time.Hour), "ready")
+
+	m := newTestMonitor(t, baseMonitorConfig(st, dir, &now))
+	recordHealthyBackup(t, m)
+	m.Run(context.Background())
+	snapshot := m.Snapshot()
+	for id, severity := range map[int64]string{expiredID: SeverityCritical, warningID: SeverityWarning} {
+		key := fmt.Sprintf("cert:managed:%d", id)
+		if finding, ok := findingByKey(snapshot, key); !ok || finding.Severity != severity {
+			t.Errorf("expected %s to be %s, got %+v", key, severity, finding)
+		}
+	}
+	if got := findingsByKind(snapshot, kindCertificateExpiry); len(got) != 2 {
+		t.Fatalf("expected findings for expired and expiring production certificates, got %+v", got)
+	}
+
+	renewed := now.Add(30 * 24 * time.Hour)
+	_, certPEM := pem.Decode(testCertificateBundle(t, now, renewed, site.Domain))
+	if _, err := st.DB.Exec(`UPDATE managed_certificates SET cert_pem=?, expires_at=? WHERE id=?`,
+		string(certPEM), renewed.Unix(), expiredID); err != nil {
+		t.Fatal(err)
+	}
+	m.Run(context.Background())
+	if got := findingsByKind(m.Snapshot(), kindCertificateExpiry); len(got) != 1 || got[0].Key != fmt.Sprintf("cert:managed:%d", warningID) {
+		t.Fatalf("renewal should resolve only the matching certificate finding, got %+v", got)
 	}
 }
 

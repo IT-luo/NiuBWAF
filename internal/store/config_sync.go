@@ -531,11 +531,15 @@ func readAllConfigSettings(q configQueryer) (map[string]string, error) {
 	defer rows.Close()
 	out := map[string]string{}
 	for rows.Next() {
-		var k, v string
+		var k string
+		var v sql.NullString
 		if err := rows.Scan(&k, &v); err != nil {
 			return nil, err
 		}
-		out[k] = v
+		if k == "admin_pass" && !v.Valid {
+			return nil, fmt.Errorf("管理员密码记录为空值")
+		}
+		out[k] = v.String
 	}
 	return out, rows.Err()
 }

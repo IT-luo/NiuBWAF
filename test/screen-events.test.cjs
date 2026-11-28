@@ -89,3 +89,45 @@ test('latest arrivals remain visible when a burst shares the same timestamp', ()
   assert.equal(screen.recent.at(-1).ip, '192.0.2.3');
   assert.equal(screen.take(100).event.ip, '192.0.2.3');
 });
+
+test('history reports expired login and reconnects the wallboard after login', async () => {
+  const page = readFileSync(path.join(__dirname, '../internal/web/screen.html'), 'utf8');
+  const connection = { hidden: true, textContent: '' };
+  const streams = [];
+  const polls = [];
+  let status = 401;
+  class EventSource {
+    static CLOSED = 2;
+    constructor() {
+      this.readyState = 0;
+      streams.push(this);
+    }
+  }
+  const context = vm.createContext({
+    $: () => connection,
+    EventSource,
+    console: { warn() {} },
+    setInterval: poll => polls.push(poll),
+    j: async () => {
+      if (status !== 200) throw Object.assign(new Error(status), { status });
+      return { list: [] };
+    },
+    timeline: { mergeHistory() {} },
+    updateMapPoints() {},
+    feedDirty: false,
+  });
+  const start = page.indexOf('let historyLoading = false;');
+  vm.runInContext(page.slice(start, page.indexOf('</script>', start)), context);
+  streams[0].readyState = EventSource.CLOSED;
+  streams[0].onerror();
+  await new Promise(setImmediate);
+  assert.equal(connection.hidden, false);
+  assert.match(connection.textContent, /重新登录/);
+
+  status = 200;
+  await polls[0]();
+  assert.equal(streams.length, 2);
+  assert.match(connection.textContent, /攻击日志/);
+  streams[1].onopen();
+  assert.equal(connection.hidden, true);
+});

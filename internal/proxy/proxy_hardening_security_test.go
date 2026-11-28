@@ -55,6 +55,28 @@ func newSecurityTestProxy(t *testing.T, site store.Site, settings map[string]str
 	return p
 }
 
+func TestReloadKeepsSnapshotWhenIPListCannotBeRead(t *testing.T) {
+	p := newSecurityTestProxy(t, store.Site{Domain: "example.test", Upstream: "http://127.0.0.1:8080"}, nil)
+	site := p.sites["example.test"]
+	if _, err := p.Store.DB.Exec(`DELETE FROM sites`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Store.DB.Exec(`ALTER TABLE ip_lists RENAME TO unavailable_ip_lists`); err != nil {
+		t.Fatal(err)
+	}
+	p.Reload()
+	if got := p.sites["example.test"]; got != site || site == nil {
+		t.Fatal("failed reload replaced the previous site snapshot")
+	}
+	if _, err := p.Store.DB.Exec(`ALTER TABLE unavailable_ip_lists RENAME TO ip_lists`); err != nil {
+		t.Fatal(err)
+	}
+	p.Reload()
+	if p.sites["example.test"] != nil {
+		t.Fatal("reload did not apply the deletion after the database recovered")
+	}
+}
+
 func TestSecuritySiteAuthOnAllForwardingPaths(t *testing.T) {
 	requests := make(chan *http.Request, 6)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

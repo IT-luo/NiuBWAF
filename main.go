@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"niubwaf/internal/api"
+	"niubwaf/internal/certmgr"
 	"niubwaf/internal/engine"
 	"niubwaf/internal/monitor"
 	"niubwaf/internal/proxy"
@@ -38,7 +39,8 @@ func main() {
 	adminKey := flag.String("admin-key", "", "管理控制台私钥文件（PEM）")
 	dataDir := flag.String("data", "./data", "数据目录")
 	upstreamConnections := flag.Int("upstream-connections", proxy.DefaultUpstreamConnections, "每个上游源站的连接上限")
-	acmeHTTP := flag.String("acme-http", ":80", "ACME HTTP-01 挑战监听地址（仅 acme_enabled=on 时启动）")
+	// Accept the retired option so existing service units can upgrade.
+	flag.String("acme-http", "", "deprecated compatibility option")
 	hotUpgrade := flag.Bool("hot-upgrade", false, "Linux 二进制热升级（SIGHUP）")
 	flag.Parse()
 	if *upstreamConnections <= 0 {
@@ -57,12 +59,10 @@ func main() {
 	dbPath := filepath.Join(*dataDir, "niubwaf.db")
 	var worker *upgradeWorker
 	if *hotUpgrade {
-		challengeAddr, err := upgradeChallengeAddress(dbPath, *acmeHTTP)
-		if err != nil {
-			log.Fatalf("读取 ACME 热升级配置失败: %v", err)
-		}
+		// Preserve the listener layout for handoff from existing supervisors.
 		var supervisor bool
-		worker, supervisor, err = startHotUpgrade(true, []string{*adminAddr, *tlsAddr, *proxyAddr, challengeAddr})
+		var err error
+		worker, supervisor, err = startHotUpgrade(true, []string{*adminAddr, *tlsAddr, *proxyAddr, ""})
 		if err != nil {
 			log.Fatalf("热升级服务失败: %v", err)
 		}
@@ -111,9 +111,9 @@ func main() {
 		log.Println("Turnstile 人机验证已配置")
 	}
 	p.HTTPSAddr = *tlsAddr
-	p.InitACME(*dataDir)
 	a := api.New(st, p)
 	a.DataDir = *dataDir
+	a.Certificates = certmgr.New(st.DB, *dataDir, p.Reload, p.Notify)
 	if worker != nil {
 		a.ConsoleSessionScope = worker.SessionScope()
 	}
@@ -220,10 +220,6 @@ func main() {
 		{name: "HTTPS 防护代理", server: proxyTLSServer, useTLS: true, maxConnections: 1024},
 		{name: "HTTP 防护代理", server: proxyServer, maxConnections: 1024},
 	}
-	if worker != nil || p.ACMEEnabled() {
-		acmeServer := &http.Server{Addr: *acmeHTTP, Handler: p.ACMEHandler(p), ReadHeaderTimeout: 10 * time.Second}
-		services = append(services, httpService{name: "ACME HTTP-01", server: acmeServer, maxConnections: 64, optional: true})
-	}
 	log.Printf("管理控制台: https://%s （首次登录需修改初始密码）", *adminAddr)
 	log.Printf("防护代理 HTTPS 监听: %s（按站点 SNI 证书，可在控制台配置）", *tlsAddr)
 	log.Printf("防护代理 HTTP 监听: %s", *proxyAddr)
@@ -241,17 +237,19 @@ func main() {
 		upgrade = worker
 		settingsDone = watchSharedSettings(ctx, st, p)
 	}
-	var maintenanceDone <-chan struct{}
+	var maintenanceDone, certificatesDone <-chan struct{}
 	runErr := runHTTPServices(ctx, services, upgrade, func() {
 		p.ResumeBackgroundJobs()
 		inspector.Start(maintenanceCtx)
 		maintenanceDone = runMaintenance(maintenanceCtx, st, a)
+		certificatesDone = a.Certificates.Run(maintenanceCtx)
 	}, func() {
 		stopMaintenance()
 		p.Hub.Retire()
 		p.PauseBackgroundJobs()
 	})
 	stop()
+	stopMaintenance()
 	p.PauseBackgroundJobs()
 	if settingsDone != nil {
 		<-settingsDone
@@ -259,6 +257,9 @@ func main() {
 	if maintenanceDone != nil {
 		<-maintenanceDone
 		inspector.Wait()
+	}
+	if certificatesDone != nil {
+		<-certificatesDone
 	}
 	st.Close()
 	if runErr != nil {

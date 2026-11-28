@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
 	"encoding/csv"
 	"encoding/json"
@@ -25,7 +26,9 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
+	"niubwaf/internal/certmgr"
 	"niubwaf/internal/engine"
 	"niubwaf/internal/metrics"
 	"niubwaf/internal/monitor"
@@ -40,11 +43,12 @@ type Inspector interface {
 }
 
 type API struct {
-	Store     *store.Store
-	Proxy     *proxy.Proxy
-	Inspector Inspector
-	AdminTLS  bool   // 管理台是否运行于 TLS，决定会话 Cookie 的 Secure 标志
-	DataDir   string // 数据目录，用于数据库热备份
+	Certificates *certmgr.Manager
+	Store        *store.Store
+	Proxy        *proxy.Proxy
+	Inspector    Inspector
+	AdminTLS     bool   // 管理台是否运行于 TLS，决定会话 Cookie 的 Secure 标志
+	DataDir      string // 数据目录，用于数据库热备份
 
 	ConsoleSessionScope string // non-empty for workers belonging to a running supervisor
 
@@ -853,6 +857,8 @@ func (a *API) route(w http.ResponseWriter, r *http.Request) {
 		a.getSettings(w)
 	case path == "/api/settings" && r.Method == "PUT":
 		a.putSettings(w, r)
+	case path == "/api/certificates" || strings.HasPrefix(path, "/api/certificates/"):
+		a.managedCertificates(w, r)
 	case path == "/api/block-page/preview" && (r.Method == "GET" || r.Method == "POST"):
 		a.previewBlockPage(w, r)
 	case path == "/api/password" && r.Method == "PUT":
@@ -970,6 +976,7 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 		return
 	}
 	s := input.Site
+	s.Domain = strings.ToLower(strings.TrimSpace(s.Domain))
 	s.AuthPass = input.AuthPass
 	s.CertPEM = strings.TrimSpace(input.CertPEM)
 	s.KeyPEM = strings.TrimSpace(input.KeyPEM)
@@ -992,8 +999,8 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 		return
 	}
 	if s.CertPEM != "" {
-		if _, err := tls.X509KeyPair([]byte(s.CertPEM), []byte(s.KeyPEM)); err != nil {
-			writeErr(w, 400, "证书或私钥无效: "+err.Error())
+		if err := validateSiteCertificate(s.CertPEM, s.KeyPEM, s.Domain); err != nil {
+			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
@@ -1010,8 +1017,7 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 	default:
 		s.BotMode = "off"
 	}
-	s.Domain = strings.ToLower(strings.TrimSpace(s.Domain))
-	if s.AuthPass != "" && !strings.HasPrefix(s.AuthPass, "pbkdf2_sha256$") {
+	if s.AuthPass != "" {
 		s.AuthPass = store.HashPass(s.AuthPass)
 	}
 	tlsConfigured := s.CertPEM != ""
@@ -1021,9 +1027,12 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 	} else {
 		s.ID = id
 		action = "修改站点"
+		replaceTLS := input.ClearTLS || tlsConfigured
 		keepUpstream := false
-		if !input.ReplaceUpstream {
-			previous, readErr := a.Store.GetSite(id)
+		var previous *store.Site
+		if !input.ReplaceUpstream || !replaceTLS {
+			var readErr error
+			previous, readErr = a.Store.GetSite(id)
 			if errors.Is(readErr, sql.ErrNoRows) {
 				writeErr(w, http.StatusNotFound, "站点不存在")
 				return
@@ -1033,12 +1042,24 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 				return
 			}
 			visible, redacted := store.DisplayUpstreams(previous.Upstream)
-			keepUpstream = redacted && visible == s.Upstream
+			keepUpstream = !input.ReplaceUpstream && redacted && visible == s.Upstream
 		}
-		if keepUpstream {
-			tlsConfigured, err = a.Store.UpdateSitePreservingUpstream(&s, input.ClearTLS || tlsConfigured)
+		if !replaceTLS {
+			if !strings.EqualFold(strings.TrimSpace(previous.Domain), s.Domain) && previous.CertPEM != "" && previous.KeyPEM != "" {
+				if err := validateSiteCertificate(previous.CertPEM, previous.KeyPEM, s.Domain); err != nil {
+					writeErr(w, http.StatusBadRequest, "请替换或移除原站点证书: "+err.Error())
+					return
+				}
+			}
+			tlsConfigured, err = a.Store.UpdateSiteRetainingTLS(&s, previous, keepUpstream)
+			if errors.Is(err, sql.ErrNoRows) {
+				writeErr(w, http.StatusConflict, "站点或证书已更改，请刷新后重试")
+				return
+			}
+		} else if keepUpstream {
+			tlsConfigured, err = a.Store.UpdateSitePreservingUpstream(&s, true)
 		} else {
-			tlsConfigured, err = a.Store.UpdateSite(&s, input.ClearTLS || tlsConfigured)
+			tlsConfigured, err = a.Store.UpdateSite(&s, true)
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			writeErr(w, http.StatusNotFound, "站点不存在")
@@ -1053,6 +1074,24 @@ func (a *API) saveSite(w http.ResponseWriter, r *http.Request, id int64) {
 	a.Proxy.Reload()
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, siteForConsole(s, tlsConfigured))
+}
+
+func validateSiteCertificate(cert, key, domain string) error {
+	pair, err := tls.X509KeyPair([]byte(cert), []byte(key))
+	if err != nil {
+		return fmt.Errorf("证书或私钥无效: %w", err)
+	}
+	leaf := pair.Leaf
+	if leaf == nil {
+		leaf, err = x509.ParseCertificate(pair.Certificate[0])
+		if err != nil {
+			return errors.New("无法解析站点证书")
+		}
+	}
+	if err := leaf.VerifyHostname(domain); err != nil {
+		return fmt.Errorf("证书未覆盖站点域名 %s", domain)
+	}
+	return nil
 }
 
 var paramRe = regexp.MustCompile(`^[A-Za-z0-9_.\-\[\]]+$`)
@@ -1279,11 +1318,9 @@ func csvText(s string) string {
 	if strings.HasPrefix(s, "\r") || strings.HasPrefix(s, "\n") || strings.HasPrefix(s, "\t") {
 		return "'" + s
 	}
-	for _, initial := range strings.TrimLeftFunc(s, unicode.IsSpace) {
-		if strings.ContainsRune("=+-@＝＋－＠", initial) {
-			return "'" + s
-		}
-		break
+	initial, _ := utf8.DecodeRuneInString(strings.TrimLeftFunc(s, unicode.IsSpace))
+	if strings.ContainsRune("=+-@＝＋－＠", initial) {
+		return "'" + s
 	}
 	return s
 }
@@ -1338,7 +1375,7 @@ func (a *API) getSettings(w http.ResponseWriter) {
 	keys := []string{"block_page", "geoip_mode", "geoip_countries", "log_retention_days", "semantic_mode",
 		"reputation_enabled", "rep_window", "rep_threshold", "rep_ban_ttl", "rep_max_ttl", "trusted_proxies",
 		"alert_enabled", "alert_threshold", "alert_window", "alert_cooldown",
-		"acme_enabled", "acme_domains", "acme_email", "acme_staging",
+
 		"intel_provider", "body_inspect_kb", "body_scan_kb", "allowed_content_types",
 		"bot_verify_crawlers", "bot_path_limit",
 		"inspect_interval_sec", "inspect_cert_warn_days", "inspect_upstream_failures", "inspect_disk_free_percent",
@@ -1361,7 +1398,7 @@ func (a *API) getSettings(w http.ResponseWriter) {
 	}
 	for k, def := range map[string]string{"reputation_enabled": "on", "rep_window": "24", "rep_threshold": "30", "rep_ban_ttl": "60", "rep_max_ttl": "1440",
 		"alert_enabled": "off", "alert_threshold": "50", "alert_window": "60", "alert_cooldown": "300",
-		"acme_enabled": "off", "acme_staging": "on", "intel_provider": "off", "body_inspect_kb": "2048", "body_scan_kb": "16",
+		"intel_provider": "off", "body_inspect_kb": "2048", "body_scan_kb": "16",
 		"inspect_interval_sec": "60", "inspect_cert_warn_days": "14", "inspect_upstream_failures": "3",
 		"inspect_disk_free_percent": "10", "inspect_disk_free_mb": "1024", "inspect_backup_max_age_hours": "26",
 		"inspect_geoip_max_age_days": "30", "inspect_ip2region_max_age_days": "90", "inspect_cooldown_sec": "21600"} {
@@ -1383,7 +1420,7 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	allowed := map[string]bool{"block_page": true, "geoip_mode": true, "geoip_countries": true, "log_retention_days": true, "semantic_mode": true,
 		"reputation_enabled": true, "rep_window": true, "rep_threshold": true, "rep_ban_ttl": true, "rep_max_ttl": true, "trusted_proxies": true,
 		"alert_enabled": true, "alert_webhook": true, "alert_dingtalk": true, "alert_wecom": true, "alert_threshold": true, "alert_window": true, "alert_cooldown": true,
-		"acme_enabled": true, "acme_domains": true, "acme_email": true, "acme_staging": true, "metrics_token": true,
+		"metrics_token":  true,
 		"intel_provider": true, "intel_api_key": true, "intel_api_url": true, "body_inspect_kb": true, "body_scan_kb": true, "allowed_content_types": true,
 		"bot_verify_crawlers": true, "bot_path_limit": true,
 		"inspect_interval_sec": true, "inspect_cert_warn_days": true, "inspect_upstream_failures": true, "inspect_disk_free_percent": true,
@@ -1396,7 +1433,6 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		"bot_path_limit": {0, 128}}
 	repChanged := false
 	trustedChanged := false
-	acmeChanged := false
 	ctChanged := false
 	scanChanged := false
 	botChanged := false
@@ -1431,26 +1467,6 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 		if k == "bot_path_limit" {
 			botChanged = true
 		}
-		if (k == "acme_enabled" || k == "acme_staging") && v != "on" && v != "off" {
-			writeErr(w, 400, k+" 必须是 on/off")
-			return
-		}
-		if k == "acme_domains" && v != "" {
-			for _, d := range strings.Split(v, ",") {
-				d = strings.ToLower(strings.TrimSpace(d))
-				if d == "" {
-					continue
-				}
-				if !validACMEDomain(d) {
-					writeErr(w, 400, "acme_domains 含非法域名（不支持通配符/IP/协议）: "+d)
-					return
-				}
-			}
-		}
-		if k == "acme_email" && v != "" && !strings.Contains(v, "@") {
-			writeErr(w, 400, "acme_email 必须是合法邮箱")
-			return
-		}
 		if k == "intel_provider" && v != "off" && v != "generic" {
 			writeErr(w, 400, "intel_provider 必须是 off/generic")
 			return
@@ -1483,9 +1499,6 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			ctChanged = true
-		}
-		if strings.HasPrefix(k, "acme_") {
-			acmeChanged = true
 		}
 		if (k == "alert_webhook" || k == "alert_dingtalk" || k == "alert_wecom") && v != "" &&
 			!strings.HasPrefix(v, "http://") && !strings.HasPrefix(v, "https://") {
@@ -1553,29 +1566,10 @@ func (a *API) putSettings(w http.ResponseWriter, r *http.Request) {
 	if trustedChanged {
 		go a.Proxy.Reload()
 	}
-	if acmeChanged {
-		go a.Proxy.Reload()
-	}
 	if botChanged {
 		a.Proxy.Reload()
 	}
 	writeJSON(w, map[string]string{"ok": "true"})
-}
-
-// validACMEDomain 校验 ACME 域名：纯主机名、含点、无通配符/协议/路径，拒绝 IP。
-func validACMEDomain(d string) bool {
-	if strings.ContainsAny(d, "/* :\\") || net.ParseIP(d) != nil {
-		return false
-	}
-	if !strings.Contains(d, ".") || strings.HasPrefix(d, ".") || strings.HasSuffix(d, ".") || strings.Contains(d, "..") {
-		return false
-	}
-	for _, r := range d {
-		if !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '.') {
-			return false
-		}
-	}
-	return true
 }
 
 func keysOf(m map[string]string) []string {

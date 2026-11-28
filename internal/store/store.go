@@ -178,15 +178,6 @@ func Open(path string) (*Store, error) {
 		stopCh:   make(chan struct{}),
 		doneCh:   make(chan struct{}),
 	}
-	rows, err := db.Query(`SELECT key, value FROM settings`)
-	if err == nil {
-		for rows.Next() {
-			var k, v string
-			rows.Scan(&k, &v)
-			s.settings[k] = v
-		}
-		rows.Close()
-	}
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, err
@@ -346,6 +337,7 @@ func (s *Store) migrate() error {
 			query_redacted INTEGER NOT NULL DEFAULT 0
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_ts ON attack_logs(ts)`,
+		`CREATE INDEX IF NOT EXISTS idx_logs_recent_attacks ON attack_logs(id) WHERE status<>200`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_ip ON attack_logs(client_ip)`,
 		`CREATE INDEX IF NOT EXISTS idx_logs_req_id ON attack_logs(req_id) WHERE req_id IS NOT NULL`,
 		// 覆盖索引：信誉评分按 ts 范围 + client_ip 分组 + severity/action 聚合，全部字段入索引可索引-only 扫描，避免 60s 周期回表
@@ -448,6 +440,9 @@ func (s *Store) migrate() error {
 		!strings.Contains(err.Error(), "duplicate column name: query_redacted") {
 		return fmt.Errorf("迁移攻击日志脱敏字段: %w", err)
 	}
+	if err := s.loadStartupSettings(); err != nil {
+		return fmt.Errorf("读取数据库设置: %w", err)
+	}
 	adminHash := s.GetSetting("admin_pass")
 	legacyDefault := false
 	if adminHash != "" {
@@ -469,30 +464,73 @@ func (s *Store) migrate() error {
 			initialPassword = RandToken()
 			initialPasswordToLog = initialPassword
 		}
-		if err := s.SetSetting("admin_pass", HashPass(initialPassword)); err != nil {
+		changed, err := s.initializeAdminPassword(adminHash, HashPass(initialPassword))
+		if err != nil {
 			return fmt.Errorf("初始化管理密码: %w", err)
 		}
-		if err := s.SetSetting("must_change_pass", "on"); err != nil {
-			return fmt.Errorf("初始化强制改密设置: %w", err)
+		if err := s.loadStartupSettings(); err != nil {
+			return fmt.Errorf("读取初始化后的数据库设置: %w", err)
 		}
-		if initialPasswordToLog != "" {
+		if changed && initialPasswordToLog != "" {
 			log.Printf("初始管理员密码: %s（仅首次初始化显示，请立即修改）", initialPasswordToLog)
 		}
 	} else if s.GetSetting("must_change_pass") == "" {
-		if err := s.SetSetting("must_change_pass", "off"); err != nil {
+		if _, err := s.DB.Exec(`INSERT INTO settings(key,value) VALUES('must_change_pass','off')
+			ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE settings.value IS NULL OR settings.value=''`); err != nil {
 			return fmt.Errorf("迁移强制改密设置: %w", err)
 		}
+		if err := s.loadStartupSettings(); err != nil {
+			return fmt.Errorf("读取迁移后的数据库设置: %w", err)
+		}
 	}
-	s.migrateAuthPass()
+	if err := s.migrateManagedCertificates(); err != nil {
+		return fmt.Errorf("迁移托管证书: %w", err)
+	}
+	return s.migrateAuthPass()
+}
+
+func (s *Store) loadStartupSettings() error {
+	settings, err := readAllConfigSettings(s.DB)
+	if err != nil {
+		return err
+	}
+	s.settings = settings
 	return nil
 }
 
+// Keep password initialization and the first-login gate atomic across workers.
+func (s *Store) initializeAdminPassword(expected, hash string) (bool, error) {
+	tx, err := s.DB.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	result, err := tx.Exec(`INSERT INTO settings(key,value) VALUES('admin_pass',?)
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE settings.value=?`, hash, expected)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	if _, err := tx.Exec(`INSERT INTO settings(key,value) VALUES('must_change_pass','on')
+		ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // migrateAuthPass 将存量明文站点 Basic-Auth 口令一次性升级为 PBKDF2 哈希（幂等）
-func (s *Store) migrateAuthPass() {
+func (s *Store) migrateAuthPass() error {
 	rows, err := s.DB.Query(`SELECT id, auth_pass FROM sites WHERE auth_pass != ''`)
 	if err != nil {
-		return
+		return fmt.Errorf("读取待迁移站点口令: %w", err)
 	}
+	defer rows.Close()
 	type row struct {
 		id   int64
 		pass string
@@ -501,14 +539,26 @@ func (s *Store) migrateAuthPass() {
 	for rows.Next() {
 		var id int64
 		var pass string
-		if rows.Scan(&id, &pass) == nil && !strings.HasPrefix(pass, "pbkdf2_sha256$") {
+		if err := rows.Scan(&id, &pass); err != nil {
+			return fmt.Errorf("读取待迁移站点口令: %w", err)
+		}
+		if !strings.HasPrefix(pass, "pbkdf2_sha256$") {
 			todo = append(todo, row{id, pass})
 		}
 	}
-	rows.Close()
-	for _, r := range todo {
-		s.DB.Exec(`UPDATE sites SET auth_pass=? WHERE id=?`, HashPass(r.pass), r.id)
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("遍历待迁移站点口令: %w", err)
 	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭站点口令查询: %w", err)
+	}
+	for _, r := range todo {
+		// Another worker may have changed the credential while we hashed it.
+		if _, err := s.DB.Exec(`UPDATE sites SET auth_pass=? WHERE id=? AND auth_pass=?`, HashPass(r.pass), r.id, r.pass); err != nil {
+			return fmt.Errorf("迁移站点 %d 口令: %w", r.id, err)
+		}
+	}
+	return nil
 }
 
 // Backup 通过 VACUUM INTO 生成一致性热备份，可在服务运行中安全执行
@@ -573,7 +623,10 @@ func VerifyPass(password, stored string) (ok bool, needsRehash bool) {
 			return false, false
 		}
 		iter, err := strconv.Atoi(parts[1])
-		if err != nil || iter <= 0 {
+		if err != nil || iter <= 0 || iter > 1_000_000 {
+			return false, false
+		}
+		if len(parts[2]) != 2*16 || len(parts[3]) != 2*sha256.Size {
 			return false, false
 		}
 		salt, err := hex.DecodeString(parts[2])
@@ -581,7 +634,7 @@ func VerifyPass(password, stored string) (ok bool, needsRehash bool) {
 			return false, false
 		}
 		want, err := hex.DecodeString(parts[3])
-		if err != nil || len(want) == 0 {
+		if err != nil {
 			return false, false
 		}
 		got := pbkdf2SHA256([]byte(password), salt, iter, len(want))
@@ -650,7 +703,7 @@ func (s *Store) ListSites() ([]Site, error) {
 		}
 		out = append(out, t)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *Store) GetSite(id int64) (*Site, error) {
@@ -675,24 +728,34 @@ func (s *Store) CreateSite(t *Site) error {
 }
 
 func (s *Store) UpdateSite(t *Site, replaceTLS bool) (tlsConfigured bool, err error) {
-	return s.updateSite(t, replaceTLS, false)
+	return s.updateSite(t, replaceTLS, false, nil)
 }
 
 // UpdateSitePreservingUpstream retains the database's current upstream, including data
 // that the console must not reveal, when a different site setting is edited.
 func (s *Store) UpdateSitePreservingUpstream(t *Site, replaceTLS bool) (bool, error) {
-	return s.updateSite(t, replaceTLS, true)
+	return s.updateSite(t, replaceTLS, true, nil)
 }
 
-func (s *Store) updateSite(t *Site, replaceTLS, keepUpstream bool) (tlsConfigured bool, err error) {
+// UpdateSiteRetainingTLS updates the site only if the domain and retained TLS pair still match the validated snapshot.
+func (s *Store) UpdateSiteRetainingTLS(t, previous *Site, keepUpstream bool) (bool, error) {
+	return s.updateSite(t, false, keepUpstream, previous)
+}
+
+func (s *Store) updateSite(t *Site, replaceTLS, keepUpstream bool, previous *Site) (tlsConfigured bool, err error) {
+	var domain, cert, key string
+	if previous != nil {
+		domain, cert, key = previous.Domain, previous.CertPEM, previous.KeyPEM
+	}
 	err = s.DB.QueryRow(`UPDATE sites SET name=?,domain=?,upstream=CASE WHEN ? THEN upstream ELSE ? END,enabled=?,waf_mode=?,auth_user=?,
 		auth_pass=COALESCE(NULLIF(?, ''), auth_pass),cc_rate=?,cc_burst=?,captcha=?,resp_detect=?,
 		dynamic_mode=?,bot_mode=?,bot_strict=?,cert_pem=CASE WHEN ? THEN ? ELSE cert_pem END,
 		key_pem=CASE WHEN ? THEN ? ELSE key_pem END,http_redirect=? WHERE id=?
+		AND (? OR (domain=? AND cert_pem=? AND key_pem=?))
 		RETURNING cert_pem <> '' AND key_pem <> '', upstream`,
 		t.Name, t.Domain, keepUpstream, t.Upstream, t.Enabled, t.WAFMode, t.AuthUser, t.AuthPass, t.CCRate, t.CCBurst,
 		t.Captcha, t.RespDetect, t.DynamicMode, t.BotMode, t.BotStrict, replaceTLS, t.CertPEM, replaceTLS,
-		t.KeyPEM, t.HTTPRedirect, t.ID).Scan(&tlsConfigured, &t.Upstream)
+		t.KeyPEM, t.HTTPRedirect, t.ID, previous == nil, domain, cert, key).Scan(&tlsConfigured, &t.Upstream)
 	return tlsConfigured, err
 }
 
@@ -880,7 +943,7 @@ func (s *Store) ListIPs(kind string) ([]IPEntry, error) {
 		}
 		out = append(out, e)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *Store) AddIP(kind, ip, note, expires string) error {
@@ -958,23 +1021,23 @@ func (s *Store) ListReputation(limit int) ([]IPReputation, error) {
 }
 
 // ActiveBans 返回当前生效的自动封禁（ip → unix 到期秒），供代理载入内存判定层
-func (s *Store) ActiveBans(now string) map[string]int64 {
+func (s *Store) ActiveBans(now string) (map[string]int64, error) {
 	out := map[string]int64{}
 	rows, err := s.DB.Query(`SELECT ip,banned_until FROM ip_reputation WHERE banned_until > ?`, now)
 	if err != nil {
-		return out
+		return nil, err
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var ip, until string
-		if rows.Scan(&ip, &until) != nil {
-			continue
+		if err := rows.Scan(&ip, &until); err != nil {
+			return nil, err
 		}
 		if t, err := time.ParseInLocation("2006-01-02 15:04:05", until, time.Local); err == nil {
 			out[ip] = t.Unix()
 		}
 	}
-	return out
+	return out, rows.Err()
 }
 
 // Unban 人工解封：清空封禁并重置递增计数，给予一个窗口期的赦免，避免立即被重新封禁
@@ -1181,7 +1244,7 @@ func (s *Store) ListExclusions() ([]Exclusion, error) {
 		}
 		out = append(out, e)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *Store) AddExclusion(e *Exclusion) error {
@@ -1215,7 +1278,7 @@ func (s *Store) ListRules() ([]CustomRule, error) {
 		}
 		out = append(out, r)
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func (s *Store) CreateRule(r *CustomRule) error {

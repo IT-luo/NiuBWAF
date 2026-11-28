@@ -2,6 +2,8 @@ package store
 
 import (
 	"bytes"
+	"database/sql"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
@@ -203,6 +205,97 @@ func TestLegacyDefaultHashRotatesOnReopen(t *testing.T) {
 	}
 }
 
+func TestOpenDoesNotResetUnreadableAdminPassword(t *testing.T) {
+	logs := captureStoreLogs(t)
+	s := openHardening(t)
+	logs.Reset()
+	if _, err := s.DB.Exec("UPDATE settings SET value=NULL WHERE key='admin_pass'"); err != nil {
+		t.Fatal(err)
+	}
+	var path string
+	var seq int
+	var name string
+	if err := s.DB.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err == nil {
+		reopened.Close()
+		t.Fatal("failed to detect unreadable stored password")
+	}
+	var unchanged bool
+	if err := s.DB.QueryRow("SELECT value IS NULL FROM settings WHERE key='admin_pass'").Scan(&unchanged); err != nil {
+		t.Fatal(err)
+	}
+	if !unchanged || strings.Contains(logs.String(), "初始管理员密码:") {
+		t.Fatal("an unreadable password must not be replaced")
+	}
+}
+
+func TestOpenRepairsNullPasswordGateAndRefreshesNullableSettings(t *testing.T) {
+	s := openHardening(t)
+	if _, err := s.DB.Exec(`UPDATE settings SET value=NULL WHERE key='must_change_pass';
+		INSERT INTO settings(key,value) VALUES('optional_setting',NULL)`); err != nil {
+		t.Fatal(err)
+	}
+	var seq int
+	var name, path string
+	if err := s.DB.QueryRow("PRAGMA database_list").Scan(&seq, &name, &path); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.GetSetting("must_change_pass"); got != "off" {
+		t.Fatalf("legacy first-login gate = %q, want off", got)
+	}
+	if _, err := reopened.RefreshSharedSettings(); err != nil {
+		t.Fatalf("refresh with a nullable optional setting: %v", err)
+	}
+}
+
+func TestUpdateSiteRetainingTLSRejectsChangedPair(t *testing.T) {
+	s := openHardening(t)
+	site := &Site{Name: "example", Domain: "example.test", Upstream: "http://127.0.0.1:8081", CertPEM: "old cert", KeyPEM: "old key"}
+	if err := s.CreateSite(site); err != nil {
+		t.Fatal(err)
+	}
+	previous := *site
+	site.CertPEM, site.KeyPEM = "new cert", "new key"
+	if _, err := s.UpdateSite(site, true); err != nil {
+		t.Fatal(err)
+	}
+	site.Domain = "renamed.test"
+	if _, err := s.UpdateSiteRetainingTLS(site, &previous, false); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("update with stale certificate snapshot: %v", err)
+	}
+	current, err := s.GetSite(site.ID)
+	if err != nil || current.Domain != previous.Domain || current.CertPEM != "new cert" {
+		t.Fatalf("stale update changed site or certificate: %v", err)
+	}
+}
+
+func TestAdminInitializationKeepsPasswordChangedByAnotherWorker(t *testing.T) {
+	s := openHardening(t)
+	old := s.GetSetting("admin_pass")
+	newPassword := HashPass("Changed9Password")
+	if err := s.ReplaceRootConsolePassword(old, newPassword, true); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := s.initializeAdminPassword(old, HashPass("Temporary8Password"))
+	if err != nil || changed {
+		t.Fatalf("stale initialization changed the password: changed=%v err=%v", changed, err)
+	}
+	var hash, gate string
+	err = s.DB.QueryRow(`SELECT a.value, b.value FROM settings a, settings b
+		WHERE a.key='admin_pass' AND b.key='must_change_pass'`).Scan(&hash, &gate)
+	if err != nil || hash != newPassword || gate != "off" {
+		t.Fatalf("stored password or first-login gate changed: gate=%q err=%v", gate, err)
+	}
+}
+
 func TestMigrateAuthPassHashesPlaintext(t *testing.T) {
 	s := openHardening(t)
 	site := &Site{Name: "t", Domain: "t.local", Upstream: "http://127.0.0.1:8081", Enabled: true, WAFMode: "balanced", AuthUser: "u", AuthPass: "sitepw", DynamicMode: "off"}
@@ -210,7 +303,9 @@ func TestMigrateAuthPassHashesPlaintext(t *testing.T) {
 		t.Fatalf("创建站点失败: %v", err)
 	}
 	// 模拟存量明文库：重启迁移应升级为哈希
-	s.migrateAuthPass()
+	if err := s.migrateAuthPass(); err != nil {
+		t.Fatal(err)
+	}
 	got, err := s.GetSite(site.ID)
 	if err != nil {
 		t.Fatalf("读取站点失败: %v", err)
@@ -223,7 +318,9 @@ func TestMigrateAuthPassHashesPlaintext(t *testing.T) {
 	}
 	// 幂等：再次迁移不应改变已哈希值
 	first := got.AuthPass
-	s.migrateAuthPass()
+	if err := s.migrateAuthPass(); err != nil {
+		t.Fatal(err)
+	}
 	again, _ := s.GetSite(site.ID)
 	if again.AuthPass != first {
 		t.Fatal("已哈希口令不应被重复哈希")

@@ -5,7 +5,6 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -77,7 +76,7 @@ func settingInt(st interface{ GetSetting(string) string }, key string, def, min,
 
 func (m *Monitor) collect(ctx context.Context, now time.Time, settings inspectionSettings) *collection {
 	collected := &collection{observations: map[string]observation{}, errors: []CheckError{}}
-	m.collectCertificates(now, settings, collected)
+	m.collectCertificates(ctx, now, settings, collected)
 	m.collectUpstreams(ctx, now, settings, collected)
 	m.collectDisk(now, settings, collected)
 	m.collectBackup(now, settings, collected)
@@ -85,7 +84,9 @@ func (m *Monitor) collect(ctx context.Context, now time.Time, settings inspectio
 	return collected
 }
 
-func (m *Monitor) collectCertificates(now time.Time, settings inspectionSettings, collected *collection) {
+func (m *Monitor) collectCertificates(ctx context.Context, now time.Time, settings inspectionSettings, collected *collection) {
+	// Resolve alerts persisted by versions that inspected the retired ACME cache.
+	collected.covered = append(collected.covered, "cert:acme:")
 	sites, err := m.store.ListSites()
 	if err != nil {
 		addCheckError(collected, now, "certificate", "sites", err)
@@ -100,6 +101,7 @@ func (m *Monitor) collectCertificates(now time.Time, settings inspectionSettings
 			addPEMCertificate(collected, now, settings, key, resource, site.Domain, []byte(site.CertPEM), true)
 		}
 	}
+	m.collectManagedCertificates(ctx, now, settings, collected)
 
 	for _, item := range []struct {
 		key      string
@@ -122,31 +124,37 @@ func (m *Monitor) collectCertificates(now time.Time, settings inspectionSettings
 		addPEMCertificate(collected, now, settings, item.key, item.resource+" "+item.path, item.path, data, true)
 	}
 
-	acmeDir := filepath.Join(m.dataDir, "acme")
-	walkErr := filepath.WalkDir(acmeDir, func(path string, entry fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if entry.IsDir() || !entry.Type().IsRegular() {
-			return nil
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		relative, err := filepath.Rel(acmeDir, path)
-		if err != nil {
-			return err
-		}
-		relative = filepath.ToSlash(relative)
-		addPEMCertificate(collected, now, settings, "cert:acme:"+relative, "ACME cache "+relative, path, data, false)
-		return nil
-	})
-	if walkErr != nil && !os.IsNotExist(walkErr) {
-		addCheckError(collected, now, "certificate", acmeDir, walkErr)
-	} else {
-		collected.covered = append(collected.covered, "cert:acme:")
+}
+
+func (m *Monitor) collectManagedCertificates(ctx context.Context, now time.Time, settings inspectionSettings, collected *collection) {
+	const prefix = "cert:managed:"
+	const source = "managed certificates"
+
+	// Include issued production certificates even when unbound, expired, or awaiting renewal.
+	rows, err := m.store.DB.QueryContext(ctx, `SELECT id, domains, cert_pem FROM managed_certificates
+		WHERE staging=0 AND cert_pem<>''`)
+	if err != nil {
+		addCheckError(collected, now, "certificate", source, err)
+		return
 	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var domains string
+		var certPEM []byte
+		if err := rows.Scan(&id, &domains, &certPEM); err != nil {
+			addCheckError(collected, now, "certificate", source, err)
+			return
+		}
+		key := prefix + strconv.FormatInt(id, 10)
+		resource := fmt.Sprintf("managed certificate %s (%d)", domains, id)
+		addPEMCertificate(collected, now, settings, key, resource, domains, certPEM, true)
+	}
+	if err := rows.Err(); err != nil {
+		addCheckError(collected, now, "certificate", source, err)
+		return
+	}
+	collected.covered = append(collected.covered, prefix)
 }
 
 func addPEMCertificate(collected *collection, now time.Time, settings inspectionSettings, key, resource, label string, data []byte, required bool) {
@@ -184,7 +192,7 @@ func addPEMCertificate(collected *collection, now time.Time, settings inspection
 	}
 }
 
-// earliestCertificate deliberately scans every PEM block: autocert and manual
+// earliestCertificate deliberately scans every PEM block: manual
 // bundles commonly place the private key before the first certificate.
 func earliestCertificate(data []byte) (time.Time, string, bool, error) {
 	var earliest time.Time

@@ -39,7 +39,7 @@ func preparePrivateDataDir(dir string) error {
 	if err := secure(root, true); err != nil {
 		return err
 	}
-	for _, name := range []string{"niubwaf.db", "niubwaf.db-wal", "niubwaf.db-shm", "niubwaf.db-journal", "default_key.pem", "admin_key.pem"} {
+	for _, name := range []string{"niubwaf.db", "niubwaf.db-wal", "niubwaf.db-shm", "niubwaf.db-journal", "default_key.pem", "admin_key.pem", "dns-certificates.key"} {
 		if err := secure(filepath.Join(root, name), false); err != nil && !os.IsNotExist(err) {
 			return err
 		}

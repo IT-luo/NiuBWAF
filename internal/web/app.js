@@ -142,7 +142,7 @@ function route() {
   if (repTimer) { clearInterval(repTimer); repTimer = null; }
   if (dashTimer) { clearInterval(dashTimer); dashTimer = null; }
   const requested = location.hash.replace('#/', '').split('?')[0];
-  const views = {dashboard, traffic, posture, sites, logs, tuning, rules, ips, reputation, settings, operations, audit, accounts, profile};
+  const views = {dashboard, traffic, posture, sites, logs, tuning, rules, ips, reputation, settings, certificates, operations, audit, accounts, profile};
   const view = Object.hasOwn(views, requested) && canOpen(requested) ? requested : 'dashboard';
   const nav = $('.sidebar nav');
   nav.querySelectorAll('a[data-view]').forEach(a => {
@@ -862,19 +862,65 @@ function siteForm(s) {
   <label class="check"><input id="f-botstrict" type="checkbox" ${s.bot_strict ? 'checked' : ''}> 严格模式：连同搜索引擎爬虫（Googlebot / Baiduspider 等）一并处置，默认放行以免误伤 SEO 收录</label>
   <details class="https-box" ${s.tls_configured ? 'open' : ''}>
     <summary>HTTPS 证书配置（TLS 监听默认 :8443，按域名 SNI 匹配）</summary>
-    <p class="hint">${s.tls_configured ? '已配置手动证书。留空保留，替换时请同时填写证书和私钥。' : '配置手动证书时，请同时填写证书和私钥。'}</p>
-    <div class="form-row"><label for="f-cert">证书（PEM 格式，含证书链）</label><textarea id="f-cert" rows="4" placeholder="-----BEGIN CERTIFICATE-----" spellcheck="false"></textarea></div>
-    <div class="form-row"><label for="f-key">私钥（PEM 格式）</label><textarea id="f-key" rows="4" placeholder="-----BEGIN PRIVATE KEY-----" spellcheck="false" autocomplete="off"></textarea></div>
+    <p class="hint">使用 DNS-01 自动签发和续期时，可在 <a href="#/certificates" onclick="closeModal()">证书管理</a> 中绑定此站点。</p>
+    <p class="hint">${s.tls_configured ? '已配置手动证书。留空保留，替换时请同时提供证书和私钥。' : '配置手动证书时，请同时提供证书和私钥。'} 可选择 PEM 文件或粘贴内容，点击保存后才会提交。</p>
+    <div class="form-row">
+      <label for="f-cert">证书内容</label>
+      <textarea id="f-cert" rows="4" placeholder="-----BEGIN CERTIFICATE-----" spellcheck="false"></textarea>
+      <label for="f-cert-file">选择证书文件（PEM，含证书链）</label>
+      <input id="f-cert-file" type="file" accept=".pem,.crt,.cer">
+    </div>
+    <div class="form-row">
+      <label for="f-key">私钥内容</label>
+      <textarea id="f-key" rows="4" placeholder="-----BEGIN PRIVATE KEY-----" spellcheck="false" autocomplete="off"></textarea>
+      <label for="f-key-file">选择私钥文件（.key 或 .pem，未加密）</label>
+      <input id="f-key-file" type="file" accept=".key,.pem">
+    </div>
     ${s.tls_configured ? '<label class="check"><input id="f-clear-tls" type="checkbox"> 移除站点手动证书</label>' : ''}
     <label class="check"><input id="f-redirect" type="checkbox" ${s.http_redirect ? 'checked' : ''}> HTTP 自动跳转 HTTPS（301）</label>
   </details>
   <div class="modal-actions"><button class="btn ghost" onclick="closeModal()">取消</button>
   <button class="btn" id="site-save">保存</button></div>
   </div></div>`;
-  $('#site-save').addEventListener('click', () => saveSite(s.id || 0));
+  const save = $('#site-save');
+  const certFile = $('#f-cert-file');
+  const keyFile = $('#f-key-file');
+  for (const [input, field, header, label] of [
+    [certFile, $('#f-cert'), /^-----BEGIN CERTIFICATE-----/, '证书'],
+    [keyFile, $('#f-key'), /^-----BEGIN (?:RSA |EC )?PRIVATE KEY-----/, '私钥'],
+  ]) {
+    input.addEventListener('change', async () => {
+      const file = input.files[0];
+      input.value = '';
+      if (!file || save.disabled) return;
+      if (file.size > 512 * 1024) {
+        toast(label + '文件超过 512 KiB', true);
+        return;
+      }
+      save.disabled = certFile.disabled = keyFile.disabled = true;
+      field.readOnly = true;
+      try {
+        const pem = (await file.text()).trim();
+        if (!header.test(pem)) throw new Error(label + '文件格式不正确，请选择 PEM 文件');
+        if (!field.isConnected) return;
+        field.value = pem;
+        toast(label + '已载入，保存后生效');
+      } catch (e) {
+        if (field.isConnected) toast(e.message, true);
+      } finally {
+        field.readOnly = false;
+        save.disabled = certFile.disabled = keyFile.disabled = false;
+      }
+    });
+  }
+  save.addEventListener('click', () => saveSite(s.id || 0));
 }
 function closeModal() { $('#modal-root').innerHTML = ''; }
 async function saveSite(id) {
+  const save = $('#site-save');
+  const certFile = $('#f-cert-file');
+  const keyFile = $('#f-key-file');
+  if (save.disabled) return;
   const body = {
     name: $('#f-name').value.trim(), domain: $('#f-domain').value.trim(),
     upstream: $('#f-upstream').value.trim(), replace_upstream: $('#f-replace-upstream')?.checked || false, waf_mode: $('#f-mode').value,
@@ -886,10 +932,13 @@ async function saveSite(id) {
     cert_pem: $('#f-cert').value.trim(), key_pem: $('#f-key').value.trim(),
     clear_tls: $('#f-clear-tls')?.checked || false, http_redirect: $('#f-redirect').checked,
   };
+  save.disabled = certFile.disabled = keyFile.disabled = true;
   try {
     await api('/api/sites' + (id ? '/' + id : ''), {method: id ? 'PUT' : 'POST', body});
-    closeModal(); toast('站点已保存'); sites();
+    if (save.isConnected) closeModal();
+    toast('站点已保存'); sites();
   } catch (e) { toast(e.message, true); }
+  finally { save.disabled = certFile.disabled = keyFile.disabled = false; }
 }
 async function delSite(id, domain) {
   if (!confirm(`确认删除站点 ${domain}？`)) return;
@@ -1654,16 +1703,6 @@ async function settings() {
     <button class="btn ghost" onclick="testAlert()">发送测试</button></div>
     <p class="hint">启用后，窗口内攻击事件数达到阈值即向已配置通道推送告警，冷却期内不重复发送。钉钉/企业微信填群机器人 Webhook；通用 Webhook 接收 {event,message,count,window,threshold,ts} JSON。修改即时生效。</p>
   </div>
-  <div class="panel"><h3>ACME 自动证书（Let's Encrypt）</h3>
-    <div class="toolbar">
-      <select id="acme-enabled"><option value="off">关闭</option><option value="on">启用</option></select>
-      <select id="acme-staging"><option value="on">测试 CA（staging，不触发速率限制）</option><option value="off">生产 CA（受信任证书）</option></select>
-      <button class="btn" onclick="saveACME()">保存</button>
-    </div>
-    <div class="form-row"><label>域名（逗号分隔，需公网解析到本机）</label><input id="acme-domains" placeholder="www.example.com,example.com" style="width:100%"></div>
-    <div class="form-row"><label>联系邮箱（证书到期通知）</label><input id="acme-email" placeholder="admin@example.com" style="width:100%"></div>
-    <p class="hint">启用后自动向 Let's Encrypt 申请并续期证书，缓存于 data/acme。要求域名公网解析到本服务器，且 80（HTTP-01）或 443（TLS-ALPN-01）端口可被 Let's Encrypt 访问；内网/无公网域名无法签发。首次启用需重启以监听 :80（-acme-http 可改地址）。建议先用测试 CA 联调，确认无误再切生产 CA。已手动配置证书的站点优先使用手动证书。</p>
-  </div>
   <div class="panel"><h3>自定义拦截页面</h3>
     <p class="hint" style="margin-bottom:10px">支持占位符：{{REQ_ID}} {{REASON}} {{CLIENT_IP}} {{DOMAIN}} {{TIME}} {{RULE_ID}}，留空使用默认页面。</p>
     <textarea id="block-page" style="width:100%;min-height:180px;font-family:var(--mono);font-size:12px"></textarea>
@@ -1726,10 +1765,6 @@ async function settings() {
     $('#alert-window').value = s.alert_window || 60;
     $('#alert-cooldown').value = s.alert_cooldown || 300;
     for (const key of ALERT_SECRET_KEYS) setSecretField(key, s[key + '_configured'] === 'true');
-    $('#acme-enabled').value = s.acme_enabled || 'off';
-    $('#acme-staging').value = s.acme_staging || 'on';
-    $('#acme-domains').value = s.acme_domains || '';
-    $('#acme-email').value = s.acme_email || '';
     $('#body-inspect-kb').value = s.body_inspect_kb || 2048;
     $('#body-scan-kb').value = s.body_scan_kb || 16;
     $('#allowed-ct').value = s.allowed_content_types || '';
@@ -2163,15 +2198,137 @@ async function saveBlockPage() {
   try { await api('/api/settings', {method: 'PUT', body: {block_page: $('#block-page').value}}); toast('拦截页面已保存'); }
   catch (e) { toast(e.message, true); }
 }
-async function saveACME() {
+async function certificates() {
+  const main = $('#main');
+  main.innerHTML = pageHead('证书管理', 'DNS-01 自动签发与续期 · 支持内网站点和通配符域名') + '<div id="cert-view" class="hint">正在读取证书…</div>';
+  const view = $('#cert-view');
   try {
-    await api('/api/settings', {method: 'PUT', body: {
-      acme_enabled: $('#acme-enabled').value, acme_staging: $('#acme-staging').value,
-      acme_domains: $('#acme-domains').value.trim(), acme_email: $('#acme-email').value.trim(),
-    }});
-    toast('ACME 配置已保存；首次启用请重启服务以监听 :80');
-  } catch (e) { toast(e.message, true); }
+    const [data, sites] = await Promise.all([api('/api/certificates'), api('/api/sites')]);
+    if (!view.isConnected) return;
+    const providerNames = {alidns: '阿里云 DNS', cloudflare: 'Cloudflare', tencentcloud: '腾讯云 DNSPod'};
+    const statusNames = {queued: '待签发', issuing: '正在验证与签发', failed: '失败，等待重试', ready: '已签发'};
+    const names = c => c.domains.join(', ');
+    const expiry = c => c.expires_at ? new Date(c.expires_at * 1000).toLocaleString() : '—';
+    const siteBindings = new Map(data.bindings.map(item => [item.site_id, item.certificate_id]));
+    const available = data.certificates.filter(c => !c.staging && c.expires_at * 1000 > Date.now());
+    const accounts = data.accounts.map(item => `<option value="${item.id}">${esc(item.name)} · ${esc(providerNames[item.provider])}</option>`).join('');
+    view.classList.remove('hint');
+    view.innerHTML = `
+      <div class="panel"><h3>DNS 服务商账号</h3>
+        <form id="cert-account-form" autocomplete="off">
+          <div class="form-grid">
+            <div class="form-row"><label for="cert-account-edit">账号</label><select id="cert-account-edit"><option value="0">新增账号</option>${accounts}</select></div>
+            <div class="form-row"><label for="cert-account-name">名称</label><input id="cert-account-name" required maxlength="100"></div>
+            <div class="form-row"><label for="cert-provider">服务商</label><select id="cert-provider">${Object.entries(providerNames).map(([key, label]) => `<option value="${key}">${label}</option>`).join('')}</select></div>
+            <div class="form-row"><label for="cert-provider-key" id="cert-key-label">Access Key ID</label><input id="cert-provider-key" type="password" required autocomplete="new-password"></div>
+            <div class="form-row"><label for="cert-provider-secret" id="cert-secret-label">Access Key Secret</label><input id="cert-provider-secret" type="password" autocomplete="new-password"></div>
+          </div>
+          <p class="hint">凭据加密保存，编辑时需重新输入。请使用仅能管理目标 DNS 区域的凭据。</p>
+          <button type="submit" class="btn">保存 DNS 账号</button>
+        </form>
+      </div>
+      <div class="panel"><h3>申请托管证书</h3>
+        <form id="cert-order-form">
+          <div class="form-grid">
+            <div class="form-row"><label for="cert-order-account">DNS 账号</label><select id="cert-order-account" required><option value="">请选择</option>${accounts}</select></div>
+            <div class="form-row"><label for="cert-order-domains">域名（逗号分隔）</label><input id="cert-order-domains" required placeholder="example.com,*.example.com"></div>
+            <div class="form-row"><label for="cert-order-email">联系邮箱</label><input id="cert-order-email" type="email" required></div>
+            <div class="form-row"><label for="cert-order-ca">证书环境</label><select id="cert-order-ca"><option value="staging">测试 CA</option><option value="production">生产 CA</option></select></div>
+          </div>
+          <label class="check"><input id="cert-terms" type="checkbox" required> 我同意 <a href="https://letsencrypt.org/repository/" target="_blank" rel="noopener noreferrer">Let's Encrypt 服务协议</a></label>
+          <button type="submit" class="btn" ${data.accounts.length ? '' : 'disabled'}>开始签发</button>
+        </form>
+      </div>
+      <div class="panel"><h3>签发与续期状态</h3>
+        <div class="toolbar"><button type="button" class="btn ghost" id="cert-list-refresh">刷新状态</button></div>
+        <div class="table-scroll"><table><thead><tr><th>域名</th><th>环境</th><th>状态</th><th>到期时间</th><th>操作</th></tr></thead>
+          <tbody>${data.certificates.length ? data.certificates.map(c => `<tr>
+            <td>${esc(names(c))}</td><td>${c.staging ? '测试' : '生产'}</td>
+            <td>${c.expires_at && c.expires_at * 1000 <= Date.now() ? '已过期 · ' : ''}${esc(statusNames[c.status] || c.status)}${c.last_error ? `<div class="hint">${esc(c.last_error)}</div>` : ''}</td>
+            <td>${esc(expiry(c))}</td><td><button type="button" class="btn ghost sm" data-cert-retry="${c.id}" ${c.status === 'issuing' ? 'disabled' : ''}>重新签发</button></td>
+          </tr>`).join('') : emptyHTML(5, '暂无托管证书')}</tbody></table></div>
+      </div>
+      <div class="panel"><h3>站点证书绑定</h3>
+        <p class="hint">已签发的生产证书可绑定到其覆盖的站点。续期后自动切换；解除绑定后恢复站点原有证书策略。</p>
+        <form id="cert-binding-form">
+          <div class="form-grid">
+            <div class="form-row"><label for="cert-binding-site">防护站点</label><select id="cert-binding-site" required><option value="">请选择</option>${sites.map(s => `<option value="${s.id}">${esc(s.domain)}${siteBindings.has(s.id) ? ' · 已绑定' : ''}</option>`).join('')}</select></div>
+            <div class="form-row"><label for="cert-binding-cert">托管证书</label><select id="cert-binding-cert"><option value="0">未绑定</option>${available.map(c => `<option value="${c.id}">${esc(names(c))}</option>`).join('')}</select></div>
+          </div>
+          <button type="submit" class="btn" ${sites.length ? '' : 'disabled'}>保存绑定</button>
+        </form>
+      </div>`;
+    const element = selector => view.querySelector(selector);
+    const value = selector => element(selector).value;
+    function credentialLabels() {
+      const provider = value('#cert-provider');
+      element('#cert-key-label').textContent = {alidns: 'Access Key ID', cloudflare: 'DNS API Token', tencentcloud: 'SecretId'}[provider];
+      element('#cert-secret-label').textContent = {alidns: 'Access Key Secret', cloudflare: 'Zone Read Token（可选）', tencentcloud: 'SecretKey'}[provider];
+      element('#cert-provider-secret').required = provider !== 'cloudflare';
+    }
+    element('#cert-provider').addEventListener('change', credentialLabels);
+    element('#cert-account-edit').addEventListener('change', () => {
+      const account = data.accounts.find(a => a.id === Number(value('#cert-account-edit')));
+      element('#cert-account-name').value = account?.name || '';
+      element('#cert-provider').value = account?.provider || 'alidns';
+      element('#cert-provider').disabled = Boolean(account);
+      element('#cert-provider-key').value = '';
+      element('#cert-provider-secret').value = '';
+      credentialLabels();
+    });
+    credentialLabels();
+    element('#cert-binding-site').addEventListener('change', () => {
+      const id = siteBindings.get(Number(value('#cert-binding-site'))) || 0;
+      const select = element('#cert-binding-cert');
+      select.querySelector('option[data-current]')?.remove();
+      if (id && !available.some(c => c.id === id)) {
+        const option = new Option('当前绑定的证书已过期', String(id));
+        option.dataset.current = '';
+        option.disabled = true;
+        select.add(option);
+      }
+      select.value = String(id);
+    });
+    async function submit(button, path, method, body, success) {
+      button.disabled = true;
+      try {
+        await api(path, {method, body});
+        toast(success);
+        if (view.isConnected) certificates();
+      } catch (e) { toast(e.message, true); }
+      finally { button.disabled = false; }
+    }
+    element('#cert-account-form').addEventListener('submit', event => {
+      event.preventDefault();
+      submit(event.submitter, '/api/certificates/accounts', 'PUT', {
+        id: Number(value('#cert-account-edit')), name: value('#cert-account-name'), provider: value('#cert-provider'),
+        key: value('#cert-provider-key'), secret: value('#cert-provider-secret'),
+      }, 'DNS 账号已保存');
+    });
+    element('#cert-order-form').addEventListener('submit', event => {
+      event.preventDefault();
+      submit(event.submitter, '/api/certificates', 'POST', {
+        account_id: Number(value('#cert-order-account')), domains: value('#cert-order-domains').split(/[,，\s]+/).filter(Boolean),
+        email: value('#cert-order-email'), staging: value('#cert-order-ca') === 'staging', accept_terms: element('#cert-terms').checked,
+      }, '已加入签发队列');
+    });
+    element('#cert-binding-form').addEventListener('submit', event => {
+      event.preventDefault();
+      const selected = element('#cert-binding-cert').selectedOptions[0];
+      if (!selected || selected.disabled) return;
+      submit(event.submitter, '/api/certificates/binding', 'PUT', {
+        site_id: Number(value('#cert-binding-site')), certificate_id: Number(selected.value),
+      }, '站点证书绑定已更新');
+    });
+    element('#cert-list-refresh').addEventListener('click', () => certificates());
+    view.querySelectorAll('[data-cert-retry]').forEach(button => button.addEventListener('click', () => {
+      submit(button, '/api/certificates/retry', 'POST', {id: Number(button.dataset.certRetry)}, '已加入签发队列');
+    }));
+  } catch (e) {
+    if (view.isConnected) view.textContent = e.message;
+  }
 }
+
 async function saveMetrics() {
   const body = readSecretFields(['metrics_token']);
   if (!Object.hasOwn(body, 'metrics_token')) return;

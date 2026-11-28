@@ -1,6 +1,6 @@
 # NiuB WAF（NiuBWAF）部署文档
 
-预编译包以 `v1.3.2` 为例。该版本内置 Coraza v3.8.1 和 OWASP CRS 4.25.2 LTS，使用 Go 1.26.11 和 `CGO_ENABLED=0` 构建 Linux AMD64 和 Windows x64 二进制。[发布页](https://github.com/IT-luo/NiuBWAF/releases/tag/v1.3.2)
+预编译包以 `v1.3.3` 为例。该版本内置 Coraza v3.8.1 和 OWASP CRS 4.25.2 LTS，使用 Go 1.26.11 和 `CGO_ENABLED=0` 构建 Linux AMD64 和 Windows x64 二进制。[发布页](https://github.com/IT-luo/NiuBWAF/releases/tag/v1.3.3)
 
 | 部署方式 | 交付范围 |
 |---|---|
@@ -20,7 +20,6 @@
 | 8080 | `-proxy :8080` | 防护代理 HTTP（业务流量入口） | 是 |
 | 8443 | `-tls :8443` | 防护代理 HTTPS（按站点 SNI 证书） | 是 |
 | 9443 | `-admin 127.0.0.1:9443` | 管理控制台（**仅 HTTPS**） | 否，默认仅环回；远程仅运维网段或 SSH 隧道 |
-| 80 | `-acme-http :80` | ACME HTTP-01 挑战（仅 `acme_enabled=on` 时启动） | 启用 ACME 时需公网可达 |
 
 数据流：`客户端 → [可选前置 LB/CDN] → NiuBWAF(8080/8443) → 上游源站`。管理面与业务面端口分离，互不影响。
 
@@ -38,11 +37,10 @@
 ### 2.2 网络 / 防火墙
 - 放行 8080/8443 给业务流量。
 - 9443 默认仅监听环回；确需对外开放时仅放行运维 / 堡垒机网段（管理面含全部配置能力）。
-- 若启用 ACME：域名需公网解析到本机，且 80（HTTP-01）或 443（TLS-ALPN-01）可被 Let's Encrypt 访问；**内网 / 无公网域名无法签发**。
 
 ### 2.3 证书准备（三选一）
 1. **手动证书**：自备 PEM（fullchain + privkey），启动参数 `-cert/-key`（代理默认）与 `-admin-cert/-admin-key`（管理台），或在控制台按站点配置 SNI 证书。
-2. **ACME 自动签发**：控制台「ACME 自动证书」启用（需公网域名，见 §9）。
+2. **DNS-01 自动签发**：在控制台「证书管理」配置 DNS 账号并申请（见 §9）。
 3. **自签名（默认）**：未提供证书时自动生成 `data/default_cert.pem`、`data/admin_cert.pem`（SAN 仅含 localhost/niubwaf.local/127.0.0.1/::1）。**浏览器会告警，仅限内网 / 测试**；生产请换 1 或 2。
 
 ### 2.4 可选：GeoIP 库
@@ -56,10 +54,10 @@
 
 ### 3.1 下载发布包（Linux x86_64）
 
-从 [GitHub Releases](https://github.com/IT-luo/NiuBWAF/releases) 下载同一版本的 `niubwaf-<版本>-linux-amd64.tar.gz` 和 `SHA256SUMS`。以下以 `v1.3.2` 为例，在下载目录运行。成功时会报告压缩包 `OK`，并解压得到 `niubwaf`。
+从 [GitHub Releases](https://github.com/IT-luo/NiuBWAF/releases) 下载同一版本的 `niubwaf-<版本>-linux-amd64.tar.gz` 和 `SHA256SUMS`。以下以 `v1.3.3` 为例，在下载目录运行。成功时会报告压缩包 `OK`，并解压得到 `niubwaf`。
 
 ```bash
-sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.2-linux-amd64.tar.gz
+sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.3-linux-amd64.tar.gz
 ```
 
 ### 3.2 从版本标签编译
@@ -67,7 +65,7 @@ sha256sum -c --ignore-missing SHA256SUMS && tar -xzf niubwaf-v1.3.2-linux-amd64.
 进入仓库，在 Bash 中执行以下命令。Windows PowerShell 可用 `$env:CGO_ENABLED='0'`、`$env:GOOS='linux'` 和 `$env:GOARCH='amd64'` 设置环境变量，再执行其中的 `go build`。
 
 ```bash
-git checkout v1.3.2
+git checkout v1.3.3
 CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o niubwaf .
 # arm64 目标：GOARCH=arm64
 ```
@@ -86,16 +84,16 @@ git rev-parse HEAD
 
 ### 3.4 Windows x64 原生部署
 
-从发布页下载同一版本的 `niubwaf-v1.3.2-windows-amd64.zip` 和 `SHA256SUMS`，在下载目录的 PowerShell 中执行。管理台默认仅绑定本机 HTTPS `9443`。
+从发布页下载同一版本的 `niubwaf-v1.3.3-windows-amd64.zip` 和 `SHA256SUMS`，在下载目录的 PowerShell 中执行。管理台默认仅绑定本机 HTTPS `9443`。
 
 ```powershell
-$package = 'niubwaf-v1.3.2-windows-amd64.zip'
+$package = 'niubwaf-v1.3.3-windows-amd64.zip'
 $expected = (Select-String -LiteralPath SHA256SUMS -Pattern ('^[0-9a-f]{64}  ' + [regex]::Escape($package) + '$')).Line -split '  '
 if (-not $expected -or (Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash -ne $expected[0]) {
     throw 'SHA-256 校验失败'
 }
-Expand-Archive -LiteralPath $package -DestinationPath '.\niubwaf-v1.3.2'
-Set-Location '.\niubwaf-v1.3.2'
+Expand-Archive -LiteralPath $package -DestinationPath '.\niubwaf-v1.3.3'
+Set-Location '.\niubwaf-v1.3.3'
 .\niubwaf.exe -proxy ':8080' -tls ':8443' -admin '127.0.0.1:9443' -data 'C:\NiuBWAF\data'
 ```
 
@@ -109,7 +107,7 @@ go build -trimpath -ldflags '-s -w' -o niubwaf.exe .
 .\niubwaf.exe -proxy ':8080' -tls ':8443' -admin '127.0.0.1:9443' -data 'C:\NiuBWAF\data'
 ```
 
-使用专用 NTFS 数据目录，以实际运行账号启动。程序会为数据目录、受管 SQLite 文件、生成的私钥、备份及 ACME 缓存检查或收紧 ACL，允许当前运行账号、SYSTEM 与 Administrators 访问。权限修复失败会中止启动，可由管理员为实际运行账号预配目录权限。通过启动参数引用的外部证书和私钥由部署者设置权限。
+使用专用 NTFS 数据目录，以实际运行账号启动。程序会为数据目录、受管 SQLite 文件、生成的私钥及备份检查或收紧 ACL，允许当前运行账号、SYSTEM 与 Administrators 访问。权限修复失败会中止启动，可由管理员为实际运行账号预配目录权限。通过启动参数引用的外部证书和私钥由部署者设置权限。
 
 ---
 
@@ -126,7 +124,6 @@ go build -trimpath -ldflags '-s -w' -o niubwaf.exe .
     ├── ip2region_v4.xdb                       # 可选，中国省市+运营商（推荐）
     ├── geoip.mmdb / geoip_city.mmdb / geoip_asn.mmdb   # 可选，手动放置
     ├── idc_cache.json / tor_cache.json      # 情报缓存（自动）
-    ├── acme/                                # ACME 签发缓存（启用后自动）
     └── backups/                             # 自动备份（0700，保留 7 份）
 ```
 
@@ -152,7 +149,7 @@ sudo install -d -m 0700 -o niubwaf -g niubwaf /opt/niubwaf/data
 sudo install -m 0755 -o root -g root niubwaf /opt/niubwaf/niubwaf
 ```
 
-可选 GeoIP 数据放在 `/opt/niubwaf/data/`。默认业务端口和管理端口允许普通用户监听。启用 ACME 的 `:80` 监听时，给服务配置 `CAP_NET_BIND_SERVICE`。
+可选 GeoIP 数据放在 `/opt/niubwaf/data/`。默认业务端口和管理端口允许普通用户监听。配置监听 `:80` 或 `:443` 时，给服务配置 `CAP_NET_BIND_SERVICE`。
 
 ### 5.3 systemd unit
 `/etc/systemd/system/niubwaf.service`：
@@ -233,7 +230,7 @@ sudo journalctl -u niubwaf -n 30 --no-pager
 - 日志出现「已接管新连接」代表切换完成。新工作进程启动失败时，当前版本继续接收流量。回滚可以原子放回兼容的旧二进制，再执行 `reload`。
 - 已建立的 HTTP/HTTPS、WebSocket 和 SSE 连接留在原工作进程，直到客户端或上游正常关闭。现有控制台登录可在该监听进程的后续工作进程中继续使用。
 - 旧进程在连接排空之前仍占用内存和连接资源。配置 systemd 的内存和文件描述符上限时，要给并行运行的多个版本留出余量。活跃连接可能持续数小时，跨版本持久状态需要兼容旧进程。
-- 监听地址、启动参数和 HTTP-01 挑战端口的首次启用属于启动配置，应安排常规重启。应用层尚未完成的人机验证和部分内存限流计数随工作进程管理。
+- 监听地址和启动参数属于启动配置，应安排常规重启。应用层尚未完成的人机验证和部分内存限流计数随工作进程管理。
 - `systemctl restart`、停止服务、整台主机重启和容器重建会关闭原进程。Windows 原生运行默认采用常规重启流程。
 
 ## 6. Docker 部署（备选）
@@ -321,7 +318,7 @@ volumes:
 |---|---|---|---|---|
 | 1 | 管理口令 | 首次登录强制 | 随机初始口令 + 强口令 | 无固定默认口令；改密撤销全部旧会话 |
 | 2 | 管理台证书 | `-admin-cert/-admin-key` | 正式证书 | 否则自签名浏览器告警 |
-| 3 | 代理证书 | `-cert/-key` 或控制台站点证书 或 ACME | 正式证书 | 按站点 SNI |
+| 3 | 代理证书 | `-cert/-key` 或控制台站点证书 或 DNS-01 托管证书 | 正式证书 | 按站点 SNI |
 | 4 | `trusted_proxies` | 安全设置 | **留空**（默认忽略转发头）或仅填真实前置代理的 IP/CIDR | 公网入口必须清理客户端自带的身份头，并从连接来源重建可信转发头 |
 | 5 | `log_retention_days` | 安全设置→日志保留 | 按合规（默认 30） | 6h 清理一次 |
 | 6 | `semantic_mode` | 安全设置 | 先 `observe` 观察误报，再 `block` | 抗混淆语义引擎 |
@@ -338,8 +335,17 @@ volumes:
 ## 9. 证书管理
 
 - **手动**：启动参数或控制台站点证书（SNI）。站点证书优先于默认证书。
-- **ACME**：控制台「ACME 自动证书」→ 启用、填域名（逗号分隔）与邮箱；`acme_staging` 默认 on（测试 CA，不触发速率限制），联调通过后切 off（生产 CA）。需公网域名 + 80/443 可达 Let's Encrypt；首次启用需重启以监听 :80（`-acme-http` 可改）。签发缓存于 `data/acme`，自动续期。**内网无法实际签发**，仅验证配置/回退不破坏代理。
-- **回退顺序**：站点证书 → ACME → 默认自签名证书。
+
+### DNS-01 托管证书
+
+从旧版公网 ACME 升级前，请为相关站点签发并绑定 DNS-01 生产证书，或先配置手动证书。新版停止使用旧 ACME 缓存。若旧热升级主进程仍保留独立验证端口，安排一次常规重启释放该端口。
+
+1. 在管理台「证书管理」保存 DNS 服务商账号。现支持阿里云 DNS（Access Key ID / Secret）、Cloudflare（DNS API Token，可选独立 Zone Read Token）和腾讯云 DNSPod（SecretId / SecretKey）。请使用仅能管理目标 DNS 区域的凭据。
+2. 选择 DNS 账号，输入域名和联系邮箱，先发起测试签发。例如 `example.com,*.example.com` 同时覆盖根域和一级子域。CA 验证公网 TXT 记录，WAF 只需能访问 CA、DNS API 和公网 DNS。测试签发成功后，以生产 CA 单独再申请一次。
+3. 在同一页把已签发的生产证书绑定到站点。一张证书可绑定到多个匹配站点。有效的托管证书优先用于这些站点的新 TLS 握手，解除绑定后恢复站点手动证书或代理默认证书。
+
+托管证书到期前会自动续期。通过证书配对、域名和有效期校验后，自动更新绑定站点，无需重启服务。续期失败时保留上一张证书，可在管理台查看失败原因，或在已配置的告警通道接收通知。DNS 凭据仅写入、不回显，并以 `data/dns-certificates.key` 加密。迁移或灾难恢复时，须同时备份数据库和该密钥文件，分别保护它们的访问权限。
+- **回退顺序**：有效的 DNS-01 托管证书 → 站点手动证书 → 代理默认证书。
 
 ---
 
@@ -347,7 +353,7 @@ volumes:
 
 - **自动**：每 6 小时 `VACUUM INTO` 热备份到受限的 `data/backups/` 目录，保留最近 7 份；运行中可安全执行。
 - **手动**：控制台「数据备份」→ 立即备份，或 `POST /api/backup`；列表 `GET /api/backups`。
-- **备份范围**：热备份生成 SQLite 快照。`data/` 中的外部证书、GeoIP 文件、ACME 缓存，以及部署文件和外置证书需另行备份。站点证书等入库配置可能包含私钥，备份文件应按敏感数据管理。
+- **备份范围**：热备份生成 SQLite 快照。`data/` 中的外部证书、GeoIP 文件，以及部署文件和外置证书需另行备份。站点证书等入库配置可能包含私钥，备份文件应按敏感数据管理。
 - **恢复**：选择与目标程序版本兼容的备份。先在独立目录或测试实例中恢复并核对站点、证书和规则。正式恢复时停止服务，将现有数据库及 `-wal`、`-shm` 文件一起移到另一个备份目录。将已验证的快照复制为 `data/niubwaf.db`，确认运行用户有读写权限，再启动服务，重新执行 §7 外部验收。
 
 ---
@@ -409,7 +415,7 @@ Docker 升级前保留旧镜像标签和已验收的数据快照。回滚时切�
 | `text/plain` POST 被 403（规则 920420） | 已启用内容类型白名单，该类型不在允许范围 | 按业务需要增补「允许的 Content-Type」，或让客户端使用站点已支持的格式 |
 | 真实客户端 IP 显示为代理 IP | 前置 LB 未配 `trusted_proxies` | 安全设置填真实代理 CIDR（勿填 0.0.0.0/0） |
 | 覆盖二进制报 `ETXTBSY` | 直接覆盖运行中文件 | 用 §11 的 `.new + mv` 流程 |
-| ACME 签发失败 | 内网/域名未公网解析/80-443 不可达 | 确认公网可达；或改手动证书 |
+| DNS-01 签发失败 | DNS 凭据权限不足或验证 TXT 未传播 | 在证书管理检查错误详情和 DNS 授权 |
 
 ---
 
@@ -434,7 +440,6 @@ sudo rm -rf /opt/niubwaf        # 含 data/（先备份！）
 | `-admin` | `127.0.0.1:9443` | 管理控制台监听（恒 HTTPS；远程运维建议 SSH 隧道） |
 | `-admin-cert` / `-admin-key` | 空 | 管理台证书/私钥；留空自动生成自签名 |
 | `-data` | `./data` | 数据目录 |
-| `-acme-http` | `:80` | ACME HTTP-01 监听（仅 acme_enabled=on） |
 
 ## 附录 B：控制台设置项（`GET/PUT /api/settings`）
 
@@ -450,8 +455,6 @@ sudo rm -rf /opt/niubwaf        # 含 data/（先备份！）
 | `alert_enabled` | off | on/off | 告警推送 |
 | `alert_threshold` / `alert_window` / `alert_cooldown` | 50 / 60 / 300 | 1–1e6 / 10–3600 / 10–86400 | 阈值/窗口/冷却 |
 | `alert_webhook` / `alert_dingtalk` / `alert_wecom` | 空 | http(s) URL | 推送通道 |
-| `acme_enabled` / `acme_staging` | off / on | on/off | ACME 开关/测试 CA |
-| `acme_domains` / `acme_email` | 空 | 域名逗号分隔/邮箱 | ACME 签发目标 |
 | `metrics_token` | 空 | 字符串 | Prometheus 抓取令牌 |
 | `intel_provider` / `intel_api_key` / `intel_api_url` | off / 空 / 空 | `off` 或 `generic`，配 Bearer key 和含 `{ip}` 的 URL | 可选威胁情报服务 |
 | `body_inspect_kb` | 2048 | 64–102400 | 请求体检查上限 |
@@ -473,7 +476,6 @@ sudo rm -rf /opt/niubwaf        # 含 data/（先备份！）
 - **请求体完整检查**。通用上限取 `body_inspect_kb` 与 `body_scan_kb` 的较小值（默认 16 KiB，最高 1 MiB）。超限返回 413，非 identity 的 `Content-Encoding` 返回 415。上传客户端需要发送未压缩的请求，并按站点业务体积调整上限。
 - **大文件上传策略**。管理员可在「防护站点 → 上传策略」为 `POST`、`PUT` 或 `PATCH` 的精确路径配置 1–64 MiB 请求体上限和 1–4 个大上传并发。例如 `POST /api/upload` 可设置 64 MiB、并发 2。上限按整个请求体计算，包含 multipart 表单边界及字段。匹配且经过 WAF 防护的请求仍完整送入 Coraza 进行 HTTP 请求检测，文件类型校验、文件内容安全扫描和磁盘配额由业务端负责。每个 WAF 进程对大请求同时使用 4 个处理槽及 128 MiB 在途请求体额度，额度不足返回 503 和 `Retry-After`。代理读取、检测和回源期间都占用额度，Coraza 可能使用系统临时目录。
 - **上游连接池**。每个源站默认最多使用 256 条代理连接，共用源站的站点共享额度。可用启动参数 `-upstream-connections` 按源站容量调整。等待连接超过 1 秒返回 503 和 `Retry-After`。SSE 与 WebSocket 在连接存续期间占用额度。
-- **ACME 需公网**：内网环境无法实际签发。
 - **API 与 Bot 范围**：支持 OpenAPI 3.0 / 3.1 请求契约，以及 UA、搜索引擎来源校验和短窗口访问行为。TLS 指纹、GraphQL 专项检测和 BOLA 自动识别尚未提供，业务对象授权由应用执行。
 - **日志保留与过载**：攻击日志按保留期自动清理，审计日志保留最新约 10000 条；极端超过攻击日志队列容量时仍会丢弃，但会写入限频告警，并通过 `/api/stats` 的 `dropped_attack_logs` 暴露累计丢弃数。
 

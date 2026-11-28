@@ -349,7 +349,11 @@ function updateClock() { $('#clock').textContent = new Date().toLocaleString('zh
 updateClock();
 setInterval(updateClock, 1000);
 
-async function j(p) { const r = await fetch(p); if (!r.ok) throw new Error(r.status); return r.json(); }
+async function j(p, options) {
+  const response = await fetch(p, options);
+  if (!response.ok) throw Object.assign(new Error(response.status), { status: response.status });
+  return response.json();
+}
 
 async function refresh() {
   try {
@@ -403,32 +407,52 @@ function renderFeed() {
 }
 
 let historyLoading = false;
+let historyStatus = 0;
+let streamInterrupted = false;
+let es;
+const feedConnection = $('#feed-connection');
+
+function showFeedStatus() {
+  let message = '';
+  if (historyStatus === 401) {
+    message = '登录已失效，请通过管理控制台重新登录。';
+  } else if (historyStatus === 403) {
+    message = '当前登录无法查看攻击日志，请检查管理控制台。';
+  } else if (historyStatus && historyStatus !== 200) {
+    message = streamInterrupted
+      ? '实时连接暂不可用，攻击日志补载失败，正在重试。'
+      : '攻击日志补载失败，正在重试。';
+  } else if (streamInterrupted) {
+    message = historyStatus === 200
+      ? '实时连接暂不可用，当前显示攻击日志。'
+      : '实时连接暂不可用，正在尝试补载攻击日志。';
+  }
+  if (feedConnection.textContent === message) return;
+  feedConnection.textContent = message;
+  feedConnection.hidden = !message;
+}
+
 async function refreshHistory() {
   if (historyLoading) return;
   historyLoading = true;
   try {
-    const result = await j('/api/logs?screen=1');
+    const result = await j('/api/logs?screen=1', { cache: 'no-store' });
     timeline.mergeHistory(result.list);
     updateMapPoints();
     feedDirty = true;
+    historyStatus = 200;
+    // EventSource does not retry a connection closed by an HTTP error.
+    if (es.readyState === EventSource.CLOSED) connectFeed();
   } catch (e) {
-    console.warn('攻击日志补载失败', e);
+    historyStatus = e.status || 503;
+    if (historyStatus !== 401 && historyStatus !== 403) console.warn('攻击日志补载失败', e);
   } finally {
     historyLoading = false;
+    showFeedStatus();
   }
 }
 
-const es = new EventSource('/api/events');
-const feedConnection = $('#feed-connection');
-es.onopen = () => {
-  feedConnection.hidden = true;
-  refreshHistory();
-};
-es.onerror = () => {
-  feedConnection.textContent = '实时连接暂不可用，正在从攻击日志补载。';
-  feedConnection.hidden = false;
-};
-es.onmessage = ev => {
+function handleFeedEvent(ev) {
   const d = JSON.parse(ev.data);
   if (d.type === 'qps') {
     $('#m-qps').textContent = d.qps;
@@ -439,7 +463,23 @@ es.onmessage = ev => {
   $('#m-events').textContent = ++evCount;
   updateMapPoints();
   feedDirty = true;
-};
+}
+
+function connectFeed() {
+  es = new EventSource('/api/events');
+  es.onopen = () => {
+    streamInterrupted = false;
+    showFeedStatus();
+    refreshHistory();
+  };
+  es.onerror = () => {
+    streamInterrupted = true;
+    showFeedStatus();
+  };
+  es.onmessage = handleFeedEvent;
+}
+
+connectFeed();
 refreshHistory();
 setInterval(refreshHistory, 10000);
 </script>
